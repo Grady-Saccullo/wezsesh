@@ -1,0 +1,3 @@
+# wezsesh
+
+Wezterm Resurrect TUI
