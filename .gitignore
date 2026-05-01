@@ -1,0 +1,30 @@
+# Nix
+.direnv/
+.envrc.local
+result
+result-*
+
+# Go
+/wezsesh
+/cmd/wezsesh/wezsesh
+*.test
+*.out
+coverage.txt
+coverage.html
+/dist/
+/bin/
+
+# Editors
+*.swp
+*.swo
+.nvim.lua
+.luarc.json.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+*.log
+/tmp/
+/scratch/
