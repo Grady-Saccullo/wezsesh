@@ -50,6 +50,10 @@ PRD section references are given as `(P §x.y)`.
 | 26 | Unicode sort caveat made explicit (§13.10): alphabetical sort is byte-order over NFC-normalised UTF-8 — locale-naive. Locale-aware ordering deferred. | v2-R10 |
 | 27 | Config-vs-env precedence specified explicitly (§11.4) and documented as a single resolution table. | v2-R16 |
 | 28 | §17.2 HMAC round-trip fixture corrected: the prior placeholder `id` (`01JABCDEFGHIJKLMNPQRSTUVWXY`) was 27 chars and used Crockford-excluded glyphs (I, L, U), so §9.3.1's `#id == 26` check would silent-drop it before HMAC verify ran. Replaced with `01JABCDEFGHJKMNPQRSTVWXYZA` (26 chars, all-Crockford-valid); `expected_hmac` is now pinned to the openssl-computed value. Pure-Lua HMAC + canonical-JSON encoder were validated against this fixture and against openssl during the IPC integration spike. | spike-#1 (`docs/issues/1.md`) |
+| 29 | New §9.0.1 documents mlua sandbox constraints discovered during the spike: `debug.*` is unavailable (no self-locate via `debug.getinfo`), `wezterm` is NOT exposed on `_G` (every submodule MUST acquire it via `local wezterm = require("wezterm")`). | spike-#1 |
+| 30 | §5.4 `seen_ids` storage shape narrowed to a flat int (`unix-seconds`) per ULID; new "GLOBAL value-shape rule" forbids nested-table values in `wezterm.GLOBAL.*`. mlua's GLOBAL userdata silently breaks indexing on read for nested-table values ("can only index array or object values"). §10.6 schema updated; same rule applies to all `wezterm.GLOBAL` sub-tables. | spike-#1 |
+| 31 | §9.1 `apply_to_config(config, opts)` contract tightened: `opts` MUST carry `binary` (or `plugin_root`); the function MUST bust `package.loaded["wezsesh.*"]` at entry. wezterm's `Ctrl+Shift+R` reloads the entry-point file via `loadfile` but does NOT re-evaluate cached `require()` results, so submodule edits never land without an explicit cache-bust or full wezterm restart. | spike-#1 |
+| 32 | §3.1 gains a "PTY-multiplexer" caveat: the binary MUST run inside a native wezterm pane. tmux / screen / asciinema / Claude-Code-style agents own the PTY, consume the OSC bytes as program output, and never forward the SetUserVar to wezterm's parser. New doctor check `WEZSESH_UNDER_MULTIPLEXER` flags the condition based on `$TMUX` / `$STY` / agent env vars in the binary's environment. | spike-#1 |
 
 ### §0.2 — Document map
 
@@ -196,6 +200,18 @@ The `internal/uservar.Writer.mu` mutex serialises wezsesh's own writes;
 it does NOT prevent interleaving with bubbletea's renderer (which also
 writes to `/dev/tty`). Wezterm's OSC parser handles interleaved
 non-OSC bytes correctly because OSC is delimited.
+
+**PTY multiplexer caveat.** The binary MUST run inside a native
+wezterm pane. PTY multiplexers — tmux, screen, asciinema, agent
+harnesses (e.g. Claude Code) — own the PTY between bash and wezterm:
+they read /dev/tty bytes as program output and do not forward OSC
+SetUserVar sequences upstream, so `user-var-changed` never fires.
+Spike #1 exhibited this: a `wezsesh noop` from inside a Claude Code
+pane reliably hit `IPC_TIMEOUT` because the OSC was consumed by the
+agent's PTY before reaching wezterm. Doctor (§8.17) MUST surface
+`WEZSESH_UNDER_MULTIPLEXER` (added to §7) when `$TMUX` / `$STY` /
+known-agent env vars are set in the binary's environment, with
+remediation copy pointing at "open a native wezterm tab".
 
 ### §3.2 — Reverse path: Lua → binary
 
@@ -440,12 +456,24 @@ runs AFTER HMAC verify (so attackers cannot use stale-ts to spam logs).
 ### §5.4 — Replay
 
 Session-wide `seen_ids` keyed by request ULID:
-`wezterm.GLOBAL.wezsesh_seen_ids[<ulid>] = { ts = os.time() }`.
+`wezterm.GLOBAL.wezsesh_seen_ids[<ulid>] = <unix-seconds-int>`.
 If present → silent drop.
 
 ULIDs are 128-bit; collision probability across a session is negligible.
 Per-pane bucketing (v2) added prune complexity with no security benefit
 because HMAC already binds a request to the session key.
+
+**`wezterm.GLOBAL` value-shape rule.** All values stored in
+`wezterm.GLOBAL.*` sub-tables MUST be flat scalars (string, integer,
+boolean) — NOT nested Lua tables. mlua's GLOBAL userdata accepts
+table writes but silently breaks indexing on read with "can only
+index array or object values". A v2 draft of this section had
+`seen_ids[ulid] = { ts = N }`; the spike (#1) found the read-time
+crash. The same rule applies transitively to every other GLOBAL
+key listed in §10.6: pack nested fields into a single string
+(JSON-encoded via `wezterm.json_encode` if structured), or keep one
+key per scalar. CI gate (§17.4): grep ban on `wezterm.GLOBAL[%s.]*=%s*{`
+in `plugin/wezsesh/*.lua` outside the canonical-JSON encoder.
 
 ### §5.5 — TTL prune
 
@@ -637,6 +665,7 @@ The "Surface" column distinguishes:
 | `NO_PATH_PROVIDER` | no zoxide/fd on PATH and no override | n/a | `tui-only` | toast w/ install hint |
 | `RENAME_COLLISION` | rename target already exists (live or saved) | n/a | `binary-only` | TUI re-prompts |
 | `TRUST_REBIND_MISSING` | `wezsesh trust --rebind <old> <new>` source absent | n/a | (CLI exit) | exit non-zero |
+| `WEZSESH_UNDER_MULTIPLEXER` | binary launched under tmux / screen / asciinema / agent harness; OSC would be intercepted before reaching wezterm | n/a | `doctor-only` | doctor remediation: open a native wezterm tab |
 | `UNKNOWN` | uncategorised | `completed` | `error.code` | toast |
 
 `details` field shapes:
@@ -1799,6 +1828,20 @@ If wezterm ever swaps to LuaJIT (no native bitwise ops), `ct_eq.lua`
 would need a `bit.bxor` / `bit.bor` rewrite. The CI check fails loudly
 in that scenario, preventing silent breakage.
 
+### §9.0.1 — mlua sandbox constraints
+
+wezterm's mlua runtime is a Lua 5.4 *sandbox* — not stock Lua. The
+following stdlib features are unavailable at runtime and MUST NOT be
+used in plugin code:
+
+| Feature | Status | Required workaround |
+|---|---|---|
+| `debug.getinfo` / `debug.traceback` / any `debug.*` function | NOT exposed | Plugin cannot self-locate via `debug.getinfo(1, "S").source`; `init.lua`'s `apply_to_config` accepts an explicit `plugin_root` (or derives one from `binary`'s parent dir). See §9.1. |
+| `wezterm` as a global (`_G.wezterm`) | NOT exposed | Every submodule MUST acquire it via `local wezterm = require("wezterm")` at file top. Reading `_G.wezterm` resolves to nil and silently puts every "if `_G.wezterm` then runtime else test-mode" branch into test-mode. Spike #1 exhibited this — `ipc.handle_value` returned `no_key` because its `_G.wezterm.GLOBAL.wezsesh_session_key` lookup failed. |
+
+CI gates (§17.4): grep bans `debug%.` and `_G%.wezterm` references
+under `plugin/wezsesh/*.lua`.
+
 ### §9.1 — `init.lua`
 
 ```lua
@@ -1808,6 +1851,21 @@ M.VERSION = "0.1.0"      -- bumped per tagged release; CI asserts match
 -- Entry point. Body wrapped in pcall (P §7.1).
 -- Sentinel-prefixed errors (WEZSESH_*) raised via error(msg, 0) are
 -- detected by string.find substring match and surfaced via 10s toast.
+--
+-- opts MUST carry one of:
+--   • binary       = "<absolute path to wezsesh binary>"
+--                    plugin_root is auto-derived as parent_dir(binary)/plugin
+--   • plugin_root  = "<absolute path to plugin/ dir>"
+--                    explicit; takes precedence when both are set.
+--
+-- The function MUST bust `package.loaded["wezsesh.*"]` at entry so
+-- `Ctrl+Shift+R` reloads pick up submodule edits without a full
+-- wezterm restart. Wezterm reloads init.lua via `loadfile` but does
+-- NOT re-evaluate cached `require()` results (spike #1).
+--
+--   for k in pairs(package.loaded) do
+--       if k:sub(1, 8) == "wezsesh." then package.loaded[k] = nil end
+--   end
 function M.apply_to_config(config, opts)  end
 
 -- Programmatic API
@@ -1819,6 +1877,9 @@ function M.pinned(name)        end       -- bool
 
 return M
 ```
+
+CI gate (§17.4): grep asserts the `package.loaded` bust loop is
+present in `plugin/init.lua`'s `apply_to_config`.
 
 ### §9.2 — `manager.lua`
 
@@ -2208,19 +2269,29 @@ wezsesh_session_key       string  (64 hex chars; the only HMAC-key store)
 wezsesh_plugin_version    string  ("0.1.0")
 wezsesh_bin_path          string  (absolute path)
 wezsesh_state             object  → keyed by pane_id_str:
-    {
-      target_window_id : number,
-      spawned_at       : number
-    }
+                                    JSON-encoded string
+                                    (decode via wezterm.json_parse to get
+                                     {target_window_id, spawned_at})
 wezsesh_seen_ids          object  → keyed by ULID string:
-                                    { ts = number }     (session-wide)
+                                    int unix-seconds  (session-wide)
 wezsesh_requests          object  → keyed by request ULID:
-    { spawned_pane_id = number, started_at = number }
+                                    JSON-encoded string
+                                    (decode to get
+                                     {spawned_pane_id, started_at})
 wezsesh_writing           object  → keyed by absolute path: bool
 ```
 
 (Note vs v2: `hmac_key` is no longer per-pane; `seen_ids` is now
 session-wide rather than nested under `wezsesh_state[pid]`.)
+
+**Storage shape rule.** All values stored in `wezterm.GLOBAL.*`
+sub-tables are flat scalars (string, integer, boolean) per §5.4.
+The two structured ones above (`wezsesh_state[pid]`,
+`wezsesh_requests[id]`) are stored as JSON-encoded strings — the
+caller round-trips through `wezterm.json_encode` / `wezterm.json_parse`
+at the boundary. Storing them as nested Lua tables breaks indexing
+on read with "can only index array or object values" (mlua quirk
+found by spike #1).
 
 ### §10.7 — Binary config file (`$WEZSESH_CONFIG_FILE`)
 
@@ -3255,6 +3326,10 @@ plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 | `defer recover()` presence in goroutines in restricted packages | AST walk for `go func` and goroutine-bodies | PR fail |
 | `log.Println`/`fmt.Fprintln(os.Stderr, ...)` in restricted packages | AST walk; must use `internal/logger` | PR fail |
 | `verb_args_shape` parity | reflective check: keyset(dispatch_table) == keyset(verb_args_shape) | PR fail |
+| `_G.wezterm` reference in `plugin/wezsesh/*.lua` | grep `_G%.wezterm` | build error (use `local wezterm = require("wezterm")`) |
+| `debug.*` reference in `plugin/wezsesh/*.lua` (incl. `init.lua`) | grep `\bdebug%.` | build error (mlua sandbox lacks debug library) |
+| `package.loaded["wezsesh.*"] = nil` bust loop in `init.lua` | grep | build error if `apply_to_config` body lacks the loop |
+| Nested-table value into `wezterm.GLOBAL` | grep `wezterm%.GLOBAL[%w_.]*%s*=%s*{` outside canonical-JSON | PR fail (use scalar or JSON-encoded string per §5.4) |
 
 ---
 
@@ -3399,6 +3474,10 @@ for the run-time byte-equality artefacts.
 | Default-allowlist sync | codegen tool | source `default.txt` ↔ generated `default_allowlist.lua` mismatch |
 | Verb / shape parity | reflective check | `dispatch_table` keys ≠ `verb_args_shape` keys |
 | Locale | run `LC_ALL=C` | test diff failure |
+| `_G.wezterm` ban (`plugin/wezsesh/*.lua`) | grep `_G%.wezterm` | any reference (mlua sandbox does not expose wezterm globally) |
+| `debug.*` ban (`plugin/wezsesh/*.lua`, `plugin/init.lua`) | grep `\bdebug%.` | any reference (debug library unavailable in mlua) |
+| `package.loaded["wezsesh.*"]` bust loop in `apply_to_config` | grep | absence in `plugin/init.lua` |
+| Nested-table value to `wezterm.GLOBAL.*` outside canonical-JSON | grep `wezterm%.GLOBAL[%w_.]*%s*=%s*{` | breaks indexing on read |
 
 ### §17.5 — Fuzz test mutation classes (Lua handler)
 
