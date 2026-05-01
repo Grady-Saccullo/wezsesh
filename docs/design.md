@@ -49,6 +49,7 @@ PRD section references are given as `(P §x.y)`.
 | 25 | Threat-model assumption made explicit (Appendix D): single-user host. `wezsesh keygen` exit path is unchanged; the assumption is now a documented precondition. | v2-P9 |
 | 26 | Unicode sort caveat made explicit (§13.10): alphabetical sort is byte-order over NFC-normalised UTF-8 — locale-naive. Locale-aware ordering deferred. | v2-R10 |
 | 27 | Config-vs-env precedence specified explicitly (§11.4) and documented as a single resolution table. | v2-R16 |
+| 28 | §17.2 HMAC round-trip fixture corrected: the prior placeholder `id` (`01JABCDEFGHIJKLMNPQRSTUVWXY`) was 27 chars and used Crockford-excluded glyphs (I, L, U), so §9.3.1's `#id == 26` check would silent-drop it before HMAC verify ran. Replaced with `01JABCDEFGHJKMNPQRSTVWXYZA` (26 chars, all-Crockford-valid); `expected_hmac` is now pinned to the openssl-computed value. Pure-Lua HMAC + canonical-JSON encoder were validated against this fixture and against openssl during the IPC integration spike. | spike-#1 (`docs/issues/1.md`) |
 
 ### §0.2 — Document map
 
@@ -3301,16 +3302,31 @@ diff'd. Any divergence fails the build. CI runs under `LC_ALL=C`.
 ```
 key_hex = "a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1"
 canonical_json (noop fixture, including v):
-    {"args":{},"hmac":"<computed>","id":"01JABCDEFGHIJKLMNPQRSTUVWXY",
+    {"args":{},"hmac":"<computed>","id":"01JABCDEFGHJKMNPQRSTVWXYZA",
      "op":"noop","reply_sock":"/tmp/x.sock","target_window_id":1,
      "ts":1700000000,"v":1}
-expected_hmac = <pre-computed via reference RFC-4231 tooling, committed>
+canonical_sans_hmac.sha256 = f23dc13717d2c992a06d216528f9a0fb62ffd0d2b896ddf66e5dd3931911f616
+expected_hmac              = 52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5
 ```
 
 Both encoders MUST emit `expected_hmac` for the canonical sans-hmac
 form. Both directions tested:
 - Lua signs → Go verifies
 - Go signs → Lua verifies
+
+`expected_hmac` was computed via `openssl dgst -sha256 -mac HMAC -macopt
+hexkey:<key>` (an RFC-4231 reference) over the canonical sans-hmac
+bytes. Cross-validated by an independent Go (`crypto/hmac`) and
+pure-Lua HMAC implementation during spike #1; see `docs/issues/1.md`
+for the run-time byte-equality artefacts.
+
+> **Note on the `id` literal.** Earlier drafts of this section carried
+> `01JABCDEFGHIJKLMNPQRSTUVWXY`, which was 27 chars and used `I`, `L`,
+> `U` — all excluded from the Crockford-base32 alphabet. Either flaw
+> would have caused §9.3.1's `#payload.id == 26` check to silent-drop
+> the fixture before HMAC verify ever ran, defeating the round-trip
+> test. The replacement above is 26 chars and uses no Crockford-excluded
+> glyphs; `expected_hmac` was recomputed against the new bytes.
 
 ### §17.3 — Required tests by surface
 
