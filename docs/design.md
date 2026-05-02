@@ -54,6 +54,7 @@ PRD section references are given as `(P §x.y)`.
 | 30 | §5.4 `seen_ids` storage shape narrowed to a flat int (`unix-seconds`) per ULID; new "GLOBAL value-shape rule" forbids nested-table values in `wezterm.GLOBAL.*`. mlua's GLOBAL userdata silently breaks indexing on read for nested-table values ("can only index array or object values"). §10.6 schema updated; same rule applies to all `wezterm.GLOBAL` sub-tables. | spike-#1 |
 | 31 | §9.1 `apply_to_config(config, opts)` contract tightened: `opts` MUST carry `binary` (or `plugin_root`); the function MUST bust `package.loaded["wezsesh.*"]` at entry. wezterm's `Ctrl+Shift+R` reloads the entry-point file via `loadfile` but does NOT re-evaluate cached `require()` results, so submodule edits never land without an explicit cache-bust or full wezterm restart. | spike-#1 |
 | 32 | §3.1 gains a "PTY-multiplexer" caveat: the binary MUST run inside a native wezterm pane. tmux / screen / asciinema / Claude-Code-style agents own the PTY, consume the OSC bytes as program output, and never forward the SetUserVar to wezterm's parser. New doctor check `WEZSESH_UNDER_MULTIPLEXER` flags the condition based on `$TMUX` / `$STY` / agent env vars in the binary's environment. | spike-#1 |
+| 33 | Save / load Lua handlers no longer rely on `pcall(state_manager.save_state, …)` returning errors — `save_state` swallows I/O and encryption errors into a `wezterm.emit("resurrect.error", string)` and returns `nil`. New §9.13 `resurrect_error.lua` exposes `with_capture(fn) → (pcall_ok, pcall_ret, captured)` that combines a per-call buffer with the persistent listener. §9.4.1 / §9.4.2 rewritten to dual-path detection (pcall return catches `wezterm.json_encode` failures; capture catches I/O / encryption failures). §9.4.1 additionally splits `SNAPSHOT_LOAD_FAILED` from `RESURRECT_PARTIAL` for the corrupted-snapshot case (load returned `{}` → restore raised `ipairs(nil)` → previously misclassified as PARTIAL). §9.1 registers the listener and calls `resurrect.state_manager.change_state_save_dir(snapshot_dir .. "/")`. Appendix C events table expanded; §13.4 caveat 2.b strengthened ("empirically broken — spike #2 verified"); §7 `SAVE_FAILED` / `SNAPSHOT_LOAD_FAILED` `details.raw_error` taxonomy added. Upstream gap acknowledged at [MLFlexer/resurrect.wezterm#28](https://github.com/MLFlexer/resurrect.wezterm/issues/28). | spike-#2 (`docs/issues/2.md`) |
 
 ### §0.2 — Document map
 
@@ -112,6 +113,7 @@ wezsesh/
 │       ├── b64.lua                              §9.10
 │       ├── on_pane_restore.lua                  §9.11
 │       ├── default_allowlist.lua                §9.12   (codegen'd, see §8.12)
+│       ├── resurrect_error.lua                  §9.13   (resurrect.error capture; spike-#2)
 │       └── vendor/
 │           ├── sha2.lua                         pinned commit, MIT
 │           └── SOURCES.lock                     upstream commit + sha256
@@ -671,10 +673,38 @@ The "Surface" column distinguishes:
 `details` field shapes:
 - `ILLEGAL_NAME` — `{ field: "name"|"tags[i]", reason: "<human>" }`.
 - `RESURRECT_PARTIAL` — `{ raw_error: "<lua-error-message>" }`.
-- `SAVE_FAILED` — `{ raw_error: "<lua-error-message>" }`.
+- `SAVE_FAILED` — `{ raw_error: "<lua-error-message>" }`. See raw_error
+  taxonomy below.
+- `SNAPSHOT_LOAD_FAILED` — `{ raw_error: "<lua-error-message>" }`. Same
+  taxonomy.
 - `PATH_PICKER_CMD_FAILED` — `{ stderr_head: "<first 256 bytes>" }`.
 - `RENAME_COLLISION` — `{ existing: "live"|"saved" }`.
 - Others: `{}` or absent.
+
+**`raw_error` taxonomy for `SAVE_FAILED` / `SNAPSHOT_LOAD_FAILED`** (spike
+#2). The string is the unparsed error captured from one of two sources:
+the caller's `pcall` return (when `wezterm.json_encode` /
+`wezterm.json_parse` raised), or the `resurrect.error` event payload
+(when resurrect's internal pcall caught an I/O / encryption error and
+emitted the message). **Wezsesh does NOT pattern-match on the message
+for control flow** — every distinct failure yields a `SAVE_FAILED` /
+`SNAPSHOT_LOAD_FAILED` with a different opaque string. The TUI toast
+surfaces the first 256 bytes of `raw_error` verbatim (sanitised per
+§15.4); the helper-line copy in `internal/tui/strings.go` may probe the
+prefix for a "disk full?" / "agent missing?" hint.
+
+| Prefix | Origin | Probable cause |
+|---|---|---|
+| `EOF while parsing a value at line N column M` (or other serde_json) | `wezterm.json_parse` raised — caller's `pcall` return | Snapshot file is truncated / not JSON. **Plaintext only**; encrypted files show as `Decryption failed` instead. |
+| `error converting Lua function to value` (or other serde_json encode error) | `wezterm.json_encode` raised — caller's `pcall` return | Workspace state contains a non-encodable Lua value (function, userdata, cycle). Should not happen in practice — resurrect-collected state is plain tables — but defensible if some future plugin pollutes the state. |
+| `Failed to write state: …Could not open file:` | `resurrect.error` event | `io.open(path, "w+")` returned nil. Usually parent dir gone, EACCES, EROFS. |
+| `Failed to write state: …` (other suffix) | `resurrect.error` event | `write` / `flush` / `close` raised. Usually ENOSPC, EIO, broken pipe. |
+| `Encryption failed: …Failed to execute:` | `resurrect.error` event | `io.popen(cmd, "w")` returned nil. Encryption binary missing on PATH. |
+| `Encryption failed: …` (other suffix) | `resurrect.error` event | Encryption process exit nonzero or stderr non-empty. Wrong recipient, agent error. |
+| `Decryption failed: …` | `resurrect.error` event | Decryption process exit nonzero. Wrong key, file corrupted, agent error. |
+| `Invalid json: <path>` | `resurrect.error` event | `wezterm.json_parse` returned nil rather than throwing. Rare on current wezterm builds; spike #2 V3 showed `throw` is the dominant path. |
+
+These prefixes are observational; adding new ones does not break wezsesh.
 
 Adding a new code requires updating: this table, the relevant package's
 emitter, the TUI copy table (`internal/tui/strings.go`), and the
@@ -1620,6 +1650,11 @@ wezterm.pane.env                   ← WEZTERM_PANE set + resolves
 snapshot.dir.exists
 snapshot.dir.writable
 snapshot.dir.fs.network
+snapshot.dir.matches.resurrect     ← detect resurrect's save_state_dir
+                                     from <snapshot_dir>/workspace/ +
+                                     <snapshot_dir>/window/ presence;
+                                     warn if drift from cfg.SnapshotDir
+                                     (spike #2)
 snapshot.count
 snapshot.name.validation
 snapshot.argv.allowlist.coverage
@@ -1866,6 +1901,20 @@ M.VERSION = "0.1.0"      -- bumped per tagged release; CI asserts match
 --   for k in pairs(package.loaded) do
 --       if k:sub(1, 8) == "wezsesh." then package.loaded[k] = nil end
 --   end
+--
+-- After cache-bust, `apply_to_config` MUST also (spike #2):
+--   (a) require("wezsesh.resurrect_error").register()
+--       — installs the persistent `wezterm.on("resurrect.error", …)`
+--       listener that backs §9.13's with_capture. Idempotent within a
+--       Lua state via a `_G` install gate; cleanly re-armed on reload
+--       (handlers are wiped when wezterm rebuilds the Lua state).
+--   (b) resurrect.state_manager.change_state_save_dir(opts.snapshot_dir .. "/")
+--       — keeps resurrect's save_state_dir in lockstep with wezsesh's
+--       configured snapshot_dir. Wezsesh's expected_hash, sidecar
+--       correlation, and §12.3 name encoding all assume the two
+--       directories are the same; doctor `snapshot.dir.matches.resurrect`
+--       (§8.17.1) catches drift, but `apply_to_config` makes drift
+--       impossible by construction.
 function M.apply_to_config(config, opts)  end
 
 -- Programmatic API
@@ -1980,24 +2029,120 @@ return M
 
 #### §9.4.1 — Restore-class verbs (split-reply)
 
-`switch` (when target is saved-not-live) and `load` emit:
-1. `result.reply_started(payload)` BEFORE calling
-   `resurrect.workspace_state.restore_workspace(...)` (pcall-wrapped).
-2. Then, AFTER restore returns: `result.reply_completed(payload, data)`
-   on success or `result.reply_partial(payload, data, warnings)` on
-   pcall-caught error.
+`switch` (when target is saved-not-live) and `load` emit
+`result.reply_started(payload)` first, then run two sequential
+`with_capture` calls (§9.13) — one around `load_state`, one around
+`restore_workspace` — so the load-failure path and the restore-failure
+path map to distinct error codes.
+
+```
+1. result.reply_started(payload)
+
+2. local ok_load, state, captured_load =
+       resurrect_error.with_capture(function()
+         return resurrect.state_manager.load_state(name, "workspace")
+       end)
+
+   • if not ok_load:
+       reply_error(payload, "SNAPSHOT_LOAD_FAILED",
+                   tostring(state),                  -- pcall return = the error
+                   { raw_error = tostring(state) })  -- e.g. wezterm.json_parse
+       return                                          --       throw on torn JSON
+   • if #captured_load > 0 OR not state.window_states:
+       local raw = (#captured_load > 0)
+                   and table.concat(captured_load, " | ")
+                   or "load returned empty state"
+       reply_error(payload, "SNAPSHOT_LOAD_FAILED", raw,
+                   { raw_error = raw })
+       return                                          -- decrypt failure path or
+                                                       -- silent {} return path
+
+3. local ok_restore, _, captured_restore =
+       resurrect_error.with_capture(function()
+         resurrect.workspace_state.restore_workspace(state, opts)
+       end)
+
+   • if not ok_restore:
+       reply_partial(payload, data,
+                     {{ code = "RESURRECT_PARTIAL",
+                        details = { raw_error = tostring(captured_restore[1]
+                                                          or "<no message>") }}})
+   • elseif #captured_restore > 0:
+       reply_partial(payload, data,
+                     {{ code = "RESURRECT_PARTIAL",
+                        details = { raw_error = table.concat(captured_restore,
+                                                              " | ") }}})
+   • else:
+       reply_completed(payload, data)
+```
+
+**Why the split.** `load_state` returns `{}` on json_parse-returned-nil
+or decrypt failure (resurrect's `state_manager.lua:43–46`); spike #2 V3
+showed `wezterm.json_parse` actually *throws* on torn JSON, so the
+plaintext-corrupted path arrives via `not ok_load`, while the
+encrypted-wrong-key path still arrives via the `{}` return + non-empty
+capture. Both must be detected before `restore_workspace` is called —
+otherwise `restore_workspace({})` raises `ipairs(nil)` from inside the
+spawn loop and the error gets misclassified as `RESURRECT_PARTIAL`
+when the snapshot is actually unreadable. Step 2's "lacks
+`.window_states`" check guards this.
+
+**Why the second `with_capture`.** Resurrect's
+`restore_workspace` does not internally pcall its window/tab spawn loop
+(`workspace_state.lua:32–43` has no inner pcall). The wezsesh-side
+`with_capture` is therefore load-bearing: without it, a single bad cwd
+in the snapshot terminates the Lua handler before `result.reply_*` can
+fire. The capture also catches mid-restore `resurrect.error` emissions
+(e.g., the `Domain X is not spawnable` path at `pane_tree.lua:81`) and
+appends them to the warning's `details.raw_error` for parity with
+`SAVE_FAILED`.
 
 #### §9.4.2 — Save handler
 
-`save`'s Lua-side handler:
-1. Receive payload. Lua does NOT enforce `expected_hash` — that has
+`save`'s Lua-side handler is **dual-path**: `pcall` catches
+`wezterm.json_encode` failures, `with_capture` (§9.13) catches I/O and
+encryption failures. Both must be inspected before replying success.
+
+```
+1. Receive payload. Lua does NOT enforce expected_hash — that has
    already been checked binary-side (§13.4) before the OSC was emitted.
-2. `pcall(resurrect.state_manager.save_state, current_state)`.
-3. On success: `result.reply_completed(payload, { name = name })`.
-   The binary fills `hash` after re-reading the file under a brief
-   second lock (§13.4 step 7) and surfaces the final value to TUI.
-4. On error: `result.reply_error(payload, "SAVE_FAILED",
-   tostring(err), { raw_error = tostring(err) })`.
+
+2. local current_state =
+       resurrect.workspace_state.get_workspace_state()
+
+3. local pok, perr, captured =
+       resurrect_error.with_capture(function()
+         return resurrect.state_manager.save_state(current_state)
+       end)
+
+4. if not pok:
+       -- pcall caught a Lua error. Almost always a wezterm.json_encode
+       -- failure (spike #2 V4a confirmed `throw` on non-encodable
+       -- inputs like function values; serde_json error string surfaces
+       -- as `error converting Lua function to value`).
+       result.reply_error(payload, "SAVE_FAILED",
+                          tostring(perr),
+                          { raw_error = tostring(perr) })
+       return
+
+5. if #captured > 0:
+       -- save_state returned cleanly (per spike #2 V6, pcall_ok=true,
+       -- ret=nil) but resurrect.error fired during the call. I/O
+       -- failure (ENOSPC / EACCES / EROFS) or encryption-agent failure.
+       local raw = table.concat(captured, " | ")
+       result.reply_error(payload, "SAVE_FAILED", raw,
+                          { raw_error = raw })
+       return
+
+6. result.reply_completed(payload, { name = name })
+   -- The binary fills `hash` after re-reading the file under a brief
+   -- second lock (§13.4 Phase C) and surfaces the final value to TUI.
+```
+
+**Bare `pcall(save_state, …)` is forbidden.** CI lint (§17.4) rejects
+any `pcall` of `resurrect.state_manager.save_state` outside
+`resurrect_error.with_capture` — the bare form silently misses the I/O
+failure path.
 
 ### §9.5 — `result.lua`
 
@@ -2187,6 +2332,108 @@ return {
 
 CI gate: regenerate, diff against the committed file; mismatch fails
 the build.
+
+### §9.13 — `resurrect_error.lua` (resurrect.error capture)
+
+Owns the persistent `wezterm.on("resurrect.error", …)` listener and the
+per-call capture buffer that backs §9.4.1 / §9.4.2's dual-path error
+detection. New in spike #2; see `docs/issues/2.md` for the empirical
+basis.
+
+```lua
+local M = {}
+local wezterm = require("wezterm")
+
+-- Per-call capture buffer. nil when no save/load is in flight.
+-- Set by with_capture, read after the wrapped fn returns, then cleared.
+local current_capture = nil
+
+-- Diagnostic ring buffer for resurrect.error events that fire when no
+-- with_capture is active (e.g., resurrect.periodic_save errors). Bounded;
+-- pruned on overflow. Surfaced by `wezsesh doctor` and the recent-errors
+-- log check (§8.17.1 `log.recent_errors`).
+local UNCAPTURED_RING_MAX = 32
+local uncaptured_ring = {}
+
+local function on_resurrect_error(msg)
+    local s = tostring(msg)
+    if current_capture then
+        current_capture[#current_capture + 1] = s
+    else
+        wezterm.log_warn("resurrect.error (uncaptured): " .. s)
+        uncaptured_ring[#uncaptured_ring + 1] =
+            { ts = os.time(), msg = s }
+        while #uncaptured_ring > UNCAPTURED_RING_MAX do
+            table.remove(uncaptured_ring, 1)
+        end
+    end
+    -- DO NOT return false; that would short-circuit other handlers
+    -- (e.g., the user's own toast handler). See §C "registration order"
+    -- and the wezterm.on contract.
+end
+
+-- Install the listener. Called from §9.1 apply_to_config AFTER the
+-- package.loaded["wezsesh.*"] cache-bust loop. Idempotent within a
+-- single Lua state via a `_G` install gate.
+--
+-- Why _G and not wezterm.GLOBAL: GLOBAL persists across reloads, so a
+-- GLOBAL gate would skip installation when the listener has actually
+-- been wiped (wezterm rebuilds the Lua state on reload). Why _G and
+-- not a module-local `installed` flag: the cache-bust loop reloads
+-- this module on every apply_to_config call, resetting any
+-- module-local state. _G survives the cache-bust within one Lua state
+-- and is reset on reload — exactly the scope we want.
+--
+-- wezterm.on has no de-register API (per wezterm docs); duplicate
+-- registration would mean every resurrect.error emission appends
+-- multiple copies into current_capture.
+function M.register()
+    if _G._wezsesh_resurrect_error_listener_installed then
+        return
+    end
+    wezterm.on("resurrect.error", on_resurrect_error)
+    _G._wezsesh_resurrect_error_listener_installed = true
+end
+
+-- Public API consumed by ops.lua (§9.4.1, §9.4.2).
+--
+-- Wraps `fn` in pcall and a fresh capture buffer. Returns three values:
+--   pcall_ok   bool     — false iff fn raised a Lua error
+--   pcall_ret  any      — pcall's second return (the value fn returned
+--                          on success, or the error value on failure)
+--   captured   string[] — every resurrect.error string emitted between
+--                          fn entry and fn return; empty table if none
+--
+-- Re-entrancy guard: with_capture MUST NOT nest. wezterm.emit is
+-- synchronous (spike #2 V1 confirmed), so the only way to nest is for
+-- a save/load handler to call back into another save/load — currently
+-- no path does this and the assert pins the invariant.
+function M.with_capture(fn)
+    assert(current_capture == nil,
+           "wezsesh.resurrect_error: with_capture nested")
+    current_capture = {}
+    local ok, ret = pcall(fn)
+    local captured = current_capture
+    current_capture = nil
+    return ok, ret, captured
+end
+
+-- For doctor (§8.17.1 log.recent_errors) and reset semantics.
+function M.recent_uncaptured()  end   -- → { {ts, msg}, ... }, copy
+function M.clear_uncaptured()   end
+
+return M
+```
+
+**CI gates** (§17.4):
+
+* `wezterm.on("resurrect.error", …)` outside `resurrect_error.register()` → fail.
+* `pcall(resurrect.state_manager.save_state, …)` outside `resurrect_error.with_capture(…)` → fail.
+* `wezterm.on("resurrect.workspace_state.restore_workspace.finished", …)`
+  (and `.restore_window.finished`, `.restore_tab.finished`) anywhere → fail.
+* `apply_to_config` body must contain `require("wezsesh.resurrect_error").register()` — grep absent → fail.
+
+**Test contracts** (§17.3): see "spike-#2" tagged rows.
 
 ---
 
@@ -2681,10 +2928,18 @@ TUI dispatch save{ name, overwrite, expected_hash }
   PHASE B — emit save OSC (no lock held):
   dispatcher.Dispatch(ipcCtx, "save", { name, overwrite, expected_hash })
   Lua resurrect.state_manager.save_state(...)
-  Lua reply:
-    "completed" ok=true       → proceed
+  Lua reply (per §9.4.2 dual-path detection — pcall catches
+                 json_encode failures; with_capture catches I/O /
+                 encryption failures):
+    "completed" ok=true       → proceed to Phase C
     "completed" ok=false      → propagate SAVE_FAILED to TUI; return
                                 (Lua includes details.raw_error)
+                                Phase C MUST be skipped — resurrect may
+                                not have written the file at all
+                                (encryption error path leaves prior
+                                bytes intact); rehashing would return
+                                the OLD hash and silently mask the
+                                failure.
   ▼
   PHASE C — re-hash under brief second lock:
   fd2, release2, err := safefs.AcquireExclusive(
@@ -2714,8 +2969,10 @@ TUI dispatch save{ name, overwrite, expected_hash }
   best-effort "file matched what I last saw". This trade-off is
   acceptable because:
   1. The race window is sub-millisecond in practice.
-  2. The watertight alternative (lock-during-IPC) is broken anyway —
-     resurrect uses `io.open` and ignores POSIX locks.
+  2. The watertight alternative (lock-during-IPC) is empirically broken —
+     resurrect uses `io.open(path, "w+")` and ignores POSIX advisory locks
+     (spike #2 confirmed: `file_io.lua:13`; no `flock` / `fcntl` /
+     `F_SETLK` / `lockf` anywhere in the plugin tree).
 - The new hash returned to the TUI is computed AFTER Lua finishes,
   so it accurately reflects the on-disk file as Lua wrote it.
 
@@ -2815,6 +3072,26 @@ delete            | yes                 | filesystem op
 tag / pin         | yes                 | sidecar is plaintext, separate
 preview           | DEGRADED            | "(encrypted snapshot — preview unavailable)"
 ```
+
+**Encryption errors are indistinguishable from disk errors at the
+wezsesh-binary level** (spike #2). Both surface as `SAVE_FAILED`
+(§7) with a `details.raw_error` string; the message-prefix taxonomy
+(§7) is the only differentiator and is used for the TUI helper line
+only — never for control flow. Decrypt failures during `load`/`restore`
+arrive on the same channel: `SNAPSHOT_LOAD_FAILED` with a serde_json
+error string (V3 throw path) when the file was plaintext-but-corrupted,
+or with resurrect's `Decryption failed: <stderr>` capture when the
+encryption agent rejected the key (V6-style swallow path; surfaces
+through §9.13 with_capture in §9.4.1 step 2).
+
+**Large-snapshot encryption transport.** Resurrect's encrypt path
+(`encryption.lua:30`) switches stdin transport at 150 000 bytes on POSIX:
+under the threshold, the JSON is shell-quoted and piped (`echo -E -n
+<input> | <method> -r <pubkey> -o <path>`); over, it goes through
+`io.popen(cmd, "w")` directly. Workspaces with `restore_text` on busy
+panes can exceed 150 KB. Both code paths exist at `47ce553` and produce
+slightly different `Encryption failed: …` message shapes — the §7
+taxonomy accommodates both.
 
 ### §13.7 — Find two-phase
 
@@ -3411,7 +3688,13 @@ for the run-time byte-equality artefacts.
 | Save flock serialisation (Phase A) | `internal/safefs`, `cmd/wezsesh` | one succeeds, other gets `SNAPSHOT_LOCKED` during Phase A |
 | Save first-write (no expected_hash) | `internal/safefs`, `cmd/wezsesh` | `AcquireExclusiveOrCreate` creates, locks, releases; concurrent first-saves serialise via the per-name in-process mutex |
 | Save with stale hash (Phase A reject) | `cmd/wezsesh` | mismatch → `SNAPSHOT_CHANGED`; user re-confirm with refreshed hash succeeds |
-| Save Lua-side failure | `cmd/wezsesh`, `plugin` | resurrect.save_state errors → reply with `ok=false, error.code=SAVE_FAILED, details.raw_error` |
+| Save Lua-side I/O failure (spike-#2) | `plugin`, `cmd/wezsesh` | chmod-0500 snapshot dir → `with_capture` returns `(true, nil, [resurrect.error msg])` → reply `ok=false, error.code=SAVE_FAILED, details.raw_error="Failed to write state: …"`; Phase C MUST be skipped |
+| Save Lua-side encode failure (spike-#2) | `plugin` | workspace state polluted with a function value → `with_capture` returns `(false, "<json_encode err>", [])` → reply `SAVE_FAILED` with serde_json error string in raw_error |
+| Save Lua-side success leaves capture empty (spike-#2) | `plugin` | normal save → `#captured == 0`; reply `completed`; no false-positive `SAVE_FAILED` |
+| `with_capture` re-entrancy guard (spike-#2) | `plugin` | nested `with_capture` raises the assert; outer call's capture is preserved |
+| Load: torn JSON → SNAPSHOT_LOAD_FAILED via pcall (spike-#2) | `plugin` | corrupted plaintext snapshot → `with_capture` returns `(false, "EOF while parsing …", [])` → reply `SNAPSHOT_LOAD_FAILED` BEFORE `restore_workspace` is called |
+| Load: silent decrypt failure → SNAPSHOT_LOAD_FAILED via capture (spike-#2) | `plugin` | wrong-key encrypted snapshot → load_state returns `{}`, capture has `Decryption failed: …` → reply `SNAPSHOT_LOAD_FAILED` BEFORE `restore_workspace` is called (guards the `ipairs(nil)` misclassification path) |
+| `resurrect_error.register()` is idempotent (spike-#2) | `plugin` | calling `apply_to_config` twice in one Lua state → exactly one `wezterm.on("resurrect.error", …)` registration via the `_G` install gate |
 | Save Phase C re-hash | `cmd/wezsesh` | reply.data.hash matches sha256 of file as written by Lua |
 | Save in-process serialisation | `cmd/wezsesh` | two concurrent same-name saves in one binary run sequentially via nameMutex; no races |
 | Switch-poller false-positive | `internal/wezcli` | `switch` to active short-circuits in 1 tick; `switch+restore` bypasses via `isRestoreFlow` |
@@ -3478,6 +3761,11 @@ for the run-time byte-equality artefacts.
 | `debug.*` ban (`plugin/wezsesh/*.lua`, `plugin/init.lua`) | grep `\bdebug%.` | any reference (debug library unavailable in mlua) |
 | `package.loaded["wezsesh.*"]` bust loop in `apply_to_config` | grep | absence in `plugin/init.lua` |
 | Nested-table value to `wezterm.GLOBAL.*` outside canonical-JSON | grep `wezterm%.GLOBAL[%w_.]*%s*=%s*{` | breaks indexing on read |
+| `resurrect_error.register()` invocation in `apply_to_config` (spike-#2) | grep | absence in `plugin/init.lua`'s `apply_to_config` body |
+| `wezterm.on("resurrect.error", …)` outside `resurrect_error.register()` (spike-#2) | grep | any reference outside `plugin/wezsesh/resurrect_error.lua` |
+| `wezterm.on("resurrect.workspace_state.restore_workspace.finished", …)` and the `restore_window.finished` / `restore_tab.finished` siblings (spike-#2) | grep | any reference anywhere; events fire only on success and are never a completion signal |
+| `pcall` of `resurrect.state_manager.save_state` outside `resurrect_error.with_capture` (spike-#2) | grep + AST walker | bare `pcall(resurrect.state_manager.save_state, …)` silently misses the I/O-failure path |
+| `pcall` of `resurrect.state_manager.load_state` outside `resurrect_error.with_capture` (spike-#2) | grep + AST walker | same shape — silent decrypt failures escape detection |
 
 ### §17.5 — Fuzz test mutation classes (Lua handler)
 
@@ -3595,13 +3883,44 @@ snapshot is non-JSON.
 
 | Event | Handler | Purpose |
 |---|---|---|
-| `resurrect.file_io.write_state.start` | `state.set_writing(path, true)` | snapshot-write gate |
-| `resurrect.file_io.write_state.finished` | `state.set_writing(path, nil)` | unblock TUI open |
-| `resurrect.error` | `log_warn` + best-effort correlate to in-flight requests | save-failure observability |
+| `resurrect.file_io.write_state.start` | `state.set_writing(path, true)` | snapshot-write gate (entry) |
+| `resurrect.file_io.write_state.finished` | `state.set_writing(path, nil)` | snapshot-write gate (exit) |
+| `resurrect.error` | `resurrect_error.on_error` (§9.13) → per-call capture buffer when `with_capture` is active; ring-buffer + `log_warn` otherwise | save / load / decrypt / encrypt failure observability |
 
-Note: `resurrect.workspace_state.restore_workspace.finished` is NOT
-subscribed; it only fires on the success path and cannot be used as a
-completion signal.
+**Notes (spike #2):**
+
+* `write_state.finished` is **NOT a success signal** — it fires
+  unconditionally after the encode + write attempt
+  (`file_io.lua:94`). The handler must always clear the writing gate;
+  success vs. failure is determined by `with_capture`'s captured
+  buffer, not by this event.
+* All four `restore_*.finished` events fire *only* on the success path
+  (resurrect does not pcall its restore loops; see
+  `workspace_state.lua:9–46`, `window_state.lua:45–84`,
+  `tab_state.lua:96–119`). **NONE of them is subscribed.** Wezsesh
+  wraps restore calls in `with_capture` (§9.4.1) and surfaces
+  `RESURRECT_PARTIAL` / `SNAPSHOT_LOAD_FAILED` from the result tuple.
+  CI lint (§17.4) rejects any `wezterm.on(name, …)` registration
+  whose `name` matches `restore_workspace%.finished` /
+  `restore_window%.finished` / `restore_tab%.finished` — the
+  success-only behavior is invisible to a reader skimming
+  registrations.
+* `resurrect.error` is fire-and-forget with a single `string` arg.
+  There is no correlation id. Wezsesh routes the event through a
+  per-call capture buffer (§9.13) and drains it around each save /
+  load call, relying on `wezterm.emit` being synchronous (V1
+  empirically confirmed — handler runs inline before `emit` returns).
+* Resurrect's README example references a
+  `resurrect.state_manager.save_state.finished` event. **It is never
+  emitted in source as of `47ce553`.** Do not subscribe to it; use
+  `file_io.write_state.finished` (which fires on success AND error,
+  per the first note above) plus the `resurrect.error` capture.
+* Upstream tracking for an error-aware `state_manager.save_state`
+  shape: [MLFlexer/resurrect.wezterm#28](https://github.com/MLFlexer/resurrect.wezterm/issues/28)
+  (open since 2024-08; maintainer's own acknowledgement of the
+  swallow). If a future resurrect release exposes `(ok, err)` returns,
+  §9.13's `with_capture` becomes a vestigial wrapper that can be
+  simplified.
 
 ---
 
