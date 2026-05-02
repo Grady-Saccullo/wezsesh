@@ -63,7 +63,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 ## Phase 0 — Bootstrap
 
 ### T-000 · Repo skeleton + go.mod
-**Status:** ready
+**Status:** in-progress
 **Owner:** general-purpose
 **Depends-on:** —
 **Spec:** §2 (repo layout), §16.1 (Go version)
