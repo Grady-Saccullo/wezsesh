@@ -22,7 +22,7 @@ PRD section references are given as `(P §x.y)`.
 
 | # | Change | Rationale |
 |---|---|---|
-| 1 | Save flow no longer holds the OS file lock across the IPC roundtrip. Lock-acquire / hash-verify happen once; lock is released before OSC dispatch; an in-process per-name mutex serialises concurrent wezsesh saves. A second short lock is taken to re-hash after Lua returns. | v2-R1/P1 — locks held across async IPC are a smell, and the lock provides no protection against resurrect's own writer anyway. |
+| 1 | Save flow no longer holds the OS file lock across the IPC roundtrip. Lock-acquire / hash-verify happen once; lock is released before forward dispatch; an in-process per-name mutex serialises concurrent wezsesh saves. A second short lock is taken to re-hash after Lua returns. | v2-R1/P1 — locks held across async IPC are a smell, and the lock provides no protection against resurrect's own writer anyway. |
 | 2 | `state.json.pins[]` removed. Sidecar `pinned: true\|false` is the single source of truth for saved workspaces; `state.json.live_pins` (renamed) holds pins for live-only workspaces only. The two stores are disjoint by construction; on save, any live pin migrates to the sidecar and is removed from `live_pins`. | v2-P3 — eliminates mirror drift; sidecars are read at startup anyway, so the cache is free. |
 | 3 | `seen_ids` is now session-wide (single map keyed by ULID), not per-pane. ULIDs are globally unique; HMAC binds requests; per-pane bucketing added prune complexity with no security upside. | v2-P2 |
 | 4 | New `internal/ipcdispatcher` package owns the concrete `Dispatcher`. `cmd/wezsesh` only does flag parsing, DI, and lifecycle. | v2-P4 |
@@ -33,7 +33,7 @@ PRD section references are given as `(P §x.y)`.
 | 9 | Hook env scrub narrowed: only the three sensitive vars (`WEZSESH_HMAC_KEY`, `WEZSESH_PROTO_VERSION`, `WEZSESH_CONFIG_FILE`) are dropped. User-tunables (`WEZSESH_LOG`, `WEZSESH_NO_HOOKS`, `WEZSESH_NERDFONT`) survive. | v2-R9 |
 | 10 | Centralised symlink-defense policy in `safefs.SymlinkPolicy` enum + `safefs.Enforce` helper; replaces ad-hoc per-site reactions. | v2-P7 |
 | 11 | Logger flushes immediately on `Warn` and `Error` (not just on the 1 s tick). | v2-P8 |
-| 12 | OSC atomicity rationale rewritten — `/dev/tty` is not a pipe; PIPE_BUF does not apply. The 4 KiB ceiling derives from wezterm's OSC parser buffer + write(2) ergonomics. | v2-R2 |
+| 12 | OSC atomicity rationale rewritten — `/dev/tty` is not a pipe; PIPE_BUF does not apply. The 4 KiB ceiling derives from wezterm's OSC parser buffer + write(2) ergonomics. **Superseded by #34** (spike #3 found this rationale incomplete: byte-level interleave with bubbletea's renderer races at ≥ ~2 KiB on-wire; sidecar pattern adopted). | v2-R2 |
 | 13 | `expected_hash` is always `"sha256:<hex>"`. `snapshots.Repo.Hash` returns the prefixed form; helper `RawHashHex` exists for callers that need the bare hex. Save reply re-hashes after Lua returns. | v2-R7, #10 |
 | 14 | Save flow gains a second timeout budget: `lockCtx` (5 s) and `ipcCtx` (5 s) are independent. | v2-R12 |
 | 15 | `ct_eq.lua` documents the Lua 5.3+ requirement explicitly; CI gate asserts wezterm ships with mlua/Lua 5.4. | v2-R4 |
@@ -55,6 +55,7 @@ PRD section references are given as `(P §x.y)`.
 | 31 | §9.1 `apply_to_config(config, opts)` contract tightened: `opts` MUST carry `binary` (or `plugin_root`); the function MUST bust `package.loaded["wezsesh.*"]` at entry. wezterm's `Ctrl+Shift+R` reloads the entry-point file via `loadfile` but does NOT re-evaluate cached `require()` results, so submodule edits never land without an explicit cache-bust or full wezterm restart. | spike-#1 |
 | 32 | §3.1 gains a "PTY-multiplexer" caveat: the binary MUST run inside a native wezterm pane. tmux / screen / asciinema / Claude-Code-style agents own the PTY, consume the OSC bytes as program output, and never forward the SetUserVar to wezterm's parser. New doctor check `WEZSESH_UNDER_MULTIPLEXER` flags the condition based on `$TMUX` / `$STY` / agent env vars in the binary's environment. | spike-#1 |
 | 33 | Save / load Lua handlers no longer rely on `pcall(state_manager.save_state, …)` returning errors — `save_state` swallows I/O and encryption errors into a `wezterm.emit("resurrect.error", string)` and returns `nil`. New §9.13 `resurrect_error.lua` exposes `with_capture(fn) → (pcall_ok, pcall_ret, captured)` that combines a per-call buffer with the persistent listener. §9.4.1 / §9.4.2 rewritten to dual-path detection (pcall return catches `wezterm.json_encode` failures; capture catches I/O / encryption failures). §9.4.1 additionally splits `SNAPSHOT_LOAD_FAILED` from `RESURRECT_PARTIAL` for the corrupted-snapshot case (load returned `{}` → restore raised `ipairs(nil)` → previously misclassified as PARTIAL). §9.1 registers the listener and calls `resurrect.state_manager.change_state_save_dir(snapshot_dir .. "/")`. Appendix C events table expanded; §13.4 caveat 2.b strengthened ("empirically broken — spike #2 verified"); §7 `SAVE_FAILED` / `SNAPSHOT_LOAD_FAILED` `details.raw_error` taxonomy added. Upstream gap acknowledged at [MLFlexer/resurrect.wezterm#28](https://github.com/MLFlexer/resurrect.wezterm/issues/28). | spike-#2 (`docs/issues/2.md`) |
+| 34 | Forward path uses a sidecar file under `<runtime_dir>/req/` for the canonical-JSON request; the OSC carries only a ≤ 256 B pointer (`{v, id, path}`). The OSC is single-syscall on every supported platform, so the **renderer-OSC byte-level interleave race** — a kernel TTY split-write of an inline-payload OSC interleaved with bubbletea's frame-paint syscalls from a separate fd, causing wezterm's OSC parser to abort the in-progress OSC per ECMA-48 when it sees an embedded ESC and dump the trailing payload bytes into the rendered scrollback — documented in spike #3 (1.33 % OSC loss above ~2 KiB on-wire under bubbletea rendering pressure on darwin-arm64; visible base64 leakage) is structurally impossible. New §3.1 two-phase dispatch (request file write + pointer OSC); §3.3 framing reframed as file-resident; §3.5 grows an OSC-pointer ceiling (256 B) alongside the retained 4 KiB request-file ceiling; new `<runtime_dir>/req/` filesystem entry (§12.1) with mirrored cleanup (§12.4); new `runtime.dir.req_orphans` doctor check (§8.17.1); new `REQ_POINTER_REJECTED` wire-silent error code (§7); `internal/uservar.WriteOSC` contract narrowed to ≤ 256 B with the prior "OSC parser tolerates interleaving" comment removed (§8.8); `internal/ipcdispatcher` Phase 1 calls `safefs.AtomicWriteFile` (§8.6); plugin handler (§9.3) grows pre-steps for pointer decode + path validation + file read + delete; field-shape validator split into pointer (§9.3.1.A) + payload (§9.3.1.B); `b64.lua decode` promoted to hot path (§9.10); §9.0.1 sandbox table gains a `dofile` row plus new §9.0.1.1 documenting Lua's expression-call ambiguity that bit the spike's install snippet; §17.3 / §17.6 grow gates for atomic write, lifecycle, pointer validation, OSC-ceiling enforcement, and end-to-end 0 % loss / 0 orphans. Empirical validation: 1500 emits over 15 buckets up to 6170 B JSON (`mode=sidecar`), 0 % loss, 0 orphans, p50 5.31 ms emit latency. | spike-#3 (`docs/issues/3.md`) |
 
 ### §0.2 — Document map
 
@@ -176,32 +177,89 @@ Lint rules (CI):
 
 ### §3.1 — Forward path: binary → Lua
 
-Bytes written to `/dev/tty` (NOT `os.Stdout`), under
-`internal/uservar.Writer.mu`:
+Two-phase dispatch. The binary first writes the canonical-JSON request
+bytes (§3.3) to a per-request file under `<runtime_dir>/req/`, then
+emits a fixed-shape OSC carrying only a pointer to that file. The OSC
+itself stays ≤ 256 B on the wire (§3.5), which is single-syscall on
+every supported platform.
+
+**Phase 1 — atomic file write.** `safefs.AtomicWriteFile` —
+`O_WRONLY|O_CREAT|O_EXCL` on `<runtime_dir>/req/<8-hex>.json.tmp`,
+write canonical-JSON request bytes, `fsync`, `rename` to
+`<runtime_dir>/req/<8-hex>.json`. Mode 0600 via `unix.Umask(0077)`
+before create. `<8-hex>` is the first 8 hex chars of the request ULID
+— **same prefix used by the reply socket (§3.2)** so post-mortem
+debugging can correlate request file and reply socket by visual scan.
+Symlink defense via `safefs.Enforce(SymlinkRefuse)` on every ancestor
+of `<runtime_dir>/req/` at startup.
+
+**Phase 2 — pointer OSC.** Bytes written to `/dev/tty` (NOT
+`os.Stdout`), under `internal/uservar.Writer.mu`:
 
 ```
-ESC ] 1337 ; SetUserVar=wezsesh_op= <base64-payload> BEL
+ESC ] 1337 ; SetUserVar=wezsesh_op= <base64-pointer> BEL
 0x1B 0x5D "1337;SetUserVar=wezsesh_op=" <b64> 0x07
 ```
 
-`<b64>` is `base64.StdEncoding` of the canonical-JSON request bytes
-(§3.3). No line wrap, no padding tweaks.
+`<b64>` is `base64.StdEncoding` of the canonical-JSON pointer.
+*Example shown in human reading order; the on-the-wire byte order is
+the canonical one given below the schema:*
+
+```jsonc
+{
+  "v":    1,
+  "id":   "<26-char Crockford-base32 ULID>",
+  "path": "<absolute path to the request file>"
+}
+```
+
+`pointer.id` MUST equal `payload.id` (§3.3); the plugin rejects any
+mismatch as a forged or stale pointer. Pointer field order **on the
+wire** (canonical JSON) is unsigned UTF-8 byte order: `id`, `path`,
+`v`.
 
 **Atomicity rationale.** `/dev/tty` is a character device backed by the
 controlling terminal driver; PIPE_BUF semantics do NOT apply (PIPE_BUF
-governs `pipe(2)` and FIFOs only). wezterm's OSC parser buffers bytes
-across reads until it sees the `ESC \` / `BEL` terminator, so partial
-writes do not corrupt the sequence. The 4 KiB request ceiling (§3.5) is
-self-imposed for two reasons:
-1. `write(2)` to a non-blocking TTY rarely returns short for ≤ 4 KiB
-   payloads in practice (the kernel TTY buffers are 4 KiB on Linux,
-   ≥ 1 KiB on darwin), keeping the common-case write a single syscall;
-2. it gives the OSC parser a hard upper bound for memory budgeting.
+governs `pipe(2)` and FIFOs only). The on-the-wire pointer OSC at
+≤ 256 B fits in a single kernel `write(2)` syscall on every supported
+platform (darwin TTY ≥ 1 KiB, Linux ≥ 4 KiB), which the kernel TTY
+layer serialises against any other writer's syscall. The
+renderer-OSC byte-level interleave race documented in spike #3 (1.33 %
+OSC loss above ~2 KiB on-wire under bubbletea rendering pressure on
+darwin-arm64; visible base64 leakage in scrollback when the OSC parser
+encounters a bubbletea-emitted ESC mid-payload and aborts the in-progress
+OSC per ECMA-48) is therefore **structurally impossible** under this
+two-phase scheme: the OSC is always single-syscall, and the full
+request payload is on disk where the OSC parser never sees it.
 
-The `internal/uservar.Writer.mu` mutex serialises wezsesh's own writes;
-it does NOT prevent interleaving with bubbletea's renderer (which also
-writes to `/dev/tty`). Wezterm's OSC parser handles interleaved
-non-OSC bytes correctly because OSC is delimited.
+The `internal/uservar.Writer.mu` mutex serialises wezsesh's own
+pointer-OSC writes against any concurrent OSC the binary itself may
+emit (currently none; reserved for future). It does NOT need to
+coordinate with bubbletea's renderer — the pointer OSC's
+single-syscall property removes that requirement.
+
+**Plugin-side handler outline.** The `user-var-changed` callback for
+`wezsesh_op` runs four pre-steps before §9.3's existing (a)–(i) state
+machine, on the same synchronous Lua bytecode path:
+
+1. `b64.decode` + `wezterm.json_parse` → pointer.
+2. Pointer field-shape validate (§9.3.1.A): `v == 1`, `id` is 26
+   chars, `path` starts with the configured `<runtime_dir>/req/`
+   prefix. Any failure → `log_warn("REQ_POINTER_REJECTED", reason)`
+   and silent-drop.
+3. `io.open(path, "r")` then `lfs`-style stat (or fallback `wezterm`
+   helper) confirming regular-file, mode 0600, owner-self, not a
+   symlink. Failure → silent-drop with the same code.
+4. `io.read("*a")` → canonical-JSON request bytes; `os.remove(path)`
+   (best-effort; orphans handled by §12.4 startup sweep + §8.17.1
+   `runtime.dir.req_orphans` doctor check); `wezterm.json_parse` →
+   payload. Cross-check `pointer.id == payload.id`; mismatch →
+   silent-drop.
+
+(a)–(i) then run **unchanged** against the file-derived payload —
+HMAC verification, freshness, replay, target-window match, dispatch.
+The schema and bytes the HMAC covers are identical to the prior
+inline-OSC era.
 
 **PTY multiplexer caveat.** The binary MUST run inside a native
 wezterm pane. PTY multiplexers — tmux, screen, asciinema, agent
@@ -239,7 +297,12 @@ mandatory.
 - Sock file: born 0600 via `unix.Umask(0077)` before `net.Listen`;
   `os.Chmod(sock, 0o600)` is a backstop.
 
-### §3.3 — Request payload (canonical JSON before base64)
+### §3.3 — Request payload (canonical JSON, file-resident)
+
+The schema below is the canonical-JSON written into
+`<runtime_dir>/req/<8-hex>.json` per §3.1's two-phase dispatch. Bytes
+are NOT base64'd at rest — the file holds raw canonical-JSON. The
+OSC pointer (§3.1) carries only `{v, id, path}`.
 
 ```jsonc
 {
@@ -258,6 +321,15 @@ All fields REQUIRED **on requests**. Field order in canonical JSON is
 unsigned UTF-8 byte order
 (`args`, `hmac`, `id`, `op`, `reply_sock`, `target_window_id`, `ts`,
 `v`).
+
+The HMAC continues to cover the canonical-JSON request bytes — i.e.,
+the file contents — using the §4 / §5 spec verbatim. The pointer is
+**not** signed; an attacker who could forge OSCs could equally point
+at a file under their control, so pointer-side authenticity adds
+nothing the file-content HMAC does not already provide. Pointer
+validation (path prefix, mode, non-symlink) prevents trivial
+out-of-runtime-dir abuses; HMAC defends against tampering with file
+contents post-write.
 
 ### §3.4 — Reply payload (Unix socket, JSON, no envelope)
 
@@ -297,19 +369,36 @@ OPTIONAL on replies; the others are REQUIRED.
 
 | Limit | Value | Source |
 |---|---|---|
-| Request canonical-JSON size | 4 KiB | self-imposed; TTY/parser ergonomics |
+| **OSC pointer envelope (on the wire)** | **256 B** | hard; preserves §3.1 single-syscall atomicity. See worst-case math below. |
+| Request file size (canonical JSON in `<runtime_dir>/req/<8-hex>.json`) | 4 KiB | self-imposed; canonical-JSON encoder ergonomics + golden-corpus (§17.1) memory bounds. Empirically (spike #3) the wezterm OSC parser handles arbitrary file-content sizes correctly because the file is read directly by the plugin; no kernel TTY interleave concerns apply. The `mode=sidecar` reproducer validated 0 % loss up to 6170 B file content — the 4 KiB ceiling is a canonical-JSON-encoder ergonomics target, not a correctness floor. |
 | Reply payload size | 1 MiB | `io.LimitedReader` cap |
 | First-reply ceiling | 5 s | TUI surfaces `IPC_TIMEOUT` |
 | Follow-up after `started` | 30 s | non-fatal toast on overrun |
 | Single-retransmit at | 2 s | `tea.Tick` Cmd, idempotent guard |
 | Reply dir cleanup mtime | 60 s | startup sweep |
+| Request dir cleanup mtime | 60 s | startup sweep (§12.4); doctor `runtime.dir.req_orphans` (§8.17.1) |
 | Reply channel buffer | 2 | exactly fits split-reply (started + terminal) |
-
-(`delete` no longer goes over OSC; bulk size limit removed.)
 
 The reply channel buffer reduction from v2's 4 to 2 is intentional —
 sequential accept (§13.2) plus the at-most-2 messages per request bound
 the steady-state queue depth at 2.
+
+**OSC pointer worst-case math.** The pointer JSON in canonical byte
+order is `{"id":"<26-char ULID>","path":"<P>","v":1}` where `<P>` =
+`<runtime_dir>/req/<8-hex>.json`. Static structural bytes: 24
+(`{"id":"","path":"","v":1}`) + 26 (`id`) + 18 (literal `/req/` +
+`<8-hex>` + `.json`) + `len(<runtime_dir>)`. With `<runtime_dir>` at
+the darwin SUN_PATH budget (§3.2: 90 B for the budget after subtracting
+the 14-byte socket-tail overhead — `len(<runtime_dir>) ≤ 104 - 14 = 90`),
+the pointer JSON reaches 158 B. After base64 (4/3 expansion → 212 B)
+and the OSC envelope (`\x1B]1337;SetUserVar=wezsesh_op=` = 29 B + b64 +
+BEL = 1 B), worst-case on-the-wire is **242 B**. The 256 B ceiling
+provides 14 B of headroom — enough for one digit-class of growth in
+`<runtime_dir>` length (e.g., a slightly looser SUN_PATH budget on
+Linux where SUN_PATH = 108) but no more. **The §3.2 SUN_PATH check
+already enforces the runtime-dir bound that keeps the pointer under
+256 B**; relaxing §3.2 without a corresponding §3.5 update would
+silently re-open the §3.1 race for marginal-length runtime dirs.
 
 ---
 
@@ -668,6 +757,7 @@ The "Surface" column distinguishes:
 | `RENAME_COLLISION` | rename target already exists (live or saved) | n/a | `binary-only` | TUI re-prompts |
 | `TRUST_REBIND_MISSING` | `wezsesh trust --rebind <old> <new>` source absent | n/a | (CLI exit) | exit non-zero |
 | `WEZSESH_UNDER_MULTIPLEXER` | binary launched under tmux / screen / asciinema / agent harness; OSC would be intercepted before reaching wezterm | n/a | `doctor-only` | doctor remediation: open a native wezterm tab |
+| `REQ_POINTER_REJECTED` | §3.1 pointer fails plugin pre-step validation: malformed JSON, path outside `<runtime_dir>/req/`, file mode ≠ 0600, file is symlink, `io.open` failed (incl. file already removed by retransmit), or `pointer.id ≠ payload.id` | n/a | `wire-silent` | log_warn with rejection reason; reply socket is already bound (§3.2) but the plugin writes no reply, so the binary observes `IPC_TIMEOUT`; doctor `runtime.dir.req_orphans` (§8.17.1) surfaces leaked request files |
 | `UNKNOWN` | uncategorised | `completed` | `error.code` | toast |
 
 `details` field shapes:
@@ -932,15 +1022,21 @@ func (e *ValidationError) Error() string
 ```go
 package ipc
 
-// Dispatcher abstracts the OSC-emit + reply-listen sequence. Used by
-// internal/tui and internal/find so neither package depends directly
-// on internal/uservar / internal/ipcsock.
+// Dispatcher abstracts the request-write + pointer-OSC + reply-listen
+// sequence (§3.1's two-phase forward dispatch). Used by internal/tui
+// and internal/find so neither package depends directly on
+// internal/uservar / internal/ipcsock / internal/safefs.
 type Dispatcher interface {
-    // Dispatch sends one OSC for verb with args and returns a channel
-    // of replies. Single-reply verbs deliver one Reply then close.
-    // Restore-class verbs deliver "started" then a terminal reply,
-    // then close. ctx cancellation closes the listener early; the
-    // channel is then closed after any in-flight read drains.
+    // Dispatch performs the §3.1 two-phase forward dispatch:
+    //   1. safefs.AtomicWriteFile the canonical-JSON request bytes to
+    //      <runtime_dir>/req/<8-hex>.json (mode 0600, tmp+rename).
+    //   2. WriteOSC the §3.1 pointer ({v, id, path}) so the plugin
+    //      learns where to read the request from.
+    // Then returns a channel of replies. Single-reply verbs deliver
+    // one Reply then close. Restore-class verbs deliver "started"
+    // then a terminal reply, then close. ctx cancellation closes the
+    // listener early; the channel is then closed after any in-flight
+    // read drains.
     Dispatch(ctx context.Context, verb string, args map[string]any) (<-chan Reply, error)
 }
 
@@ -973,10 +1069,12 @@ Tests substitute a fake.
 package ipcdispatcher
 
 // New constructs a Dispatcher backed by:
-//   - uservar.Writer for the forward path
+//   - safefs.AtomicWriteFile for the §3.1 Phase-1 request-file write
+//   - uservar.Writer for the §3.1 Phase-2 pointer OSC
 //   - ipcsock.StartListener for the reverse path
 //   - hmac.Signer for request signing
-//   - the per-request socket-path generator
+//   - the per-request socket-path + request-file path generator
+//     (both share the same first-8-hex-of-ULID prefix; see §3.2)
 //
 // The deps argument bundles the live components so that cmd/wezsesh
 // only has to build one struct rather than wire each callsite.
@@ -985,16 +1083,22 @@ func New(deps Deps) (ipc.Dispatcher, func(), error)
 type Deps struct {
     Writer        *uservar.Writer
     Signer        *hmac.Signer
-    RuntimeDir    string
+    RuntimeDir    string  // root for both <runtime_dir>/req/ and reply socket dir
     TargetWindowID int
     Logger        *logger.Logger
 }
 ```
 
+Implementation note: `RuntimeDir/req/` is created with mode 0700 +
+`safefs.Enforce(SymlinkRefuse)` on the parent at construction time;
+each `Dispatch` call writes one file under it via
+`safefs.AtomicWriteFile` (§8.1) before emitting the pointer OSC.
+
 Why an own package: keeps `cmd/wezsesh/main.go` to flag parsing + DI;
-keeps the listener wiring with the OSC-write pairing in one place;
-gives tests a clean construction seam (`ipcdispatcher.New` substituted
-with a fake at the `ipc.Dispatcher` interface level).
+keeps the listener wiring with the OSC-write + request-file pairing
+in one place; gives tests a clean construction seam
+(`ipcdispatcher.New` substituted with a fake at the `ipc.Dispatcher`
+interface level).
 
 ### §8.7 — `internal/ipcsock`
 
@@ -1006,8 +1110,10 @@ package ipcsock
 //   replies — buffered (cap 2) channel of parsed Reply payloads
 //   cleanup — closes listener + os.Remove(sockPath); idempotent (sync.Once)
 //
-// MUST be called synchronously before the corresponding OSC is emitted
-// (in bubbletea: from Update, NEVER from a tea.Cmd body).
+// MUST be called synchronously before the corresponding §3.1 forward
+// dispatch (request-file write + pointer OSC) — in bubbletea, from
+// Update, NEVER from a tea.Cmd body. The plugin replies to this
+// socket; both halves share the same first-8-hex-of-ULID prefix.
 //
 // Accept loop: SEQUENTIAL — one connection at a time. Top-level
 // defer recover() in the goroutine logs via the structured logger.
@@ -1031,16 +1137,26 @@ func SweepStale(dir string, log *logger.Logger) error
 package uservar
 
 // Writer wraps /dev/tty under a mutex. SAFE to call from tea.Cmd
-// bodies; wezterm's OSC parser tolerates interleaving with bubbletea's
-// renderer because OSC sequences are delimited (§3.1).
+// bodies — but ONLY for ≤ 256 B payloads. Spike #3 demonstrated that
+// OSC sequences whose total on-the-wire size exceeds ~2 KiB can race
+// with bubbletea's renderer at the kernel TTY layer (split-write
+// interleave) and abort wezterm's OSC parser per ECMA-48. The
+// pointer-OSC envelope (§3.1) is fixed-shape and ≤ 256 B, well below
+// the smallest single-syscall TTY-write window on any supported
+// platform; the full request payload travels via a sidecar file in
+// <runtime_dir>/req/ (see §3.1, §12.1) and never touches the TTY.
 type Writer struct { /* unexported */ }
 
 // New opens /dev/tty (O_WRONLY|O_CLOEXEC).
 func New() (*Writer, error)
 
 // WriteOSC emits one OSC 1337 SetUserVar=wezsesh_op=<payload> sequence.
-// payload MUST be base64'd canonical-JSON. Single write(2) syscall in
-// the common case (≤ 4 KiB payloads on Linux, ≥ 1 KiB on darwin).
+// payload MUST be base64'd canonical-JSON of the §3.1 pointer
+// (≤ 256 B on the wire after envelope). The implementation enforces
+// the ceiling and returns an error rather than emit an oversized OSC.
+// Single write(2) syscall on every supported platform (kernel TTY
+// buffers ≥ 1 KiB on darwin, ≥ 4 KiB on Linux); the kernel serialises
+// concurrent writes against any other writer's syscalls.
 func (w *Writer) WriteOSC(ctx context.Context, payload []byte) error
 
 // Close releases /dev/tty fd. Called once at process shutdown.
@@ -1670,6 +1786,10 @@ runtime.dir.exists
 runtime.dir.fs.network
 runtime.dir.permissions
 runtime.dir.sun_path_budget
+runtime.dir.req_orphans            ← scan <runtime_dir>/req/ for *.json
+                                     files older than 60 s; warn if any
+                                     exceed (lost OSC or stuck listener)
+                                     (spike #3)
 home.consistency
 linux.kernel.version
 nerdfont.detected
@@ -1873,9 +1993,35 @@ used in plugin code:
 |---|---|---|
 | `debug.getinfo` / `debug.traceback` / any `debug.*` function | NOT exposed | Plugin cannot self-locate via `debug.getinfo(1, "S").source`; `init.lua`'s `apply_to_config` accepts an explicit `plugin_root` (or derives one from `binary`'s parent dir). See §9.1. |
 | `wezterm` as a global (`_G.wezterm`) | NOT exposed | Every submodule MUST acquire it via `local wezterm = require("wezterm")` at file top. Reading `_G.wezterm` resolves to nil and silently puts every "if `_G.wezterm` then runtime else test-mode" branch into test-mode. Spike #1 exhibited this — `ipc.handle_value` returned `no_key` because its `_G.wezterm.GLOBAL.wezsesh_session_key` lookup failed. |
+| `dofile(path)` | NOT exposed in `apply_to_config` (the Debug Overlay still has it) | Use `loadfile(path)()` (or capture into a local first to dodge §9.0.1.1's expression-call ambiguity). The wezsesh plugin already does this. Spike #3 hit "attempt to call a nil value" when using `dofile` from a config-eval context. |
 
-CI gates (§17.4): grep bans `debug%.` and `_G%.wezterm` references
-under `plugin/wezsesh/*.lua`.
+CI gates (§17.4): grep bans `debug%.`, `_G%.wezterm`, and bare
+`dofile%(` references under `plugin/wezsesh/*.lua`.
+
+#### §9.0.1.1 — Lua expression-call ambiguity
+
+Lua does NOT insert statement separators across newlines when the next
+line starts with `(`. So
+
+```lua
+wezsesh.setup({ binary = REPO .. "/wezsesh" })
+(loadfile(REPO .. "/some/probe.lua"))()
+```
+
+parses as a *single* chained call: `setup({...})(loadfile(...))()`.
+The `setup` return value is then implicitly invoked as a function and
+raises "attempt to call a nil value". Plugin code MUST either capture
+the chunk into a local first
+
+```lua
+local probe = loadfile(REPO .. "/some/probe.lua")
+probe()
+```
+
+or prefix the call with a leading `;`. CI lint (§17.4) flags any line
+matching `^\s*\(` immediately following an expression-call statement
+in `plugin/wezsesh/*.lua`. Spike #3 hit this in the harness install
+snippet before the lint was specified.
 
 ### §9.1 — `init.lua`
 
@@ -1966,13 +2112,24 @@ return M
 ```lua
 local M = {}
 
--- The user-var-changed handler. MUST execute steps (a)–(h)
--- synchronously (zero .await). CI lint enforces.
+-- The user-var-changed handler. MUST execute pre-steps (1)–(4) and
+-- steps (a)–(i) synchronously (zero .await). CI lint enforces. The
+-- pre-steps recover the file-resident request payload from §3.1's
+-- two-phase forward dispatch; (a)–(i) then run unchanged.
 local function handler(window, pane, name, value)
+    -- (1) b64.decode(value) + wezterm.json_parse → pointer (pcall)
+    -- (2) Pointer field-shape validator (§9.3.1.A)
+    -- (3) Path-prefix + mode + non-symlink + io.open guard
+    --     (rejects path outside <runtime_dir>/req/, mode ≠ 0600,
+    --     symlink, missing file → log_warn REQ_POINTER_REJECTED;
+    --     wire-silent)
+    -- (4) io.read("*a"); os.remove(path) (best-effort);
+    --     wezterm.json_parse → payload (pcall);
+    --     cross-check pointer.id == payload.id (mismatch → REQ_POINTER_REJECTED)
     -- (a) Pane-ID match
     -- (b) HMAC key availability
-    -- (c) JSON parse (pcall-wrapped)
-    -- (d) Field-shape validator (§9.3.1)
+    -- (c) (now folded into pre-step 4 — kept as label for diff continuity)
+    -- (d) Payload field-shape validator (§9.3.1.B)
     -- (e) Verb-aware tagging + canonical re-encode (§4.2; pcall)
     -- (f) HMAC verify with ct_eq.eq
     -- (g) Freshness + replay + target_window_id
@@ -1980,13 +2137,31 @@ local function handler(window, pane, name, value)
     -- (i) Dispatch with pcall
 end
 
-function M.validate_payload(payload)  end
+function M.validate_pointer(pointer)  end   -- §9.3.1.A
+function M.validate_payload(payload)  end   -- §9.3.1.B
 function M.register()  end
 
 return M
 ```
 
-#### §9.3.1 — Field-shape validator (step (d))
+#### §9.3.1 — Field-shape validators
+
+The handler runs two validators on disjoint inputs:
+
+##### §9.3.1.A — Pointer shape (pre-step 2)
+
+```lua
+return type(pointer.v) == "number" and pointer.v == 1
+   and type(pointer.id) == "string" and #pointer.id == 26
+   and type(pointer.path) == "string"
+        and pointer.path:sub(1, #req_dir_prefix) == req_dir_prefix
+```
+
+`req_dir_prefix` is `<runtime_dir>/req/` resolved at plugin-init time
+from `opts.runtime_dir`. The prefix MUST end with `/` so the check is
+unambiguous against partial-prefix attacks (e.g., `<runtime_dir>/req2/`).
+
+##### §9.3.1.B — Payload shape (step (d), unchanged from prior spec)
 
 ```lua
 return type(payload.v) == "number" and payload.v == 1
@@ -2105,7 +2280,8 @@ encryption failures. Both must be inspected before replying success.
 
 ```
 1. Receive payload. Lua does NOT enforce expected_hash — that has
-   already been checked binary-side (§13.4) before the OSC was emitted.
+   already been checked binary-side (§13.4) before the §3.1 forward
+   dispatch (request-file write + pointer OSC).
 
 2. local current_state =
        resurrect.workspace_state.get_workspace_state()
@@ -2268,8 +2444,10 @@ return M
 ```
 
 `encode` is used on the reply path (`wezsesh reply <sock> <b64>`).
-`decode` is reserved for future use; not currently exercised in the
-hot path.
+`decode` is hot-path: §9.3 pre-step (1) calls it once per inbound
+`user-var-changed` event to recover the §3.1 pointer JSON before
+opening the request file. Returning `nil` (malformed base64) MUST
+short-circuit the handler with `REQ_POINTER_REJECTED` (§7).
 
 ### §9.11 — `on_pane_restore.lua`
 
@@ -2694,9 +2872,15 @@ cannot reach the binary because the file is already written.
 | `<picked_path>/.wezsesh.json` | project sidecar | user-authored | user |
 | `<reply_dir>/` | reply socket parent | 0700 | binary, with umask 0077 |
 | `<reply_dir>/<8-hex>.sock` | reply socket | 0600 | `net.Listen` after umask |
+| `<runtime_dir>/req/` | request-file parent dir (§3.1 sidecar) | 0700 | binary, MkdirAll on Dispatcher init; `Enforce(SymlinkRefuse)` |
+| `<runtime_dir>/req/<8-hex>.json` | per-request canonical-JSON file (§3.1 Phase 1) | 0600 | `safefs.AtomicWriteFile` (tmp+rename); `<8-hex>` matches the request's reply-socket prefix |
 | `<temp>/wezsesh-<pid>-config.json` | binary config (per-spawn) | 0600 | Lua `manager.write_config_file` |
 
-### §12.2 — Reply directory selection
+### §12.2 — Reply directory + request directory selection
+
+The reply-socket directory and the §3.1 request-file directory share
+the same `<runtime_dir>` parent (the request dir is just
+`<runtime_dir>/req/`):
 
 ```
 opts.runtime_dir set (string)? → use as-is (after SUN_PATH check)
@@ -2704,6 +2888,13 @@ $XDG_RUNTIME_DIR set on Linux? → "$XDG_RUNTIME_DIR/wezsesh/"
 darwin                         → "/tmp/wezsesh-<uid>/"
 Linux without $XDG_RUNTIME_DIR → "/tmp/wezsesh-<uid>/"
 ```
+
+Both directories are created with mode 0700 + `Enforce(SymlinkRefuse)`
+on first access. The reply-socket child is the existing
+`<runtime_dir>/`-rooted layout; the §3.1 request-file child is
+`<runtime_dir>/req/`. Both share the same first-8-hex-of-ULID file
+prefix per request so post-mortem inspection can correlate by visual
+scan.
 
 ### §12.3 — Filename encoding
 
@@ -2717,12 +2908,34 @@ transform.
 - Reply socket: `defer cleanup()` after `StartListener`
   (close + remove, `sync.Once`); `InstallSignalHandler` runs the same
   on SIGINT/SIGTERM/SIGHUP.
+- Request file (§3.1): plugin-side `os.remove(path)` after read on the
+  happy path. Best-effort — if the unlink fails, the doctor sweep
+  picks it up. Binary side does NOT remove on success (the plugin
+  owns the unlink); on dispatch error before OSC emit, the binary
+  removes its own file. **Retransmit semantics** (§14.1's 2 s
+  retransmit Cmd): the binary re-emits the SAME pointer OSC against
+  the same on-disk path. Three cases:
+    1. Plugin already consumed and unlinked the file → `io.open` fails
+       in pre-step (3) → `REQ_POINTER_REJECTED` silent-drop. Original
+       reply (already in flight) closes the loop; if the reply was
+       dropped, binary observes `IPC_TIMEOUT`.
+    2. Plugin missed the original OSC (PTY-multiplexer caveat or rare
+       parser miss) and the file is still on disk → retransmit
+       succeeds; plugin's seen_ids guard (§5.4) deduplicates if both
+       eventually land.
+    3. Phase-1 file write succeeded but the binary crashed before
+       Phase-2 OSC emission → no retransmit fires (binary is gone);
+       file orphans until the next 60 s startup sweep.
 - Startup sweep: `ipcsock.SweepStale(reply_dir, log)` removes `*.sock`
   files with mtime > 60 s. Per-file `safefs.Enforce(SymlinkSkipWarn)`.
+  Same pattern (sweep `*.json` files with mtime > 60 s) runs against
+  `<runtime_dir>/req/` and feeds the doctor `runtime.dir.req_orphans`
+  check (§8.17.1).
 - `wezsesh reset --yes` removes:
   - state dir (all contents + dir itself if empty post-cleanup)
   - trust store (all contents + `allow/` dir + `wezsesh/` parent if empty)
   - reply sock dir (all `*.sock` + dir if empty)
+  - request-file dir (all `*.json` + `req/` dir if empty)
   - log files (in state dir, before state-dir removal)
   - `*.wezsesh.json` in `<snapshot_dir>/workspace/` (sidecars only)
   - **Does NOT touch resurrect snapshots** unless
@@ -2735,8 +2948,8 @@ transform.
 - **Symlink defense** (centralised via `safefs.Enforce`):
   - Top-level dirs (snapshot, state, data, runtime): `SymlinkRefuse`
     → ABORT entire run.
-  - Individual files inside (sidecars, sock files, log files, trust
-    files): `SymlinkSkipWarn` → log_warn, do not unlink.
+  - Individual files inside (sidecars, sock files, request files, log
+    files, trust files): `SymlinkSkipWarn` → log_warn, do not unlink.
 
 `wezsesh nuke ...` is a deprecated alias that prints a one-time toast
 ("nuke renamed to reset; this alias removed in v0.2") and then runs
@@ -2780,9 +2993,13 @@ Doctor reports the resolved paths and how each was determined
                  ipcsock.StartListener(sock)        ◀── synchronous (in Update)
                            │
                            ▼ defer cleanup()
-                  uservar.WriteOSC(b64(payload))
+              safefs.AtomicWriteFile(req_path,      ◀── §3.1 Phase 1
+                                     payload)         (tmp+rename, 0600)
                            │
                            ▼
+              uservar.WriteOSC(b64(pointer))        ◀── §3.1 Phase 2
+                           │                          (≤ 256 B; pointer
+                           ▼                           = {v, id, path})
                   tea.Tick(2s) — retransmit Cmd
                            │
               ┌────────────┼────────────────────┐
@@ -2799,6 +3016,12 @@ Doctor reports the resolved paths and how each was determined
         ├── "started"   → TUI dismisses; binary stays alive
         │                 to receive 30s-budgeted follow-up
         └── "partial"   → terminal; cleanup()
+
+NOTE — request-file ownership. The plugin's pre-step (§9.3 step 4)
+takes ownership of <runtime_dir>/req/<8-hex>.json after read and
+unlinks it on the happy path. The binary does NOT delete the file;
+on early-exit before plugin ack, the §12.4 startup sweep + the
+doctor `runtime.dir.req_orphans` check (§8.17.1) reap orphans.
 
 PANIC PATH (TUI subcommand):
    defer recover() (top of TUI startup)
@@ -2920,13 +3143,15 @@ TUI dispatch save{ name, overwrite, expected_hash }
       err == ErrNotExist    → reply SNAPSHOT_MISSING
       bytes, err := fd.ReadAll(lockCtx)
       hash := "sha256:" + sha256(bytes)
-      release()                          ◀── release BEFORE OSC dispatch
+      release()                          ◀── release BEFORE forward dispatch
       if hash != expected_hash:
           reply SNAPSHOT_CHANGED
           return
   ▼
-  PHASE B — emit save OSC (no lock held):
+  PHASE B — emit save dispatch (no lock held):
   dispatcher.Dispatch(ipcCtx, "save", { name, overwrite, expected_hash })
+  // Internally: safefs.AtomicWriteFile(<runtime_dir>/req/<id8>.json,
+  // canonical_payload), then uservar.WriteOSC(pointer). §3.1.
   Lua resurrect.state_manager.save_state(...)
   Lua reply (per §9.4.2 dual-path detection — pcall catches
                  json_encode failures; with_capture catches I/O /
@@ -2963,7 +3188,7 @@ TUI dispatch save{ name, overwrite, expected_hash }
   concurrent saves *within this binary*. Cross-binary concurrency is
   bounded by `AcquireExclusive`, but the lock is held only during
   Phase A and Phase C — not across the full flow.
-- Race window: between Phase A's release and Phase B's OSC dispatch,
+- Race window: between Phase A's release and Phase B's forward dispatch,
   another writer could mutate the file. The `expected_hash` semantics
   no longer give the user a watertight guarantee; they give a
   best-effort "file matched what I last saw". This trade-off is
@@ -3408,7 +3633,7 @@ is the only one that emits a wire sentinel.
 | Save IPC roundtrip | 5 s | `ipcCtx` (independent of lockCtx) | `IPC_TIMEOUT` / `SAVE_FAILED` |
 | First IPC reply | 5 s | TUI-side timer | `IPC_TIMEOUT` |
 | Follow-up after `started` | 30 s | TUI-side timer | non-fatal toast |
-| OSC retransmit | 2 s | `tea.Tick` once | suppressed via replay guard |
+| Forward-dispatch retransmit | 2 s | `tea.Tick` once | suppressed via replay guard. Retransmit re-emits the §3.1 pointer OSC against the existing request file (no second file write). |
 | `Statfs` inside `IsNetworkFS` | 2 s | goroutine + ctx | classify as network |
 | `EvalSymlinks` inside `IsNetworkFS` | 500 ms | goroutine + ctx | use unresolved + WARN |
 | Switch poller parent | 5 s | `context.WithTimeout` | `MUX_UNREACHABLE` |
@@ -3605,8 +3830,11 @@ plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 | `verb_args_shape` parity | reflective check: keyset(dispatch_table) == keyset(verb_args_shape) | PR fail |
 | `_G.wezterm` reference in `plugin/wezsesh/*.lua` | grep `_G%.wezterm` | build error (use `local wezterm = require("wezterm")`) |
 | `debug.*` reference in `plugin/wezsesh/*.lua` (incl. `init.lua`) | grep `\bdebug%.` | build error (mlua sandbox lacks debug library) |
+| `dofile(` in `plugin/wezsesh/*.lua` (incl. `init.lua`) | grep `\bdofile%s*\(` | build error (stripped from apply_to_config; use `loadfile(path)()` per §9.0.1) |
+| Line-leading `(` after an expression-call statement | structural check on `plugin/wezsesh/*.lua` (incl. `init.lua`): any line whose first non-whitespace character is `(`, when the previous non-blank, non-comment line ends with `)` outside of strings/comments. Implementation parses each `.lua` file with `internal/lualint`'s tokeniser rather than a regex; greedy regex-based linters miss nested calls (`f(g(x))(y)`), method chains (`x:m()`), and string-method targets. | PR fail (Lua expression-call ambiguity, §9.0.1.1) |
 | `package.loaded["wezsesh.*"] = nil` bust loop in `init.lua` | grep | build error if `apply_to_config` body lacks the loop |
 | Nested-table value into `wezterm.GLOBAL` | grep `wezterm%.GLOBAL[%w_.]*%s*=%s*{` outside canonical-JSON | PR fail (use scalar or JSON-encoded string per §5.4) |
+| `uservar.WriteOSC` payload size > 256 B | runtime check inside `WriteOSC` body — explicit `if len(out) > 256 { return ErrOSCTooBig }` | runtime error (the §3.1 single-syscall property is correctness-load-bearing; oversized OSCs would re-open the spike-#3 race) |
 
 ---
 
@@ -3706,6 +3934,10 @@ for the run-time byte-equality artefacts.
 | Reply socket lifecycle | `internal/ipcsock` | listener exits via `net.ErrClosed`; cleanup is `sync.Once` |
 | Reply socket sequential accept | `internal/ipcsock` | second connection waits for first to close |
 | Reply channel buffer | `internal/ipcsock` | producer blocks at cap 2; never panics |
+| Request-file atomic write (spike-#3) | `internal/ipc*`, `internal/safefs` | concurrent `Dispatch` produces disjoint `<8-hex>.json` files; tmp+rename is observably atomic; `O_EXCL` rejects collisions |
+| Request-file lifecycle (spike-#3) | `cmd/wezsesh`, `plugin` | file persists until plugin `os.remove`; orphan sweep cleans stale entries; doctor reports them via `runtime.dir.req_orphans` |
+| Pointer-shape validation (spike-#3) | `plugin` | malformed pointer JSON / path outside `<runtime_dir>/req/` / wrong mode / symlink / `pointer.id ≠ payload.id` → silent-drop + `log_warn REQ_POINTER_REJECTED`. The reply socket is already bound (§3.2 establishes it before forward dispatch); the plugin simply does not write a reply. The binary observes `IPC_TIMEOUT` after 5 s. |
+| OSC ≤ 256 B contract (spike-#3) | `internal/uservar` | `WriteOSC` rejects payloads whose on-the-wire OSC envelope > 256 B with an explicit error rather than emit a multi-syscall write that could race with bubbletea |
 | `tea.Tick` retransmit cancellation | `cmd/wezsesh` | timer goroutine exits within 100 ms of `tea.Run` return |
 | F_OFD_SETLK build-tag | CI | reference outside `lock_linux.go` fails build |
 | O_CLOEXEC inheritance | `internal/safefs` | lock fd NOT in fork-spawned child's fd table |
@@ -3816,15 +4048,32 @@ Scenarios:
      `wezsesh list` no longer shows it
   5. spawn second instance via the keybinding → both panes coexist;
      no listener-port collisions
+  6. (sidecar gate, spike #3.) Drive 1300 verb dispatches sweeping
+     request-file sizes 1024..4096 step 256 B (13 buckets, 100 reps
+     each, 50 ms cadence) while the picker is open — the upper bound
+     matches the §3.5 4 KiB request-file ceiling. Synthetic listener
+     records each delivered request's id. Assert
+     received_count == sent_count (i.e. 0 % loss) AND
+     `len(<runtime_dir>/req/*.json) == 0` after a 500 ms drain.
+     Failure indicates either:
+       * `safefs.AtomicWriteFile` failed silently,
+       * the plugin's pre-step path raced or rejected legitimate
+         pointers, or
+       * the plugin failed to `os.remove` after read (orphans).
 
 Failure modes captured:
   - any panic in either binary is asserted (logs scanned)
   - any Lua error in the wezterm.log
   - any orphaned `.sock` file in runtime_dir after teardown
+  - any orphaned `.json` file in <runtime_dir>/req/ after teardown
 
 Coverage caveat: e2e cannot assert visual fidelity (no screenshot
 diffing in v0.1). Manual QA covers picker rendering, marker glyphs,
-and color theming.
+and color theming. Spike #3 reproducer
+(`docs/issues/3-harness/osc_repro --mode=sidecar`) is the canonical
+manual regression for §3.1: confirm no `]1337;SetUserVar=` substrings
+or base64 runs appear in the wezterm scrollback regardless of TUI
+rendering pressure.
 ```
 
 ---
