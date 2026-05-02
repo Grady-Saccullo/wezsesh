@@ -49,6 +49,68 @@
 
         hasGoMod = builtins.pathExists ./go.mod;
 
+        # ── Build-loop driver ─────────────────────────────────────────────
+        # Runs `claude -p '/next-task'` repeatedly in fresh processes so each
+        # iteration starts with a cold context (no prompt-cache carry-over,
+        # no conversation memory, no PATH bleed). State lives in PROJECT.md;
+        # the loop stops when a /next-task invocation produces no new commit.
+        #
+        # Usage:
+        #   nix run .#build-loop           — one shot (50 iter cap)
+        #   MAX_ITERS=5 nix run .#build-loop
+        #   wezsesh-build-loop             — same, from inside `nix develop`
+        #
+        # `claude` must be on PATH; this driver does NOT install it.
+        buildLoop = pkgs.writeShellApplication {
+          name = "wezsesh-build-loop";
+          runtimeInputs = [pkgs.git pkgs.coreutils];
+          text = ''
+            # We manage exit codes per-iteration; don't bail on /next-task rc.
+            set +o errexit
+
+            if ! command -v claude >/dev/null 2>&1; then
+              echo "error: 'claude' not on PATH" >&2
+              exit 1
+            fi
+
+            repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+              echo "error: not in a git repository" >&2
+              exit 1
+            }
+            cd "$repo_root"
+
+            if [[ -n "$(git status --porcelain)" ]]; then
+              echo "error: working tree is dirty — commit or stash first" >&2
+              git status --short | head -10 >&2
+              exit 1
+            fi
+
+            max_iters="''${MAX_ITERS:-50}"
+            log_file="''${LOG:-build.log}"
+            extra_args=("$@")  # passed through to `claude` (e.g. --dangerously-skip-permissions)
+
+            echo "wezsesh-build-loop: max_iters=$max_iters log=$log_file"
+            echo "stop conditions: HEAD doesn't advance, or iter cap hit, or ctrl-C"
+
+            for ((i=1; i<=max_iters; i++)); do
+              before=$(git rev-parse HEAD)
+              printf '\n=== iter %d  %s ===\n' "$i" "$(date -Iseconds)" | tee -a "$log_file"
+
+              claude "''${extra_args[@]}" -p '/next-task' 2>&1 | tee -a "$log_file"
+              rc=''${PIPESTATUS[0]}
+              echo "[loop] claude rc=$rc" | tee -a "$log_file"
+
+              after=$(git rev-parse HEAD)
+              if [[ "$before" == "$after" ]]; then
+                echo "[loop] no new commits — stopping" | tee -a "$log_file"
+                exit 0
+              fi
+            done
+
+            echo "[loop] MAX_ITERS=$max_iters reached — stopping" | tee -a "$log_file"
+          '';
+        };
+
         wezsesh = pkgs.buildGoModule {
           pname = "wezsesh";
           version = "0.0.0-dev";
@@ -90,18 +152,29 @@
         # ── Packages ───────────────────────────────────────────────────────
         # Until go.mod exists, this evaluates fine but builds will fail at
         # the Go compile step — that's the intended signal.
-        packages = lib.optionalAttrs hasGoMod {
-          default = wezsesh;
-          wezsesh = wezsesh;
-        };
+        packages =
+          {
+            build-loop = buildLoop;
+          }
+          // lib.optionalAttrs hasGoMod {
+            default = wezsesh;
+            wezsesh = wezsesh;
+          };
 
         # `nix run`
-        apps = lib.optionalAttrs hasGoMod {
-          default = {
-            type = "app";
-            program = lib.getExe wezsesh;
+        apps =
+          {
+            build-loop = {
+              type = "app";
+              program = lib.getExe buildLoop;
+            };
+          }
+          // lib.optionalAttrs hasGoMod {
+            default = {
+              type = "app";
+              program = lib.getExe wezsesh;
+            };
           };
-        };
 
         # `nix fmt` — matches the dotfiles' alejandra style.
         formatter = pkgs.alejandra;
@@ -138,6 +211,10 @@
             pkgs.git
             pkgs.gnumake
             pkgs.jq
+
+            # /next-task loop driver — runs claude -p in fresh processes so
+            # each iteration has cold context. See `wezsesh-build-loop --help`.
+            buildLoop
           ];
 
           shellHook = ''
@@ -162,6 +239,10 @@
             echo "  go mod verify                  # go.sum tamper check"
             echo "  nix build                      # reproducible build"
             echo "  nix flake check                # run all flake checks"
+            echo ""
+            echo "Drive the build (one /next-task per fresh claude process):"
+            echo "  wezsesh-build-loop             # (or: nix run .#build-loop)"
+            echo "  MAX_ITERS=5 wezsesh-build-loop"
           '';
         };
 
