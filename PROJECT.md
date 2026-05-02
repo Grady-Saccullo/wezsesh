@@ -76,7 +76,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Accepted findings:** LOW — `go vet ./...` exits 1 with a "matched no packages" warning because no `.go` files exist yet; the gate's own parenthetical anticipates this. Goes to exit 0 once T-001 (or any task) lands a real Go file. CI must not enforce T-000 in isolation.
 
 ### T-001 · Pin Go dependencies
-**Status:** blocked
+**Status:** ready
 **Owner:** general-purpose
 **Depends-on:** T-000
 **Spec:** §16.2 (pinned dependencies)
@@ -88,7 +88,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Done when:** `go mod tidy && go mod verify` are both clean.
 
 ### T-002 · Vendor `sha2.lua` + `SOURCES.lock`
-**Status:** blocked
+**Status:** ready
 **Owner:** lua-plugin-engineer
 **Depends-on:** T-000
 **Spec:** §16.3 (vendored Lua)
@@ -404,7 +404,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Done when:** fixture verified; `_G.wezterm` not referenced (§16.5 lint).
 
 ### T-502 · `plugin/wezsesh/ct_eq.lua`
-**Status:** blocked
+**Status:** ready
 **Owner:** lua-plugin-engineer
 **Depends-on:** T-000
 **Spec:** §9.9 (ct_eq), §5.6 (constant-time compare), §0.1 row 15 (Lua 5.3+ requirement)
@@ -415,7 +415,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Done when:** spec passes under both Lua 5.3 and 5.4.
 
 ### T-503 · `plugin/wezsesh/b64.lua`
-**Status:** blocked
+**Status:** ready
 **Owner:** lua-plugin-engineer
 **Depends-on:** T-000
 **Spec:** §9.10 (b64), §0.1 row 34 (`b64.decode` is hot-path post-spike-#3)
@@ -426,7 +426,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Done when:** spec passes; `decode` is allocation-conscious enough to be invoked per request.
 
 ### T-504 · `plugin/wezsesh/state.lua`
-**Status:** blocked
+**Status:** ready
 **Owner:** lua-plugin-engineer
 **Depends-on:** T-000
 **Spec:** §9.6 (state), §10.6 (`wezterm.GLOBAL` keys), §0.1 row 30 (GLOBAL value-shape rule); full spike-#1 rationale in `docs/issues/1.md` (mlua GLOBAL userdata silent-break on nested-table values)
@@ -450,7 +450,7 @@ this file. See `.claude/skills/next-task/SKILL.md`.
 **Done when:** spec covers each verb's reply shape from §6.
 
 ### T-506 · `plugin/wezsesh/resurrect_error.lua`
-**Status:** blocked
+**Status:** ready
 **Owner:** resurrect-interop-engineer
 **Depends-on:** T-000
 **Spec:** §9.13 (resurrect.error capture), §0.1 row 33 (spike-#2); full spike-#2 rationale in `docs/issues/2.md` (why `pcall(state_manager.save_state)` is empirically broken; dual-path detection scheme)
