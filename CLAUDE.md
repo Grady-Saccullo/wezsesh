@@ -112,11 +112,16 @@ go build -trimpath -ldflags="-s -w -X main.version=v$(git describe --tags --alwa
 
 ## Conventions
 
+- **VCS is jj-colocated.** `.jj/` + `.git/` side by side. Use `jj` for commits,
+  diffs, history (`jj log`, `jj diff`, `jj describe`, `jj commit`). Git tools
+  (CI, IDE, `gh pr`) see the colocated `.git/` and work normally. Don't
+  invoke `git commit` / `git add` for build work — `/next-task` uses jj's
+  auto-snapshot model and a diff-allowlist check instead of explicit staging.
 - **One commit per task.** Format: `<type>(<scope>): T-XXX <title>`.
-- **Stage explicitly.** Never `git add -A` / `git add .`.
-- **Don't push from agents.** Pushes are user-initiated.
+- **Don't push from agents.** Pushes are user-initiated (`jj git push -b main`).
 - **Don't edit `docs/design.md` or `docs/prd.md` from build tasks.** Spec gaps
-  surface as a separate, explicit doc-update task.
+  queue as a `T-DOC-NNN` task in PROJECT.md (auto-handled by `/next-task`'s
+  spec-drift logic; see the skill).
 - **Comments are rare.** Default to none; add only when the WHY is non-obvious
   (a hidden invariant, a workaround for a specific bug). The codebase already
   cites § headings; redundant `// per §X` comments are noise.

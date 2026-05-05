@@ -1,0 +1,493 @@
+-- §9.2 — `manager.lua`. Owns the binary lifecycle on the Lua side:
+--
+--   * resolve_binary       — pick the wezsesh executable (string).
+--   * detect_version       — exec `<bin> version` and parse semver.
+--   * compatible           — same-major semver gate.
+--   * ensure_session_key   — §5.2 generation chain (keygen → /dev/urandom).
+--   * validate_runtime_dir — §13.9 SUN_PATH ceiling check.
+--   * write_config_file    — §10.7 JSON config to a temp file.
+--   * spawn                — Appendix A env vector + mux/tab spawn.
+--   * register_keybinding  — §11.1 default keybinding registration.
+--
+-- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
+-- §9.0.1. The standalone spec installs a harness double via
+-- `package.preload["wezterm"]` BEFORE requiring this file.
+--
+-- §16.5 lint — every `wezterm.background_child_process` call MUST be
+-- `pcall`-wrapped on the same/preceding line. T-602's spawn path uses
+-- `wezterm.mux.spawn_window` / `mux_window:spawn_tab` (Appendix A), NOT
+-- `background_child_process`, so this file does not contain any
+-- background_child_process call. The spec includes a static-text
+-- assertion guarding that property.
+
+local wezterm = require("wezterm")
+
+local M = {}
+
+-- Plugin version. Single source of truth for §10.7 `plugin_version`
+-- and Appendix A `WEZSESH_PLUGIN_VERSION`.
+M.VERSION = "0.1.0"
+
+-- ────────────────────────────────────────────────────────────────────
+-- helpers
+-- ────────────────────────────────────────────────────────────────────
+
+local function trim(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Parse a semver-shaped string into {major,minor,patch}. Returns nil
+-- on malformed input. Trailing pre-release / build metadata accepted
+-- (e.g. `1.2.3-rc1+abc`) but ignored beyond the leading three numbers.
+local function parse_semver(s)
+    if type(s) ~= "string" then return nil end
+    local mj, mn, pt = s:match("^(%d+)%.(%d+)%.(%d+)")
+    if mj == nil then return nil end
+    return {
+        major = tonumber(mj),
+        minor = tonumber(mn),
+        patch = tonumber(pt),
+    }
+end
+
+-- Path join: trim a single trailing slash from `dir`, then concatenate.
+-- Pure string ops; no filesystem syscalls.
+local function path_join(dir, file)
+    if type(dir) ~= "string" or dir == "" then return file end
+    if dir:sub(-1) == "/" then return dir .. file end
+    return dir .. "/" .. file
+end
+
+-- Tempdir picker. Lua's `os.tmpdir()` doesn't exist; emulate by
+-- consulting `$TMPDIR` (POSIX), falling back to `/tmp`.
+local function tmpdir()
+    local t = os.getenv("TMPDIR")
+    if type(t) == "string" and t ~= "" then
+        -- strip trailing slash for consistency
+        if t:sub(-1) == "/" then t = t:sub(1, -2) end
+        return t
+    end
+    return "/tmp"
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §9.2 — resolve_binary
+-- ────────────────────────────────────────────────────────────────────
+
+function M.resolve_binary(opts)
+    opts = opts or {}
+    if type(opts.binary) == "string" and opts.binary ~= "" then
+        return opts.binary
+    end
+    if type(opts.plugin_root) == "string" and opts.plugin_root ~= "" then
+        return path_join(opts.plugin_root, "wezsesh")
+    end
+    -- §11 default: bare `"wezsesh"` and let PATH resolve at exec time.
+    return "wezsesh"
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §9.2 — detect_version
+-- ────────────────────────────────────────────────────────────────────
+
+function M.detect_version(bin)
+    if type(bin) ~= "string" or bin == "" then return "missing" end
+    local ok, stdout, _stderr =
+        wezterm.run_child_process({ bin, "version" })
+    if not ok then return "missing" end
+    local out = trim(stdout or "")
+    if out == "" then return "unparseable" end
+    -- Accept `M.m.p` or `M.m.p<extra>` (no whitespace inside).
+    if not out:match("^%d+%.%d+%.%d+%S*$") then
+        return "unparseable"
+    end
+    return out
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §9.2 — compatible
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Spec is silent on the exact rule. Choice (documented): same-major
+-- semver match. Both inputs MUST parse; missing / unparseable arms
+-- return false so the apply_to_config caller surfaces the doctor toast.
+
+function M.compatible(plugin_v, bin_v)
+    local p = parse_semver(plugin_v)
+    local b = parse_semver(bin_v)
+    if p == nil or b == nil then return false end
+    return p.major == b.major
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §5.2 — ensure_session_key
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Chain:
+--   1. exec `<bin> keygen` → 64 hex on stdout.
+--   2. fallback: read 32 bytes from /dev/urandom, hex-encode.
+--   3. fallback: return nil (caller logs + early-returns; the listener
+--      no-ops on a nil session_key per §5.2 step 3).
+--
+-- Validation: trimmed output MUST match `^%x+$` and have length 64.
+-- Stores in `wezterm.GLOBAL.wezsesh_session_key` on success. Never
+-- raises — a raise here would wedge `apply_to_config`.
+
+local function valid_hex_64(s)
+    if type(s) ~= "string" then return false end
+    if #s ~= 64 then return false end
+    return s:match("^%x+$") ~= nil
+end
+
+local function bytes_to_hex(bytes)
+    if type(bytes) ~= "string" then return nil end
+    local parts = {}
+    for i = 1, #bytes do
+        parts[i] = string.format("%02x", bytes:byte(i))
+    end
+    return table.concat(parts)
+end
+
+function M.ensure_session_key(bin)
+    -- Step 1: exec the binary's keygen subcommand.
+    if type(bin) == "string" and bin ~= "" then
+        local ok, stdout, _stderr =
+            wezterm.run_child_process({ bin, "keygen" })
+        if ok then
+            local hex = trim(stdout or "")
+            if valid_hex_64(hex) then
+                wezterm.GLOBAL.wezsesh_session_key = hex
+                return hex
+            end
+        end
+    end
+
+    -- Step 2: fallback to /dev/urandom (POSIX-only build matrix per
+    -- §5.2). io.open returns nil + errmsg on failure.
+    local f = io.open("/dev/urandom", "rb")
+    if f ~= nil then
+        local raw = f:read(32)
+        f:close()
+        if type(raw) == "string" and #raw == 32 then
+            local hex = bytes_to_hex(raw)
+            if valid_hex_64(hex) then
+                wezterm.GLOBAL.wezsesh_session_key = hex
+                return hex
+            end
+        end
+    end
+
+    -- Step 3: hard fail. Caller toasts + early-returns.
+    return nil, "WEZSESH_SESSION_KEY_GENERATION_FAILED"
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §13.9 — validate_runtime_dir (Lua side SUN_PATH ceiling check)
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Verbatim from §13.9. Sentinel errors are raised via `error(msg, 0)`
+-- so the file:line prefix is suppressed and the caller can match the
+-- sentinel substring directly.
+--
+-- When `opts.runtime_dir` is nil the auto-detect path applies (§12.5);
+-- there's nothing to validate. Return silently.
+
+function M.validate_runtime_dir(opts)
+    opts = opts or {}
+    if opts.runtime_dir == nil then return end
+
+    if type(opts.runtime_dir) ~= "string" then
+        error("WEZSESH_RUNTIME_DIR_TYPE: opts.runtime_dir must be a string path", 0)
+    end
+
+    local expanded = opts.runtime_dir
+    if expanded:sub(1, 2) == "~/" then
+        expanded = (wezterm.home_dir or os.getenv("HOME") or "") .. expanded:sub(2)
+    end
+
+    local triple = wezterm.target_triple or ""
+    local ceiling = (triple:match("%-apple%-darwin") and 104) or 108
+    local needed = #expanded + 14   -- "/<8hex>.sock"
+
+    if needed > ceiling then
+        error(string.format(
+            "WEZSESH_SUN_PATH_OVERFLOW: runtime_dir too long for AF_UNIX SUN_PATH " ..
+            "(needed=%d, ceiling=%d, path=%q). Shorten or use the default.",
+            needed, ceiling, expanded), 0)
+    end
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §10.7 — write_config_file
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Builds the §10.7 JSON shape and writes it under
+-- `<tmp>/wezsesh-<pid>-config.json`. Returns the absolute path.
+--
+-- pid sourcing: §10.5 names `<pid>` literally but the wezterm mlua
+-- sandbox does not expose `os.getpid` — and the §10.5 mode-0600 row is
+-- aspirational from Lua (we cannot guarantee 0600 in pure Lua; the
+-- file is written via `io.open` which honours the process umask).
+-- We use `wezterm.procinfo.pid` when available, else a process-wide
+-- monotonic counter combined with `os.time()` for collision avoidance.
+-- Documented choice.
+
+local _config_seq = 0
+
+local function next_config_filename()
+    _config_seq = _config_seq + 1
+    local pid_like
+    local ok, pi = pcall(function() return wezterm.procinfo end)
+    if ok and type(pi) == "table" and type(pi.pid) == "function" then
+        local pok, p = pcall(pi.pid)
+        if pok and type(p) == "number" then
+            pid_like = tostring(p)
+        end
+    end
+    if pid_like == nil then
+        pid_like = tostring(os.time()) .. "-" .. tostring(_config_seq)
+    end
+    return string.format("wezsesh-%s-config.json", pid_like)
+end
+
+-- Default §11.1 keys table — copied here so write_config_file is a
+-- pure function of `opts`. apply_to_config (T-603) merges user
+-- overrides into this table before calling us.
+local DEFAULT_KEYS = {
+    switch = "s", load = "l", rename = "r", delete = "d",
+    save = "S", new = "n", pin = "p", tag = "t",
+    mark = "Tab", mark_alt = "Space", clear_marks = "c",
+    help = "?", filter = "/", quit = "q",
+    up = "k", down = "j", top = "gg", bottom = "G",
+}
+
+local function copy_keys(t)
+    local out = {}
+    for k, v in pairs(t) do out[k] = v end
+    return out
+end
+
+-- Tag a Lua table so wezterm.json_encode emits a JSON array. wezterm's
+-- encoder treats an empty Lua table as `{}` (object) by default; the
+-- §10.7 schema requires `[]` (array) for `resurrect_argv_allowlist`.
+-- The accessor `wezterm.json_array_metatable` is the documented hook.
+-- When it isn't installed (older wezterm builds, the spec shim with
+-- json_array_metatable absent), an explicitly-empty caller table would
+-- still encode as `{}`; the caller code below handles that case by
+-- substituting the non-empty default_allowlist (which encodes as `[]`
+-- via the encoder's array-detection on positive-integer keys).
+local function as_json_array(t)
+    if type(t) ~= "table" then return t end
+    local mt = wezterm.json_array_metatable
+    if mt ~= nil then
+        local copy = {}
+        for i = 1, #t do copy[i] = t[i] end
+        return setmetatable(copy, mt)
+    end
+    return t
+end
+
+-- §10.7 `resurrect_argv_allowlist` resolver. Returns a table that will
+-- encode as a JSON array `[]` (never `{}`).
+--
+--   * nil  → default_allowlist (non-empty array; encodes as `[…]`).
+--   * `{}` → tagged via json_array_metatable when available, else
+--            default_allowlist (callers wanting truly-empty must run on
+--            a wezterm build that exposes json_array_metatable).
+--   * non-empty table → tagged when available; passes through
+--            otherwise (encoder's positive-integer-keys detection
+--            handles it).
+local function resolve_argv_allowlist(v)
+    if v == nil then
+        return require("wezsesh.default_allowlist")
+    end
+    if type(v) == "table" then
+        local n = 0
+        for _ in pairs(v) do n = n + 1 end
+        if n == 0 and wezterm.json_array_metatable == nil then
+            return require("wezsesh.default_allowlist")
+        end
+        return as_json_array(v)
+    end
+    return v
+end
+
+function M.write_config_file(opts)
+    opts = opts or {}
+
+    -- Build the §10.7 body. Every top-level key from the spec is
+    -- emitted unconditionally so the binary's `config.Load` can rely
+    -- on a stable shape even when the user hasn't set the field.
+    local body = {
+        version          = 1,
+        snapshot_dir     = opts.snapshot_dir or "",
+        state_dir        = opts.state_dir or "",
+        runtime_dir      = opts.runtime_dir or "",
+        data_dir         = opts.data_dir or "",
+        log_level        = opts.log_level or "info",
+        sort             = opts.sort or "live_first",
+        default_action   = opts.default_action or "switch",
+        default_action_load_no_prompt =
+            opts.default_action_load_no_prompt == true,
+        confirm_delete    = opts.confirm_delete ~= false,
+        confirm_overwrite = opts.confirm_overwrite ~= false,
+        exclude          = opts.exclude or { "^default$" },
+        new_workspace_command = opts.new_workspace_command,
+        preview          = opts.preview or { enabled = true, width = 0.4 },
+        markers          = opts.markers or {
+            active = "▶", live = "●", marked = "✓",
+            unsaved = "(unsaved)", pinned = "[pinned]",
+        },
+        columns          = opts.columns or
+            { "marker", "name", "tabs", "age", "tags" },
+        name_truncate    = opts.name_truncate or "middle",
+        colors           = opts.colors or {
+            accent = nil, muted = nil, error = nil,
+            success = nil, focus_bg = nil,
+            match_highlight = nil, live_marker = nil,
+            saved_marker = nil,
+        },
+        hooks            = opts.hooks or {
+            run_hooks = true,
+            prompt_on_untrusted = false,
+            timeout_seconds = 600,
+        },
+        resurrect_argv_allowlist = resolve_argv_allowlist(
+            opts.resurrect_argv_allowlist),
+        keys             = opts.keys or copy_keys(DEFAULT_KEYS),
+        plugin_version   = M.VERSION,
+        proto_version    = 1,
+    }
+
+    local path = path_join(tmpdir(), next_config_filename())
+    local encoded = wezterm.json_encode(body)
+    local f, err = io.open(path, "wb")
+    if f == nil then
+        error(string.format(
+            "WEZSESH_CONFIG_WRITE_FAILED: %s (%s)",
+            tostring(err), path), 0)
+    end
+    f:write(encoded)
+    f:close()
+    return path
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §9.2 — spawn (Appendix A)
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Builds the env vector EXACTLY per Appendix A:
+--   WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_FILE,
+--   WEZSESH_PLUGIN_VERSION
+-- — no more, no less. Dirs travel inside `WEZSESH_CONFIG_FILE`.
+--
+-- spawn_mode dispatch:
+--   "window" → wezterm.mux.spawn_window{ args=…, set_environment_variables=… }
+--   "tab"   → window:mux_window():spawn_tab{ … } (default; Appendix A names
+--             this as `current_window:spawn_tab` — the GUI Window userdata
+--             exposes `:mux_window()` for that resolution)
+--
+-- The HMAC key is read from `wezterm.GLOBAL.wezsesh_session_key`;
+-- ensure_session_key MUST have populated it before spawn. If absent,
+-- we early-return without spawning so the caller can surface a doctor
+-- toast (a missing key would mean every subsequent OSC is silently
+-- dropped at HMAC verify).
+
+function M.spawn(window, opts)
+    opts = opts or {}
+
+    local key = wezterm.GLOBAL.wezsesh_session_key
+    if type(key) ~= "string" or #key ~= 64 then
+        if type(wezterm.log_error) == "function" then
+            wezterm.log_error(
+                "wezsesh: spawn aborted — wezsesh_session_key missing or malformed")
+        end
+        return nil, "WEZSESH_SESSION_KEY_MISSING"
+    end
+
+    local config_path = M.write_config_file(opts)
+    local bin = M.resolve_binary(opts)
+
+    local env = {
+        WEZSESH_HMAC_KEY       = key,
+        WEZSESH_PROTO_VERSION  = "1",
+        WEZSESH_CONFIG_FILE    = config_path,
+        WEZSESH_PLUGIN_VERSION = M.VERSION,
+    }
+
+    -- macOS GUI launch contexts hand spawned children a minimal launchd
+    -- PATH (/usr/bin:/bin:/usr/sbin:/sbin), which doesn't include the
+    -- wezterm CLI itself even though wezterm.app *is* the parent. Inject
+    -- wezterm.executable_dir so the binary's `exec.LookPath("wezterm")`
+    -- resolves. Fall back to inheriting the parent's PATH if the
+    -- accessor isn't available.
+    local exe_dir = type(wezterm.executable_dir) == "string"
+        and wezterm.executable_dir or nil
+    local parent_path = os.getenv("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"
+    if exe_dir and exe_dir ~= "" then
+        env.PATH = exe_dir .. ":" .. parent_path
+    else
+        env.PATH = parent_path
+    end
+
+    local args = { bin }
+    local mode = opts.spawn_mode or "tab"
+
+    if mode == "window" then
+        return wezterm.mux.spawn_window {
+            args = args,
+            set_environment_variables = env,
+            cwd = opts.cwd,
+            workspace = opts.workspace,
+        }
+    end
+
+    -- "tab" (default). Per Appendix A: `current_window:spawn_tab {...}`,
+    -- where `current_window` is the MUX window. The GUI `Window` userdata
+    -- the keybinding receives exposes `:mux_window()` for that resolution;
+    -- `Pane:spawn_tab` does NOT exist in current wezterm builds.
+    if window == nil then
+        return nil, "WEZSESH_SPAWN_NO_WINDOW"
+    end
+    local mux_window = window:mux_window()
+    return mux_window:spawn_tab {
+        args = args,
+        set_environment_variables = env,
+        cwd = opts.cwd,
+    }
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- §9.2 / §11 — register_keybinding
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Append a `{key, mods, action}` entry to `config.keys`, initialising
+-- the array as an empty table when absent. The action is a
+-- `wezterm.action_callback` wrapper that calls `M.spawn(window, opts)`
+-- under `pcall` — `apply_to_config` is responsible for catching the
+-- pcall return and toasting if needed; here we keep the binding
+-- crash-isolated from the wezterm event loop.
+
+function M.register_keybinding(config, opts)
+    opts = opts or {}
+    config = config or {}
+    if type(config.keys) ~= "table" then config.keys = {} end
+
+    local kb = opts.keybinding or { key = "W", mods = "LEADER|SHIFT" }
+
+    table.insert(config.keys, {
+        key    = kb.key,
+        mods   = kb.mods,
+        action = wezterm.action_callback(function(window, _pane)
+            local ok, err = pcall(M.spawn, window, opts)
+            if not ok and type(wezterm.log_error) == "function" then
+                wezterm.log_error(
+                    "wezsesh: spawn keybinding failed: " .. tostring(err))
+            end
+        end),
+    })
+    return config
+end
+
+return M

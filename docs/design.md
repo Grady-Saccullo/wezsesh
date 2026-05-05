@@ -42,7 +42,7 @@ PRD section references are given as `(P §x.y)`.
 | 18 | `find` Phase-1 drain protocol specified: ctx-cancel after poller success closes the listener; consumer drains the channel until it returns `ok=false`. The "switch to live target gets `started`" comment was wrong — live targets reply `completed`; updated accordingly. | v2-#7, R17 |
 | 19 | Switch poller worst-case latency budget is documented (each tick may take up to 4 s on a slow mux); cadence becomes adaptive. | v2-R15 |
 | 20 | New §13.5.2 trust rebind UX (`wezsesh trust --rebind <old> <new>`) for moved sidecars. | v2-R11 |
-| 21 | New §13.13 unknown-verb behaviour: Lua's `ops.dispatch` replies with `error.code=UNKNOWN_VERB`, `ok=false`, terminal `completed`. The "treated as noop" wording is dropped. | v2-#5 |
+| 21 | New §13.13 unknown-verb behaviour: Lua's `ops.dispatch` replies with `error.code=UNKNOWN_VERB`, `ok=false`, terminal `completed`. The "treated as noop" wording is dropped. **Superseded by #35** (T-600 found that §4.2's verb-keyed verifier rejects an unknown `op` at `ipc.lua` step (e), BEFORE HMAC verify and BEFORE `ops.dispatch`; no wire reply is written; the binary observes `IPC_TIMEOUT`). | v2-#5 |
 | 22 | New §13.14 panic paths for non-TUI subcommands. | v2-R13 |
 | 23 | New §17.6 end-to-end smoke test contract. | v2-P10 |
 | 24 | `__wezsesh_canonical = "untagged"` outlawed; encoder shape table is the single tagging mechanism. Numbering note: v2's §0.1 referenced §13.11 / §13.12 / §13.13 for sort / pin / binary-only flows, but the actual numbers were §13.10 / §13.11 / §13.12. v3 keeps the in-document numbering and updates this changelog accordingly. | v2-#1 |
@@ -52,10 +52,11 @@ PRD section references are given as `(P §x.y)`.
 | 28 | §17.2 HMAC round-trip fixture corrected: the prior placeholder `id` (`01JABCDEFGHIJKLMNPQRSTUVWXY`) was 27 chars and used Crockford-excluded glyphs (I, L, U), so §9.3.1's `#id == 26` check would silent-drop it before HMAC verify ran. Replaced with `01JABCDEFGHJKMNPQRSTVWXYZA` (26 chars, all-Crockford-valid); `expected_hmac` is now pinned to the openssl-computed value. Pure-Lua HMAC + canonical-JSON encoder were validated against this fixture and against openssl during the IPC integration spike. | spike-#1 (`docs/issues/1.md`) |
 | 29 | New §9.0.1 documents mlua sandbox constraints discovered during the spike: `debug.*` is unavailable (no self-locate via `debug.getinfo`), `wezterm` is NOT exposed on `_G` (every submodule MUST acquire it via `local wezterm = require("wezterm")`). | spike-#1 |
 | 30 | §5.4 `seen_ids` storage shape narrowed to a flat int (`unix-seconds`) per ULID; new "GLOBAL value-shape rule" forbids nested-table values in `wezterm.GLOBAL.*`. mlua's GLOBAL userdata silently breaks indexing on read for nested-table values ("can only index array or object values"). §10.6 schema updated; same rule applies to all `wezterm.GLOBAL` sub-tables. | spike-#1 |
-| 31 | §9.1 `apply_to_config(config, opts)` contract tightened: `opts` MUST carry `binary` (or `plugin_root`); the function MUST bust `package.loaded["wezsesh.*"]` at entry. wezterm's `Ctrl+Shift+R` reloads the entry-point file via `loadfile` but does NOT re-evaluate cached `require()` results, so submodule edits never land without an explicit cache-bust or full wezterm restart. | spike-#1 |
+| 31 | §9.1 `apply_to_config(config, opts)` contract tightened: `opts` SHOULD carry `binary` or `plugin_root` (both-set precedence: `binary` wins; bare-PATH fallback when neither is set; §11 lists both keys); the function MUST bust `package.loaded["wezsesh.*"]` at entry. wezterm's `Ctrl+Shift+R` reloads the entry-point file via `loadfile` but does NOT re-evaluate cached `require()` results, so submodule edits never land without an explicit cache-bust or full wezterm restart. | spike-#1 |
 | 32 | §3.1 gains a "PTY-multiplexer" caveat: the binary MUST run inside a native wezterm pane. tmux / screen / asciinema / Claude-Code-style agents own the PTY, consume the OSC bytes as program output, and never forward the SetUserVar to wezterm's parser. New doctor check `WEZSESH_UNDER_MULTIPLEXER` flags the condition based on `$TMUX` / `$STY` / agent env vars in the binary's environment. | spike-#1 |
-| 33 | Save / load Lua handlers no longer rely on `pcall(state_manager.save_state, …)` returning errors — `save_state` swallows I/O and encryption errors into a `wezterm.emit("resurrect.error", string)` and returns `nil`. New §9.13 `resurrect_error.lua` exposes `with_capture(fn) → (pcall_ok, pcall_ret, captured)` that combines a per-call buffer with the persistent listener. §9.4.1 / §9.4.2 rewritten to dual-path detection (pcall return catches `wezterm.json_encode` failures; capture catches I/O / encryption failures). §9.4.1 additionally splits `SNAPSHOT_LOAD_FAILED` from `RESURRECT_PARTIAL` for the corrupted-snapshot case (load returned `{}` → restore raised `ipairs(nil)` → previously misclassified as PARTIAL). §9.1 registers the listener and calls `resurrect.state_manager.change_state_save_dir(snapshot_dir .. "/")`. Appendix C events table expanded; §13.4 caveat 2.b strengthened ("empirically broken — spike #2 verified"); §7 `SAVE_FAILED` / `SNAPSHOT_LOAD_FAILED` `details.raw_error` taxonomy added. Upstream gap acknowledged at [MLFlexer/resurrect.wezterm#28](https://github.com/MLFlexer/resurrect.wezterm/issues/28). | spike-#2 (`docs/issues/2.md`) |
+| 33 | Save / load Lua handlers no longer rely on `pcall(state_manager.save_state, …)` returning errors — `save_state` swallows I/O and encryption errors into a `wezterm.emit("resurrect.error", string)` and returns `nil`. New §9.13 `resurrect_error.lua` exposes `with_capture(fn) → (pcall_ok, pcall_ret, captured)` that combines a per-call buffer with the persistent listener. §9.4.1 / §9.4.2 rewritten to dual-path detection (pcall return catches `wezterm.json_encode` failures; capture catches I/O / encryption failures). §9.4.1 additionally splits `SNAPSHOT_LOAD_FAILED` from `RESURRECT_PARTIAL` for the corrupted-snapshot case (load returned `{}` → restore raised `ipairs(nil)` → previously misclassified as PARTIAL). §9.1 registers the listener and calls `resurrect.state_manager.change_state_save_dir(snapshot_dir .. "/")` (gated on `opts.snapshot_dir` being a non-empty string; no-op otherwise — §8.17.1 doctor `snapshot.dir.matches.resurrect` is the runtime safety net for the unset case, see §9.1 step (c) / §11.5). Appendix C events table expanded; §13.4 caveat 2.b strengthened ("empirically broken — spike #2 verified"); §7 `SAVE_FAILED` / `SNAPSHOT_LOAD_FAILED` `details.raw_error` taxonomy added. Upstream gap acknowledged at [MLFlexer/resurrect.wezterm#28](https://github.com/MLFlexer/resurrect.wezterm/issues/28). | spike-#2 (`docs/issues/2.md`) |
 | 34 | Forward path uses a sidecar file under `<runtime_dir>/req/` for the canonical-JSON request; the OSC carries only a ≤ 256 B pointer (`{v, id, path}`). The OSC is single-syscall on every supported platform, so the **renderer-OSC byte-level interleave race** — a kernel TTY split-write of an inline-payload OSC interleaved with bubbletea's frame-paint syscalls from a separate fd, causing wezterm's OSC parser to abort the in-progress OSC per ECMA-48 when it sees an embedded ESC and dump the trailing payload bytes into the rendered scrollback — documented in spike #3 (1.33 % OSC loss above ~2 KiB on-wire under bubbletea rendering pressure on darwin-arm64; visible base64 leakage) is structurally impossible. New §3.1 two-phase dispatch (request file write + pointer OSC); §3.3 framing reframed as file-resident; §3.5 grows an OSC-pointer ceiling (256 B) alongside the retained 4 KiB request-file ceiling; new `<runtime_dir>/req/` filesystem entry (§12.1) with mirrored cleanup (§12.4); new `runtime.dir.req_orphans` doctor check (§8.17.1); new `REQ_POINTER_REJECTED` wire-silent error code (§7); `internal/uservar.WriteOSC` contract narrowed to ≤ 256 B with the prior "OSC parser tolerates interleaving" comment removed (§8.8); `internal/ipcdispatcher` Phase 1 calls `safefs.AtomicWriteFile` (§8.6); plugin handler (§9.3) grows pre-steps for pointer decode + path validation + file read + delete; field-shape validator split into pointer (§9.3.1.A) + payload (§9.3.1.B); `b64.lua decode` promoted to hot path (§9.10); §9.0.1 sandbox table gains a `dofile` row plus new §9.0.1.1 documenting Lua's expression-call ambiguity that bit the spike's install snippet; §17.3 / §17.6 grow gates for atomic write, lifecycle, pointer validation, OSC-ceiling enforcement, and end-to-end 0 % loss / 0 orphans. Empirical validation: 1500 emits over 15 buckets up to 6170 B JSON (`mode=sidecar`), 0 % loss, 0 orphans, p50 5.31 ms emit latency. | spike-#3 (`docs/issues/3.md`) |
+| 35 | §13.13 unknown-verb contract corrected to **wire-silent + `log_warn` at `ipc.lua` step (e)**. §4.2's verb-keyed shape lookup runs BEFORE HMAC verify (the verifier needs `canonical_json.verb_args_shape[op]` to tag the parsed payload before re-encoding); an unknown `op` therefore has no shape, the step-(e) lookup short-circuits, the handler logs `ipc: no shape registered for op=…` and silently returns — never reaching HMAC verify, never reaching `ops.dispatch`, never writing a reply. The binary observes `IPC_TIMEOUT` after the §14.1 5 s first-reply ceiling. §6.0 / §6.5 / §7 / §9.4 / §13.13 / §17.3 / §17.5 brought into alignment with the implementation landed in T-600 (`plugin/wezsesh/ipc.lua` lines 388–405). The §17.4 verb / shape parity lint becomes load-bearing (a missing shape entry now means the verb is unreachable, not merely un-dispatchable). Row #21 superseded. | T-600 |
 
 ### §0.2 — Document map
 
@@ -184,14 +185,31 @@ itself stays ≤ 256 B on the wire (§3.5), which is single-syscall on
 every supported platform.
 
 **Phase 1 — atomic file write.** `safefs.AtomicWriteFile` —
-`O_WRONLY|O_CREAT|O_EXCL` on `<runtime_dir>/req/<8-hex>.json.tmp`,
+`O_WRONLY|O_CREAT|O_EXCL` on `<runtime_dir>/req/<8hex>.json.tmp`,
 write canonical-JSON request bytes, `fsync`, `rename` to
-`<runtime_dir>/req/<8-hex>.json`. Mode 0600 via `unix.Umask(0077)`
-before create. `<8-hex>` is the first 8 hex chars of the request ULID
-— **same prefix used by the reply socket (§3.2)** so post-mortem
-debugging can correlate request file and reply socket by visual scan.
-Symlink defense via `safefs.Enforce(SymlinkRefuse)` on every ancestor
-of `<runtime_dir>/req/` at startup.
+`<runtime_dir>/req/<8hex>.json`. Mode 0600 via `unix.Umask(0077)`
+before create. Symlink defense via `safefs.Enforce(SymlinkRefuse)`
+on every ancestor of `<runtime_dir>/req/` at startup.
+
+**`<8hex>` derivation.** The per-request ULID is built from a 16-byte
+raw buffer: `raw[0:6]` is the big-endian unix-millis timestamp (48
+bits) and `raw[6:16]` is 80 bits drawn from `crypto/rand`. The
+wire-level `id` field (§3.3, `<26-char Crockford-base32 ULID>`) is the
+26-char Crockford-base32 encoding of all 16 bytes per the ULID spec.
+The `<8hex>` filename prefix is `hex(raw[6:10])` — the first 4 bytes
+of the *random* tail, lowercase-hex-encoded into 8 ASCII chars. The same
+prefix is reused as the reply-socket basename (§3.2) so post-mortem
+inspection (logs, `ls <runtime_dir>/req/`, `ls <reply_dir>/`) can pair
+each request file with its reply socket by visual scan — that visual
+correlation is the load-bearing reason a single 8-char prefix appears
+on both halves. The prefix is deliberately drawn from the random tail
+rather than `raw[0:4]` of the timestamp half: two `Dispatch` calls in
+the same millisecond would otherwise produce identical `<8hex>` values
+and trip the `O_EXCL` guard in `safefs.AtomicWriteFile`. With 32 bits
+of randomness per ms-bucket, birthday-paradox collision is bounded at
+~65k requests within a single millisecond — comfortably above any
+plausible single-binary dispatch rate. The collision bound is on the
+2^32 random bits per ms-bucket, NOT on ms-bucket granularity.
 
 **Phase 2 — pointer OSC.** Bytes written to `/dev/tty` (NOT
 `os.Stdout`), under `internal/uservar.Writer.mu`:
@@ -247,14 +265,51 @@ machine, on the same synchronous Lua bytecode path:
    chars, `path` starts with the configured `<runtime_dir>/req/`
    prefix. Any failure → `log_warn("REQ_POINTER_REJECTED", reason)`
    and silent-drop.
-3. `io.open(path, "r")` then `lfs`-style stat (or fallback `wezterm`
-   helper) confirming regular-file, mode 0600, owner-self, not a
-   symlink. Failure → silent-drop with the same code.
+3. `io.open(path, "r")` then a **conditional** stat guard
+   (`stat_guard_ok` in `plugin/wezsesh/ipc.lua`) confirming
+   regular-file, mode 0600, owner-self, not a symlink. The stat
+   guard is gated on a `stat_path` binding supplied via
+   `M._deps.stat_path`; the default binding (`_default_stat_path`)
+   returns `nil` because wezterm's mlua sandbox does NOT ship `lfs`,
+   and `stat_guard_ok` short-circuits to OK whenever the binding
+   returns `nil`. When a production `stat_path` shim IS bound and
+   rejects the file, the handler logs
+   `REQ_POINTER_REJECTED: file stat guard failed` and silent-drops
+   with the same code.
 4. `io.read("*a")` → canonical-JSON request bytes; `os.remove(path)`
    (best-effort; orphans handled by §12.4 startup sweep + §8.17.1
    `runtime.dir.req_orphans` doctor check); `wezterm.json_parse` →
    payload. Cross-check `pointer.id == payload.id`; mismatch →
    silent-drop.
+
+**Stat-guard fallback safety net.** Because pre-step 3's
+mode/owner/symlink/regular-file checks are conditional on a
+`stat_path` binding that the default plugin does NOT supply, the
+forward path's defence against a hostile request file relies on two
+unconditional layers that hold regardless of whether the shim is
+present: (a) the `<runtime_dir>/req/` path-prefix containment check
+in pre-step 2 (`validate_pointer` in `plugin/wezsesh/ipc.lua`),
+which rejects any pointer whose `path` does NOT begin with the
+literal `<runtime_dir>/req/` byte sequence — note this is a
+byte-prefix compare, NOT a canonicalising containment check, so
+`..` traversal is not normalised here; actual containment under
+the runtime tree derives from layer (b) plus the structural
+filesystem invariants on `<runtime_dir>/req/` itself — parent-dir
+mode 0700 created by the binary with `Enforce(SymlinkRefuse)` (see
+§12.1 path-table row for `<runtime_dir>/req/`), which is what
+prevents a non-binary writer from placing a file under that prefix
+in the first place; the request-file's own Phase-1 creation flags
+(`O_EXCL`, mode 0600) are tmp-name collision and read-perm
+hardening, not containment primitives. Layer (b) is
+`safefs.Enforce(SymlinkRefuse)` enforced Go-side on every ancestor
+of `<runtime_dir>/req/` at startup (see **Phase 1 — atomic file
+write** above), which prevents a symlinked ancestor from
+redirecting reads outside the runtime tree. The
+`_deps.stat_path` injection seam in `plugin/wezsesh/ipc.lua` is the
+production-overridable hook; ownership of plugging in a vendored
+stat shim — if/when one is added — sits with **T-603**
+(`apply_to_config` in `plugin/init.lua`), per the agent routing
+table.
 
 (a)–(i) then run **unchanged** against the file-derived payload —
 HMAC verification, freshness, replay, target-window match, dispatch.
@@ -283,13 +338,13 @@ emission. Lua replies via `wezsesh reply <sock> <b64>` subcommand
 (SUN_PATH = 104 darwin, 108 Linux):
 
 ```
-Linux : $XDG_RUNTIME_DIR/wezsesh/<8-hex>.sock
-        (fallback when $XDG_RUNTIME_DIR unset: /tmp/wezsesh-<uid>/<8-hex>.sock)
-darwin: /tmp/wezsesh-<uid>/<8-hex>.sock
+Linux : $XDG_RUNTIME_DIR/wezsesh/<8hex>.sock
+        (fallback when $XDG_RUNTIME_DIR unset: /tmp/wezsesh-<uid>/<8hex>.sock)
+darwin: /tmp/wezsesh-<uid>/<8hex>.sock
 ```
 
-`<8-hex>` is the first 8 hex chars of the request ULID. `.sock` is
-mandatory.
+`<8hex>` is the §3.1 prefix (same byte sequence as the request file).
+`.sock` is mandatory.
 
 **Permissions.**
 - Reply dir: mode 0700; `safefs.Enforce(SymlinkRefuse)` rejects symlink
@@ -300,7 +355,7 @@ mandatory.
 ### §3.3 — Request payload (canonical JSON, file-resident)
 
 The schema below is the canonical-JSON written into
-`<runtime_dir>/req/<8-hex>.json` per §3.1's two-phase dispatch. Bytes
+`<runtime_dir>/req/<8hex>.json` per §3.1's two-phase dispatch. Bytes
 are NOT base64'd at rest — the file holds raw canonical-JSON. The
 OSC pointer (§3.1) carries only `{v, id, path}`.
 
@@ -322,14 +377,35 @@ unsigned UTF-8 byte order
 (`args`, `hmac`, `id`, `op`, `reply_sock`, `target_window_id`, `ts`,
 `v`).
 
+**`target_window_id` semantics.** A signed integer. Wire-valid values
+fall into two classes (`>= 0` and `-1`); a third row documents what
+the §8.6 constructor rejects before the binary ever reaches the wire:
+
+| Value | Meaning |
+|---|---|
+| `>= 0` | A real wezterm window id. wezterm assigns `WINID = 0` to the first window of every session and increments from there, so `0` is just as legitimate as any other non-negative value. The §9.3 handler step (g) compares this strictly against `session.target_window_id` (the value `manager.spawn` recorded at spawn time). |
+| `-1` | The "any window" sentinel. Used as the apply-time placeholder by §9.1 before `manager.spawn` has bound the request to a live wezterm window (`init.lua` passes `-1` to `ipc.register` because no window is available at `apply_to_config` time). The §9.3 handler step (g) treats this as a fall-through — the per-pane `state.set_state` record is the gating signal in that branch (§9.6), not a window-id comparison. |
+| `< -1` | Invalid. The §8.6 `ipcdispatcher.New` constructor rejects a `Deps.TargetWindowID < -1` with `ErrInvalidConfig`; the binary refuses to start. |
+
+The choice of `-1` is durable: wezterm has never assigned negative
+window ids in any released version, so the sentinel cannot collide
+with a real window id even on a freshly-launched session. (Earlier
+revisions of this spec used `0` as the sentinel; that was empirically
+false on every install — wezterm's first window is always `WINID = 0`
+— and produced a `TargetWindowID must be positive` rejection on any
+keybinding spawned from the first window. See T-DOC-049 for the
+correction.)
+
 The HMAC continues to cover the canonical-JSON request bytes — i.e.,
 the file contents — using the §4 / §5 spec verbatim. The pointer is
 **not** signed; an attacker who could forge OSCs could equally point
 at a file under their control, so pointer-side authenticity adds
 nothing the file-content HMAC does not already provide. Pointer
-validation (path prefix, mode, non-symlink) prevents trivial
-out-of-runtime-dir abuses; HMAC defends against tampering with file
-contents post-write.
+validation (path prefix unconditionally; plus the stat-guard subset
+— mode 0600, owner-self, non-symlink, regular-file — only when a
+`_deps.stat_path` shim is bound, see §3.1 stat-guard fallback)
+prevents trivial out-of-runtime-dir abuses; HMAC defends against
+tampering with file contents post-write.
 
 ### §3.4 — Reply payload (Unix socket, JSON, no envelope)
 
@@ -370,7 +446,7 @@ OPTIONAL on replies; the others are REQUIRED.
 | Limit | Value | Source |
 |---|---|---|
 | **OSC pointer envelope (on the wire)** | **256 B** | hard; preserves §3.1 single-syscall atomicity. See worst-case math below. |
-| Request file size (canonical JSON in `<runtime_dir>/req/<8-hex>.json`) | 4 KiB | self-imposed; canonical-JSON encoder ergonomics + golden-corpus (§17.1) memory bounds. Empirically (spike #3) the wezterm OSC parser handles arbitrary file-content sizes correctly because the file is read directly by the plugin; no kernel TTY interleave concerns apply. The `mode=sidecar` reproducer validated 0 % loss up to 6170 B file content — the 4 KiB ceiling is a canonical-JSON-encoder ergonomics target, not a correctness floor. |
+| Request file size (canonical JSON in `<runtime_dir>/req/<8hex>.json`) | 4 KiB | self-imposed; canonical-JSON encoder ergonomics + golden-corpus (§17.1) memory bounds. Empirically (spike #3) the wezterm OSC parser handles arbitrary file-content sizes correctly because the file is read directly by the plugin; no kernel TTY interleave concerns apply. The `mode=sidecar` reproducer validated 0 % loss up to 6170 B file content — the 4 KiB ceiling is a canonical-JSON-encoder ergonomics target, not a correctness floor. |
 | Reply payload size | 1 MiB | `io.LimitedReader` cap |
 | First-reply ceiling | 5 s | TUI surfaces `IPC_TIMEOUT` |
 | Follow-up after `started` | 30 s | non-fatal toast on overrun |
@@ -385,9 +461,9 @@ the steady-state queue depth at 2.
 
 **OSC pointer worst-case math.** The pointer JSON in canonical byte
 order is `{"id":"<26-char ULID>","path":"<P>","v":1}` where `<P>` =
-`<runtime_dir>/req/<8-hex>.json`. Static structural bytes: 24
+`<runtime_dir>/req/<8hex>.json`. Static structural bytes: 24
 (`{"id":"","path":"","v":1}`) + 26 (`id`) + 18 (literal `/req/` +
-`<8-hex>` + `.json`) + `len(<runtime_dir>)`. With `<runtime_dir>` at
+`<8hex>` + `.json`) + `len(<runtime_dir>)`. With `<runtime_dir>` at
 the darwin SUN_PATH budget (§3.2: 90 B for the budget after subtracting
 the 14-byte socket-tail overhead — `len(<runtime_dir>) ≤ 104 - 14 = 90`),
 the pointer JSON reaches 158 B. After base64 (4/3 expansion → 212 B)
@@ -501,8 +577,14 @@ shape entry; CI lint (§17.4) enforces parity between
 4. Hex-encode digest (lowercase).
 5. Set `hmac` field.
 6. Re-encode for wire.
-7. Verifier: parse → REMOVE `hmac` key (do not zero) → verb-aware tag
-   (§4.2) → canonical-encode → recompute HMAC → constant-time compare.
+7. Verifier: parse → verb-aware tag (§4.2) → REMOVE `hmac` key
+   (do not zero) → canonical-encode → recompute HMAC → constant-time
+   compare. The tag-before-remove order is load-bearing: `ROOT_PAYLOAD_SHAPE`
+   (§4.2) declares `hmac` as a required key, so tagging a payload from
+   which `hmac` had already been dropped would raise
+   `CANONICAL_SHAPE_MISMATCH`. Field-removal is order-independent on the
+   post-encode byte sequence sans-`hmac` because the tagger touches only
+   shape metadata on `op` and `args.*`, not the `hmac` scalar.
 
 The byte sequence at step 2 MUST NOT contain `"hmac":""`. Forbidden
 alternative ("set empty then encode") produces different bytes.
@@ -608,7 +690,7 @@ here, not repeated in each verb's table:
 | `UNEXPECTED_EXIT` | Go panic-recover wrote sentinel reply |
 | `IPC_INIT_FAILED` | `net.Listen` setup failed (incl. SUN_PATH) |
 | `XDG_PATH_TIMEOUT` | state/trust read exceeded 2 s ctx |
-| `UNKNOWN_VERB` | unknown `op` value (terminal `error.code`) |
+| `UNKNOWN_VERB` | (silent on the wire — see §13.13) |
 | `UNKNOWN` | uncategorised |
 
 ### §6.1 — `switch`
@@ -709,9 +791,12 @@ TUI cancellation marker. No-op on Lua side.
 
 Reply: `completed`. `data: {}`.
 
-Unknown verbs emit a terminal `completed` reply with
-`ok=false, error.code=UNKNOWN_VERB` (§13.13). They do NOT degrade to
-noop semantics; the wording in v2 was misleading.
+Unknown verbs are silent on the wire: §4.2's verb-keyed verifier
+needs a `canonical_json.verb_args_shape[op]` entry to tag the parsed
+payload before HMAC re-encode, so an unknown `op` short-circuits at
+`ipc.lua` step (e) with an internal `log_warn` and no reply (§13.13).
+The binary observes `IPC_TIMEOUT` after the §14.1 first-reply
+ceiling. They do NOT degrade to noop semantics.
 
 ---
 
@@ -745,7 +830,7 @@ The "Surface" column distinguishes:
 | `STALE_PAYLOAD` | `|now - ts| > 30` | `completed` | `error.code` | log_warn (only fired post-HMAC) |
 | `REPLAY` | duplicate `id` in `seen_ids` | n/a | `wire-silent` | (deduplication) |
 | `IPC_TIMEOUT` | first-reply 5 s ceiling exceeded | n/a | `tui-only` | toast |
-| `UNKNOWN_VERB` | unknown `op` field | `completed` | `error.code` | log_warn |
+| `UNKNOWN_VERB` | unknown `op` field — no `canonical_json.verb_args_shape[op]` entry; rejected at `ipc.lua` step (e) before HMAC verify | n/a | `wire-silent` | log_warn; TUI hits `IPC_TIMEOUT` |
 | `UNEXPECTED_EXIT` | binary panic-recover wrote sentinel reply | `completed` | `error.code` | toast |
 | `PANE_CLOSED_RACE` | `cli activate-pane` exit 1 twice | `completed` | `error.code` / `binary-only` | toast `target pane closed; refresh and retry` |
 | `XDG_PATH_TIMEOUT` | 2 s ctx exceeded reading `state.json` / trust file | `completed` | `error.code` | toast w/ remediation |
@@ -757,7 +842,7 @@ The "Surface" column distinguishes:
 | `RENAME_COLLISION` | rename target already exists (live or saved) | n/a | `binary-only` | TUI re-prompts |
 | `TRUST_REBIND_MISSING` | `wezsesh trust --rebind <old> <new>` source absent | n/a | (CLI exit) | exit non-zero |
 | `WEZSESH_UNDER_MULTIPLEXER` | binary launched under tmux / screen / asciinema / agent harness; OSC would be intercepted before reaching wezterm | n/a | `doctor-only` | doctor remediation: open a native wezterm tab |
-| `REQ_POINTER_REJECTED` | §3.1 pointer fails plugin pre-step validation: malformed JSON, path outside `<runtime_dir>/req/`, file mode ≠ 0600, file is symlink, `io.open` failed (incl. file already removed by retransmit), or `pointer.id ≠ payload.id` | n/a | `wire-silent` | log_warn with rejection reason; reply socket is already bound (§3.2) but the plugin writes no reply, so the binary observes `IPC_TIMEOUT`; doctor `runtime.dir.req_orphans` (§8.17.1) surfaces leaked request files |
+| `REQ_POINTER_REJECTED` | §3.1 pointer fails plugin pre-step validation. **Unconditional rejection causes:** malformed JSON, path does not begin with `<runtime_dir>/req/`, `io.open` failed (incl. file already removed by retransmit), or `pointer.id ≠ payload.id`. **Conditional on a `_deps.stat_path` shim being bound** (the default plugin's `_default_stat_path` returns `nil` because wezterm's mlua sandbox does not ship `lfs`, so these short-circuit to OK; see §3.1 stat-guard fallback): file mode ≠ 0600, owner not self, file is symlink, file is not a regular file. | n/a | `wire-silent` | log_warn with rejection reason; reply socket is already bound (§3.2) but the plugin writes no reply, so the binary observes `IPC_TIMEOUT`; doctor `runtime.dir.req_orphans` (§8.17.1) surfaces leaked request files |
 | `UNKNOWN` | uncategorised | `completed` | `error.code` | toast |
 
 `details` field shapes:
@@ -947,18 +1032,25 @@ package canonicaljson
 
 // Marshal encodes v per §4.1 rules. Returns ErrFloat for any float
 // subtype, ErrInvalidUTF8 for invalid UTF-8 strings, ErrUnsupported
-// for unsupported types.
+// for unsupported types, ErrIntOverflow when a uint / uint64 value
+// exceeds math.MaxInt64.
 func Marshal(v any) ([]byte, error)
 
 var (
     ErrFloat       = errors.New("canonicaljson: float not allowed")
     ErrInvalidUTF8 = errors.New("canonicaljson: invalid UTF-8")
     ErrUnsupported = errors.New("canonicaljson: unsupported type")
+    ErrIntOverflow = errors.New("canonicaljson: integer out of int64 range")
 )
 ```
 
 There is no `Unmarshal`. Reply parsing uses `encoding/json` —
 canonicality is a property of *outbound* bytes only.
+
+`ErrIntOverflow` enforces §4.1 rule 3's integer range: the wire admits
+only `[-2^63, 2^63-1]`. Go `uint` / `uint64` values above
+`math.MaxInt64` cannot be expressed as an int64 and are rejected at
+encode time rather than silently truncated or stringified.
 
 ### §8.3 — `internal/hmac`
 
@@ -999,10 +1091,14 @@ func ValidateTag(tag string) error
 // ValidateTags checks count + each tag.
 func ValidateTags(tags []string) error
 
-// SanitizeForDisplay replaces every byte in 0x00–0x1F (except \t)
-// and 0x7F with U+FFFD. Also handles valid-UTF-8 representations
-// of U+0080–U+009F. MUST be called on every disk-sourced string
-// before lipgloss / fmt / log / toast / doctor output.
+// SanitizeForDisplay replaces each of the following with U+FFFD:
+// every byte in the C0 range 0x00–0x1F except \t (0x09); the
+// DEL byte 0x7F; valid-UTF-8 C1 controls U+0080–U+009F; the
+// line/paragraph separators U+2028 and U+2029; and every byte
+// of any invalid-UTF-8 sequence (per-byte replacement). The
+// function is total: it always returns valid UTF-8. MUST be
+// called on every disk-sourced string before lipgloss / fmt /
+// log / toast / doctor output.
 func SanitizeForDisplay(s string) string
 
 // NormalizeNFC normalizes via golang.org/x/text/unicode/norm.NFC.String.
@@ -1029,7 +1125,7 @@ package ipc
 type Dispatcher interface {
     // Dispatch performs the §3.1 two-phase forward dispatch:
     //   1. safefs.AtomicWriteFile the canonical-JSON request bytes to
-    //      <runtime_dir>/req/<8-hex>.json (mode 0600, tmp+rename).
+    //      <runtime_dir>/req/<8hex>.json (mode 0600, tmp+rename).
     //   2. WriteOSC the §3.1 pointer ({v, id, path}) so the plugin
     //      learns where to read the request from.
     // Then returns a channel of replies. Single-reply verbs deliver
@@ -1074,10 +1170,13 @@ package ipcdispatcher
 //   - ipcsock.StartListener for the reverse path
 //   - hmac.Signer for request signing
 //   - the per-request socket-path + request-file path generator
-//     (both share the same first-8-hex-of-ULID prefix; see §3.2)
+//     (both share the §3.1 prefix; see §3.2)
 //
 // The deps argument bundles the live components so that cmd/wezsesh
 // only has to build one struct rather than wire each callsite.
+//
+// Deps.TargetWindowID MUST be >= -1; New returns ErrInvalidConfig
+// otherwise (the -1 sentinel is the §3.3 "any window" case).
 func New(deps Deps) (ipc.Dispatcher, func(), error)
 
 type Deps struct {
@@ -1087,6 +1186,8 @@ type Deps struct {
     TargetWindowID int
     Logger        *logger.Logger
 }
+
+var ErrInvalidConfig = errors.New("ipcdispatcher: invalid Deps")
 ```
 
 Implementation note: `RuntimeDir/req/` is created with mode 0700 +
@@ -1107,29 +1208,39 @@ package ipcsock
 
 // StartListener creates the reply socket at sockPath, starts an accept
 // loop in a goroutine, and returns:
-//   replies — buffered (cap 2) channel of parsed Reply payloads
+//   replies — buffered (cap 2) channel of RAW reply bytes
 //   cleanup — closes listener + os.Remove(sockPath); idempotent (sync.Once)
 //
 // MUST be called synchronously before the corresponding §3.1 forward
 // dispatch (request-file write + pointer OSC) — in bubbletea, from
 // Update, NEVER from a tea.Cmd body. The plugin replies to this
-// socket; both halves share the same first-8-hex-of-ULID prefix.
+// socket; both halves share the §3.1 prefix.
 //
 // Accept loop: SEQUENTIAL — one connection at a time. Top-level
 // defer recover() in the goroutine logs via the structured logger.
+// `log` is required (the listener's accept-error and per-connection-read
+// warnings — §13.2 — surface through it; parity with `SweepStale` below).
 //
 // Caller MUST `defer cleanup()` immediately after StartListener returns.
-func StartListener(sockPath string) (replies <-chan ipc.Reply, cleanup func(), err error)
-
-// InstallSignalHandler registers SIGINT/SIGTERM/SIGHUP. On signal:
-// invoke cleanup(), then os.Exit(130).
-func InstallSignalHandler(cleanup func())
+func StartListener(sockPath string, log *logger.Logger) (replies <-chan []byte, cleanup func(), err error)
 
 // SweepStale removes *.sock files in dir whose mtime > 60 s.
 // Called from main() before tea.Run(). Uses safefs.Enforce(SymlinkSkipWarn)
 // per-file.
 func SweepStale(dir string, log *logger.Logger) error
 ```
+
+The channel carries RAW bytes by design: canonical-JSON parsing into
+`ipc.Reply` (HMAC verify, schema validation, error-class routing) lives
+in `internal/ipcdispatcher` (§8.6). Keeping `ipcsock` byte-only means
+the listener has no dependency on the wire-protocol packages and can
+be exercised by §17.3 conformance tests with hand-rolled payloads.
+
+Signal wiring is intentionally NOT an `ipcsock` export. SIGINT /
+SIGTERM / SIGHUP installation is a single-binary-singleton concern
+owned by `cmd/wezsesh/main.go` (T-800); the listener exports only the
+`cleanup` closure so main can wire it under whichever signal-handling
+strategy the binary settles on (see §8.20, owned by T-800).
 
 ### §8.8 — `internal/uservar`
 
@@ -1169,8 +1280,9 @@ func (w *Writer) Close() error
 package wezcli
 
 // Client is a thin holder for the resolved wezterm path + logger.
-// Methods take ctx; internal 2 s timeout always applies (the longer
-// of caller ctx vs internal cap).
+// Methods take ctx; internal 2 s timeout always applies — effective
+// deadline is min(callerCtx, 2 s) (the shorter of caller ctx vs
+// internal cap).
 type Client struct { /* unexported */ }
 
 // NewClient resolves `wezterm` via exec.LookPath. Returns
@@ -1272,9 +1384,19 @@ package snapshots
 // Repo binds to <snapshotDir>/workspace/. NewRepo is bind-only —
 // it verifies the dir but does NOT scan files. The first List call
 // performs the directory scan.
+//
+// `log` is threaded through for two reasons: (a) safefs.Enforce
+// accepts a *logger.Logger for SymlinkSkipWarn emission (§8.1.1),
+// which List uses on a per-entry basis so a single tampered file
+// does not abort the scan; (b) the per-file size cap (§7) and the
+// resurrect-race retry exhaustion (§17.3) both surface as structured
+// log_warns rather than user-facing errors. NewRepo also pre-creates
+// the parent-dir sidecar lock sentinel (see WriteSidecar below) so
+// the first-writer path does not race with subsequent ones; the
+// sentinel is left as an empty 0600 file and never removed.
 type Repo struct { /* unexported */ }
 
-func NewRepo(snapshotDir string) (*Repo, error)
+func NewRepo(snapshotDir string, log *logger.Logger) (*Repo, error)
 
 func (r *Repo) SnapshotDir() string
 
@@ -1319,12 +1441,38 @@ func (r *Repo) SidecarPath(name string) string
 //   v >  1           → log_warn, rename to .wezsesh.json.v<N>.bak,
 //                       zero Sidecar, ok=false, nil err
 //
-// Acquires nothing (read-only). Sidecar writes serialise via
-// AcquireExclusive in WriteSidecar.
+// Acquires nothing (read-only). Sidecar writes serialise via the
+// parent-dir sentinel described in WriteSidecar.
+//
+// `ctx` is reserved for future cancellation — sidecars currently fit
+// well under the 10 MiB cap and the read is a single os.ReadFile, so
+// the implementation discards ctx today (`_ context.Context`) but the
+// parameter is kept on the API to match List/Has/Hash and to give
+// future directory-scanning sidecar variants a place to plug in
+// without an API break.
 func (r *Repo) ReadSidecar(ctx context.Context, name string) (s Sidecar, ok bool, err error)
 
-// WriteSidecar atomically writes under AcquireExclusive on the sidecar
-// path. Sets s.Version = 1 if zero.
+// WriteSidecar atomically writes the sidecar via safefs.AtomicWriteFile
+// (temp + renameat under a dirfd-anchored open). Sets s.Version = 1
+// if zero.
+//
+// Mutual exclusion across concurrent writers is provided by an
+// exclusive POSIX advisory lock on a parent-dir SENTINEL — a single
+// shared inode at <workspaceDir>/.wezsesh.sidecar.lock that NewRepo
+// pre-creates. The sentinel is acquired via
+// safefs.AcquireExclusiveOrCreate for the full AtomicWriteFile
+// window and released as soon as the rename completes.
+//
+// Locking the sidecar path itself would be wrong: writer-1 would
+// lock inode-A, AtomicWriteFile renames a fresh inode-B over the
+// path, and writer-2 would then lock inode-B independently — the two
+// operations interleave and the file content is not actually
+// serialised across the rename. The parent-dir sentinel coarsens the
+// lock from per-name to per-dir (every sidecar in the workspace dir
+// shares one sentinel), but sidecar writes are infrequent (TUI tag /
+// pin / notes updates), so contention is negligible and the
+// correctness gain is decisive. Rationale traced to the T-203
+// second-pass review (2026-05-02).
 func (r *Repo) WriteSidecar(ctx context.Context, name string, s Sidecar) error
 
 type Entry struct {
@@ -1384,7 +1532,10 @@ package state
 // LIVE-ONLY workspaces only.
 type Store struct { /* unexported */ }
 
-func Open(ctx context.Context) (*Store, error)
+// Open verifies stateDir, reads any existing state.json, runs migration
+// (back up v>1 files; rename legacy `pins` → `live_pins`; sanity-prune
+// live_pins via repoHas), and returns a Store ready for reads/writes.
+func Open(ctx context.Context, stateDir string, log *logger.Logger, repoHas func(name string) bool) (*Store, error)
 
 // RecordSwitch atomically increments switch_count and updates
 // last_switched. ctx bounds the write.
@@ -1416,6 +1567,26 @@ type Usage struct {
 }
 ```
 
+`Open` arguments:
+
+(a) `stateDir` is the resolved state directory per §11.4
+    (`WEZSESH_STATE_DIR` → config `state_dir` → §12.5 auto-detect). The
+    package does not re-resolve; the caller passes `cfg.StateDir`
+    verbatim.
+
+(b) `log` is required because `safefs.Enforce(stateDir, SymlinkRefuse,
+    log)` (§8.1.1) accepts a `*logger.Logger` for its `SymlinkSkipWarn`
+    branch. `Open` itself uses `SymlinkRefuse` (top-level dir, hard
+    failure), but the same `Enforce` signature is shared across
+    policies, so the logger is threaded through.
+
+(c) `repoHas` inverts the §13.11 sanity-prune dependency: live_pins
+    entries with a corresponding snapshot are stale and must be pruned
+    on Open. Importing `internal/snapshots` here would create a cycle
+    (snapshots already depends on safefs/logger primitives Store will
+    eventually share), so the existence check is passed in as a
+    callback. May be nil — in which case no pruning is performed.
+
 Last-writer-wins under concurrent TUIs (acceptable per §10.4).
 
 ### §8.12 — `internal/trust`
@@ -1431,9 +1602,12 @@ func ComputeHash(absSidecarPath string, commandBytes []byte) string
 // Store backs $XDG_DATA_HOME/wezsesh/allow/.
 type Store struct { /* unexported */ }
 
-// Open MkdirAlls if missing (mode 0700), Enforce(SymlinkRefuse) on the
-// trust dir.
-func Open(ctx context.Context) (*Store, error)
+// Open verifies trustDir is not a symlink, MkdirAll's it at mode 0700 if
+// missing, and returns a Store. trustDir is the resolved trust-dir path
+// (typically `<dataDir>/allow`, where dataDir is resolved per §11.4).
+// log may be nil; symlink Skip-warn calls elsewhere will be silent in
+// that case.
+func Open(ctx context.Context, trustDir string, log *logger.Logger) (*Store, error)
 
 func (s *Store) Approve(ctx context.Context, absSidecarPath string, commandBytes []byte) error
 func (s *Store) IsApproved(ctx context.Context, absSidecarPath string, commandBytes []byte) bool
@@ -1462,6 +1636,21 @@ type Entry struct {
 var ErrTrustRebindMissing = errors.New("trust: source approval not found")
 ```
 
+`Open` takes its inputs explicitly rather than reading globals:
+
+(a) `trustDir` is the resolved trust-dir path. The caller resolves it
+    per §11.4 (`WEZSESH_DATA_DIR` → config → §12.5 auto-detect, then
+    `/allow` appended). Passing it in keeps `internal/trust` free of
+    config/env knowledge.
+
+(b) `log` is needed because `safefs.Enforce` accepts a logger for its
+    `SymlinkSkipWarn` path: the listing / `IsApproved` code paths use
+    `SymlinkSkipWarn` (a stray symlink in the trust dir is logged and
+    skipped, not fatal), while `Open` itself uses `SymlinkRefuse` —
+    same `Enforce` signature shared across policies, so the logger is
+    always required by the call shape. `log` may be nil; the
+    `SymlinkSkipWarn` calls are then silent.
+
 ### §8.13 — `internal/argvallow`
 
 ```go
@@ -1488,6 +1677,16 @@ type Auditor struct { /* unexported */ }
 func NewAuditor(shell string, userAdditions []string) *Auditor
 
 func (a *Auditor) AuditSnapshots(ctx context.Context, repo *snapshots.Repo) (map[string][]string, error)
+
+// Allows reports whether basename is in the active allowlist. The
+// lookup is O(1) (map-backed). basename must already be the program
+// basename — Allows does not re-base; passing a full path fails CLOSED.
+func (a *Auditor) Allows(basename string) bool
+
+// List returns a defensive copy of the active allowlist in insertion
+// order (default → shell → user additions). The returned slice is
+// independent of the Auditor's internal state.
+func (a *Auditor) List() []string
 ```
 
 #### §8.13.1 — `default.txt` (source of truth)
@@ -1687,13 +1886,13 @@ type Colors struct {
 }
 type KeyMap struct {
     Switch, Load, Rename, Delete, Save, New, Pin, Tag,
-    Mark, MarkAlt, ClearMarks, Help, Filter, Quit,
+    Mark, MarkAlt, ClearMarks, Help, Filter, Preview, Quit,
     Up, Down, Top, Bottom string  // empty string = disabled
 }
 
 type Data struct {
     Workspaces       []WorkspaceRow
-    State            state.State
+    State            *state.Store  // may be nil in tests
     ActiveWorkspace  string
     ActiveWindowID   int
 }
@@ -1724,13 +1923,15 @@ type Env struct {
     SnapshotDir   string
     StateDir      string
     RuntimeDir    string
+    DataDir       string
     TrustDir      string
     Cfg           *config.Config
 }
 
 type Report struct {
     Checks   []Check
-    Critical bool
+    Critical bool   // any check returned StatusFail
+    Warnings bool   // any check returned StatusWarn (informational; does not imply Critical)
 }
 
 type Check struct {
@@ -1758,7 +1959,12 @@ binary.fs.network                  ← IsNetworkFS on binary path
 plugin.version
 version.compatible
 wezterm.version                    ← floor 20230408-112425-69ae8472
-wezterm.lua_version                ← assert ≥ 5.3 (ct_eq.lua bitwise ops)
+wezterm.lua_version                ← informational only; binary cannot
+                                     probe `_VERSION` from outside the
+                                     wezterm Lua sandbox. Floor (≥ 5.3 for
+                                     ct_eq.lua bitwise ops) is enforced by
+                                     the §16.4 "Lua version assertion" CI
+                                     matrix row.
 wezterm.cli.list
 wezterm.cli.list-clients
 wezterm.cli.tty_name
@@ -1779,6 +1985,9 @@ snapshot.pin.consistency           ← live_pins ∩ saved-names should be ∅
 state.dir.exists
 state.dir.writable
 state.dir.fs.network
+data.dir.exists
+data.dir.writable
+data.dir.fs.network
 trust.dir.exists                   ← rejects symlink
 trust.count
 trust.orphans
@@ -1846,9 +2055,21 @@ package config
 
 // Config is the binary-side configuration loaded from $WEZSESH_CONFIG_FILE.
 type Config struct {
+    // Version mirrors the §10.7 schema marker ("version": 1). Captured so
+    // a future migration can key off the file value; no runtime behaviour
+    // today.
+    Version int `json:"version"`
+
     SnapshotDir    string
     StateDir       string
     RuntimeDir     string
+    DataDir        string
+    // TrustDir is NOT a separately configurable JSON key. Load derives
+    // it as filepath.Join(DataDir, "allow") per §12.1 (the trust store
+    // lives at `<data_dir>/allow/`). Captured as a struct field so the
+    // §8.20.1 startup callsite (`trust.Open(ctx, cfg.TrustDir, log)`)
+    // has a defined source.
+    TrustDir       string
     LogLevel       string
     Sort           string
     DefaultAction  string
@@ -1912,6 +2133,8 @@ wezsesh --version                → prints version, exit 0
 wezsesh --pane-id <int>          → override $WEZTERM_PANE (test/CI)
 wezsesh list [--format json]
 wezsesh doctor [--format json]   → exit 0 on all-OK, !=0 otherwise
+                                   (i.e., when Report.Critical or
+                                   Report.Warnings is true; §8.17)
 wezsesh find [PATTERN] [flags]
 wezsesh trust <name>
 wezsesh trust --revoke <name>
@@ -1929,6 +2152,15 @@ wezsesh reset --yes --include-snapshots  → also remove resurrect snapshots
 wezsesh nuke ...                 → deprecated alias for `reset` with toast
 wezsesh reply <sock> <b64json>   → internal IPC reply
 ```
+
+`--rebind` is mutually exclusive with `--path` and `--sidecar`: the two
+positional args (`<old-abs> <new-abs>`) are absolute sidecar paths (or
+project roots, normalised to `<root>/.wezsesh.json`) and are the sole
+inputs to the rebind operation. `--rebind` acts on a known on-disk trust
+entry keyed by `<old-abs>`, so a path/sidecar resolution scheme is
+meaningless and is rejected at parse time. Combining `--rebind` with
+either flag fails with `--rebind does not accept --path or --sidecar`
+and exits non-zero before any I/O.
 
 #### §8.20.1 — `main.go` startup sequence
 
@@ -1950,8 +2182,24 @@ wezsesh reply <sock> <b64json>   → internal IPC reply
    4. `ipcsock.SweepStale(cfg.RuntimeDir, log)`.
    5. `safefs.Enforce(SymlinkRefuse)` on snapshot / state / runtime dirs.
    6. `wezcli.NewClient(log)`.
-   7. `snapshots.NewRepo(cfg.SnapshotDir)` + `state.Open(ctx)` +
-      `trust.Open(ctx)`.
+   7. `repo := snapshots.NewRepo(cfg.SnapshotDir)`; then build the
+      §13.11 sanity-prune adapter and call `state.Open`:
+
+      ```go
+      repoHas := func(name string) bool {
+          ok, _ := repo.Has(ctx, name) // error intentionally swallowed
+          return ok
+      }
+      store, err := state.Open(ctx, cfg.StateDir, log, repoHas)
+      ```
+
+      The adapter narrows `repo.Has`'s `(ctx context.Context, name
+      string) (bool, error)` shape (§8.10) to `state.Open`'s
+      `func(name) bool` callback shape (§8.11). The error is
+      intentionally swallowed: a transient `stat(2)` failure during
+      sanity-prune must NOT block startup or drop pins. A false
+      negative here just leaves a stale `live_pins` entry that the
+      next Open will re-evaluate. Then `trustStore, err := trust.Open(ctx, cfg.TrustDir, log)`.
    8. Build initial `tui.Data` (sidecar pin + state.LivePins union).
    9. `dispatcher, dispCleanup, _ := ipcdispatcher.New(deps)`.
   10. `model := tui.New(cfg, initial, dispatcher)`.
@@ -1976,12 +2224,16 @@ All modules return a single table `M`.
 
 wezsesh's Lua modules require **Lua 5.3 or newer** for native bitwise
 operators (`~` for binary XOR, `|` for bitwise OR, used in `ct_eq.lua`
-§9.9). wezterm currently ships with mlua/Lua 5.4. CI gate:
-`wezterm.lua_version` doctor check (§8.17.1) asserts `_VERSION` ≥ 5.3.
+§9.9). wezterm currently ships with mlua/Lua 5.4. The load-bearing gate
+is the §16.4 "Lua version assertion" CI matrix row, which asserts
+`_VERSION` ≥ "Lua 5.3" against the wezterm release the build matrix
+targets. The §8.17.1 `wezterm.lua_version` doctor row is informational
+only — the binary runs outside the wezterm Lua sandbox and cannot probe
+`_VERSION` at runtime.
 
 If wezterm ever swaps to LuaJIT (no native bitwise ops), `ct_eq.lua`
-would need a `bit.bxor` / `bit.bor` rewrite. The CI check fails loudly
-in that scenario, preventing silent breakage.
+would need a `bit.bxor` / `bit.bor` rewrite. The §16.4 CI gate fails
+loudly in that scenario, preventing silent breakage.
 
 ### §9.0.1 — mlua sandbox constraints
 
@@ -1991,7 +2243,7 @@ used in plugin code:
 
 | Feature | Status | Required workaround |
 |---|---|---|
-| `debug.getinfo` / `debug.traceback` / any `debug.*` function | NOT exposed | Plugin cannot self-locate via `debug.getinfo(1, "S").source`; `init.lua`'s `apply_to_config` accepts an explicit `plugin_root` (or derives one from `binary`'s parent dir). See §9.1. |
+| `debug.getinfo` / `debug.traceback` / any `debug.*` function | NOT exposed | Plugin cannot self-locate via `debug.getinfo(1, "S").source`; `init.lua`'s `apply_to_config` accepts an explicit `plugin_root` (or, post-T-603, derives one from `binary`'s parent dir). See §9.1. |
 | `wezterm` as a global (`_G.wezterm`) | NOT exposed | Every submodule MUST acquire it via `local wezterm = require("wezterm")` at file top. Reading `_G.wezterm` resolves to nil and silently puts every "if `_G.wezterm` then runtime else test-mode" branch into test-mode. Spike #1 exhibited this — `ipc.handle_value` returned `no_key` because its `_G.wezterm.GLOBAL.wezsesh_session_key` lookup failed. |
 | `dofile(path)` | NOT exposed in `apply_to_config` (the Debug Overlay still has it) | Use `loadfile(path)()` (or capture into a local first to dodge §9.0.1.1's expression-call ambiguity). The wezsesh plugin already does this. Spike #3 hit "attempt to call a nil value" when using `dofile` from a config-eval context. |
 
@@ -2033,11 +2285,22 @@ M.VERSION = "0.1.0"      -- bumped per tagged release; CI asserts match
 -- Sentinel-prefixed errors (WEZSESH_*) raised via error(msg, 0) are
 -- detected by string.find substring match and surfaced via 10s toast.
 --
--- opts MUST carry one of:
+-- opts SHOULD carry one of:
 --   • binary       = "<absolute path to wezsesh binary>"
---                    plugin_root is auto-derived as parent_dir(binary)/plugin
+--                    Wins when both are set (matches §9.2's
+--                    `resolve_binary` precedence). T-603's
+--                    `apply_to_config` will auto-derive `plugin_root`
+--                    as `parent_dir(binary)/plugin` when only `binary`
+--                    is supplied.
 --   • plugin_root  = "<absolute path to plugin/ dir>"
---                    explicit; takes precedence when both are set.
+--                    Fallback used to locate the binary as
+--                    `<plugin_root>/wezsesh` only when `binary` is
+--                    absent or empty (see §9.2).
+-- If neither is supplied, `resolve_binary` returns the bare string
+-- `"wezsesh"` so PATH resolution runs at exec time (§9.2). This is a
+-- supported configuration; the SHOULD-carry recommendation is the
+-- doctor-friendly precedent so `detect_version` can locate the
+-- installed binary by absolute path.
 --
 -- The function MUST bust `package.loaded["wezsesh.*"]` at entry so
 -- `Ctrl+Shift+R` reloads pick up submodule edits without a full
@@ -2049,18 +2312,59 @@ M.VERSION = "0.1.0"      -- bumped per tagged release; CI asserts match
 --   end
 --
 -- After cache-bust, `apply_to_config` MUST also (spike #2):
---   (a) require("wezsesh.resurrect_error").register()
+--   (a) GLOBAL schema-version stamp (P §7.1; key catalogued in §10.6).
+--       Compare `wezterm.GLOBAL.wezsesh_plugin_version` to `M.VERSION`.
+--       On mismatch — including the first-load nil case AND any
+--       downgrade — every key whose name starts with `wezsesh_` is
+--       wiped from `wezterm.GLOBAL` before the fresh stamp is written.
+--       This step MUST run BEFORE any other GLOBAL write or listener
+--       registration in this function (in particular before steps (b),
+--       (c), and the §5.2 session-key generation that follows). The
+--       wipe set is keyed on the literal `wezsesh_` prefix; a stamp
+--       written after `wezsesh_session_key` would itself nuke that key
+--       on the next mismatched load and leave the plugin half-init'd.
+--       Same-version reloads are a no-op (early-return when the stored
+--       stamp equals `M.VERSION`), so this step is idempotent across
+--       `Ctrl+Shift+R`. Handles `wezterm.plugin.update_all()` cleanly
+--       with no migration logic — old shapes simply disappear and the
+--       fresh code populates GLOBAL from scratch.
+--   (b) require("wezsesh.resurrect_error").register()
 --       — installs the persistent `wezterm.on("resurrect.error", …)`
 --       listener that backs §9.13's with_capture. Idempotent within a
 --       Lua state via a `_G` install gate; cleanly re-armed on reload
 --       (handlers are wiped when wezterm rebuilds the Lua state).
---   (b) resurrect.state_manager.change_state_save_dir(opts.snapshot_dir .. "/")
+--   (c) resurrect.state_manager.change_state_save_dir(opts.snapshot_dir .. "/")
 --       — keeps resurrect's save_state_dir in lockstep with wezsesh's
 --       configured snapshot_dir. Wezsesh's expected_hash, sidecar
 --       correlation, and §12.3 name encoding all assume the two
---       directories are the same; doctor `snapshot.dir.matches.resurrect`
---       (§8.17.1) catches drift, but `apply_to_config` makes drift
---       impossible by construction.
+--       directories are the same. This call is gated on
+--       `opts.snapshot_dir` being a non-empty string; when set, it makes
+--       drift impossible by construction.
+--
+--       When `opts.snapshot_dir` is nil/empty (the supported default
+--       where the user has not pinned a snapshot dir), step (c) is a
+--       no-op — `change_state_save_dir` is NOT invoked. Resolving the
+--       path via §12.5 auto-detect at `apply_to_config` time would
+--       re-introduce the very drift this step is meant to prevent
+--       (the binary may resolve `snapshot_dir` differently than
+--       resurrect's own auto-detect, e.g. across a `WEZSESH_SNAPSHOT_DIR`
+--       override that resurrect cannot see). In the unset case
+--       resurrect's own §12.5 auto-detect is the canonical resolver,
+--       and the §8.17.1 doctor check `snapshot.dir.matches.resurrect`
+--       is the load-bearing safety net — that check is what catches
+--       drift at runtime when the lockstep call did not run.
+--   (d) require("wezsesh.ipc").register({ runtime_dir = …,
+--                                         target_window_id = -1 }).
+--       The `target_window_id` field MUST be the §3.3 "any window"
+--       sentinel (`-1`). At apply_to_config time no wezterm window has
+--       been spawned for the binary yet, so a concrete window id is not
+--       available — and any integer placeholder that could collide with
+--       a real wezterm window id (notably `0`, the first window's id)
+--       would silently wedge step (g) of the §9.3 handler. The handler
+--       runtime discriminator is `payload.target_window_id ==
+--       session.target_window_id` (§9.3.1.C), where `session` is the
+--       `manager.spawn`-recorded `state.set_state` entry; the apply-time
+--       sentinel is intentionally skipped past that comparison.
 function M.apply_to_config(config, opts)  end
 
 -- Programmatic API
@@ -2081,11 +2385,23 @@ present in `plugin/init.lua`'s `apply_to_config`.
 ```lua
 local M = {}
 
-function M.resolve_binary(opts)  end       -- string | raises
+-- Precedence (never raises): explicit `opts.binary` (non-empty string)
+-- wins; else `<opts.plugin_root>/wezsesh` when `plugin_root` is set;
+-- else the bare string "wezsesh" so PATH resolution runs at exec time.
+-- The `<opts.plugin_root>/wezsesh` branch is a deliberate total-function
+-- fallback: the binary's source lives at `cmd/wezsesh/` (§2) and
+-- installs onto `$PATH`, not under `plugin/`, so this path will
+-- typically not exist. That's intentional — `resolve_binary` stays
+-- total (always returns a string, never raises), and `M.detect_version`
+-- will classify the result as "missing" if no executable lives there.
+function M.resolve_binary(opts)  end       -- string
 
 -- Returns "missing" | "unparseable" | "<semver>"
 function M.detect_version(binary_abs_path)  end
 
+-- Same-major semver gate. Both inputs MUST start with `M.m.p`; any
+-- trailing characters are ignored. Any non-semver or nil input
+-- returns false. Returns true iff the parsed majors are equal.
 function M.compatible(plugin_v, bin_v)  end
 
 -- HMAC key generation chain (§5.2). Trims whitespace, validates
@@ -2119,10 +2435,15 @@ local M = {}
 local function handler(window, pane, name, value)
     -- (1) b64.decode(value) + wezterm.json_parse → pointer (pcall)
     -- (2) Pointer field-shape validator (§9.3.1.A)
-    -- (3) Path-prefix + mode + non-symlink + io.open guard
-    --     (rejects path outside <runtime_dir>/req/, mode ≠ 0600,
-    --     symlink, missing file → log_warn REQ_POINTER_REJECTED;
-    --     wire-silent)
+    -- (3) Path-prefix + io.open guard, plus CONDITIONAL stat guard
+    --     (mode 0600 / owner-self / non-symlink / regular-file checks
+    --     run only when M._deps.stat_path is bound to a non-nil shim;
+    --     default _default_stat_path returns nil because wezterm's
+    --     mlua sandbox lacks lfs, so stat checks short-circuit to OK
+    --     and the fallback safety net documented in §3.1 applies).
+    --     Rejects path not beginning with <runtime_dir>/req/, missing
+    --     file, or stat-shim refusal → log_warn REQ_POINTER_REJECTED;
+    --     wire-silent. (See §3.1 stat-guard fallback safety net.)
     -- (4) io.read("*a"); os.remove(path) (best-effort);
     --     wezterm.json_parse → payload (pcall);
     --     cross-check pointer.id == payload.id (mismatch → REQ_POINTER_REJECTED)
@@ -2132,7 +2453,9 @@ local function handler(window, pane, name, value)
     -- (d) Payload field-shape validator (§9.3.1.B)
     -- (e) Verb-aware tagging + canonical re-encode (§4.2; pcall)
     -- (f) HMAC verify with ct_eq.eq
-    -- (g) Freshness + replay + target_window_id
+    -- (g) Freshness + replay + target_window_id (see §9.3.1.C — wire
+    --     value `-1` is the "any window" sentinel; `>= 0` is a real
+    --     wezterm window id matched strictly against `session.target_window_id`)
     -- (h) seen_ids write-back + state.prune + state.set_state
     -- (i) Dispatch with pcall
 end
@@ -2175,6 +2498,29 @@ return type(payload.v) == "number" and payload.v == 1
    and type(payload.hmac) == "string" and #payload.hmac == 64
 ```
 
+The validator accepts any number for `payload.target_window_id` —
+sign and magnitude are checked at step (g), not here. In particular
+`0` is accepted (it is wezterm's first-window id; see §3.3).
+
+##### §9.3.1.C — Step (g) window-match semantics
+
+After the freshness + replay checks, step (g) compares
+`payload.target_window_id` against `session.target_window_id` (the
+value `manager.spawn` recorded into `state.set_state(pane_id, …)`
+when this binary was spawned). The comparison is sentinel-aware:
+
+| Wire `payload.target_window_id` | Action |
+|---|---|
+| `-1` (the §3.3 "any window" sentinel) | Skip the window-match check. The pane-id match in step (a) plus the per-pane `session` lookup is the gating signal. Falls through to step (h). |
+| `>= 0` (a real wezterm window id, including `0`) | Strict equality: dispatch only when `payload.target_window_id == session.target_window_id`. A mismatch is the multi-window broadcast filter (#3524) — wezterm fires `user-var-changed` in every listening window, but only the window whose binary spawned with this `target_window_id` should dispatch. |
+| `< -1` | Cannot occur — see §8.6 / §3.3. |
+
+The `0` row is the load-bearing case the prior spec got wrong:
+wezterm's first window is `WINID = 0`, so a keybinding spawned from
+that window emits a wire `target_window_id` of `0`. The handler MUST
+match it against a `session.target_window_id` of `0` strictly — there
+is no sentinel collision because `-1`, not `0`, is the sentinel.
+
 ### §9.4 — `ops.lua` (verb dispatch table)
 
 ```lua
@@ -2190,13 +2536,18 @@ M.dispatch_table = {
 }
 
 -- Outer dispatch. pcall-wrapped at the boundary; emits
--- result.reply_error on caught error. UNKNOWN VERB HANDLING:
---   if dispatch_table[payload.op] is nil:
---     log_warn("UNKNOWN_VERB op=" .. payload.op)
---     result.reply_error(payload, "UNKNOWN_VERB",
---                        "unknown verb: " .. payload.op, {})
---     return
--- (Replies terminal `completed`, ok=false; does NOT degrade to noop.)
+-- result.reply_error on caught error.
+--
+-- UNKNOWN VERB HANDLING: ops.dispatch never observes an unknown op.
+-- §4.2's verb-keyed verifier in ipc.lua step (e) looks up
+-- canonical_json.verb_args_shape[payload.op] to tag the parsed
+-- payload before HMAC re-encode; a missing entry short-circuits with
+-- log_warn("ipc: no shape registered for op=…") and a silent return,
+-- BEFORE HMAC verify and BEFORE this function is called. There is
+-- no wire reply for an unknown verb (§13.13); the binary observes
+-- IPC_TIMEOUT. The §17.4 verb / shape parity lint enforces that
+-- every dispatch_table key has a matching verb_args_shape entry, so
+-- this branch can never be exercised in production.
 function M.dispatch(payload, window, pane)  end
 
 return M
@@ -2691,7 +3042,7 @@ are stringified via `tostring(...)` at the boundary.
 
 ```
 wezsesh_session_key       string  (64 hex chars; the only HMAC-key store)
-wezsesh_plugin_version    string  ("0.1.0")
+wezsesh_plugin_version    string  ("0.1.0"; stamped/wiped per §9.1 step (a))
 wezsesh_bin_path          string  (absolute path)
 wezsesh_state             object  → keyed by pane_id_str:
                                     JSON-encoded string
@@ -2730,6 +3081,7 @@ binary deletes after reading.
   "snapshot_dir": "<absolute>",
   "state_dir":    "<absolute>",
   "runtime_dir":  "<absolute>",
+  "data_dir":     "<absolute>",
   "log_level":    "info",
   "sort":         "live_first",
   "default_action": "switch",
@@ -2737,7 +3089,7 @@ binary deletes after reading.
   "confirm_delete":    true,
   "confirm_overwrite": true,
   "exclude":      ["^default$"],
-  "new_workspace_command": null,
+  "new_workspace_command": null,         // or absent — see note below
   "preview":      { "enabled": true, "width": 0.4 },
   "markers":      { "active": "▶", "live": "●", "marked": "✓",
                     "unsaved": "(unsaved)", "pinned": "[pinned]" },
@@ -2749,12 +3101,49 @@ binary deletes after reading.
                     "saved_marker": null },
   "hooks":        { "run_hooks": true, "prompt_on_untrusted": false,
                     "timeout_seconds": 600 },
-  "resurrect_argv_allowlist": [],
+  "resurrect_argv_allowlist": [ /* §9.12 default_allowlist contents */ ],
   "keys":         { /* §11.1 default key map */ },
   "plugin_version": "0.1.0",
   "proto_version":  1
 }
 ```
+
+**Absent vs. `null` for nil-valued optional fields.** The Lua emitter
+(§9.2 `manager.write_config_file`) builds the config as a Lua table and
+encodes it with `wezterm.json_encode`; assigning `nil` to a table key is
+indistinguishable from never setting it, so a nil-valued optional field
+(such as `new_workspace_command` when the user has not configured one)
+is serialized as **the absent key**, not as the literal `null` token.
+The Go reader (§8.19 `config.Load`) is required to treat the absent
+key and a literal `null` value as equivalent for every optional field
+listed above (`new_workspace_command`, `colors.*`, etc.) — both decode
+to the field's zero value in `internal/config.Config`. The example
+above shows `null` as a documentation aid; the wire form actually
+written by the plugin omits the key. Future Go consumers MUST NOT
+predicate behavior on the presence of the key when its value would be
+nil; the two encodings are contractually identical. (NB: §10.7 uses
+`wezterm.json_encode`, not the §4 canonical-JSON encoder; this
+absent/null equivalence is local to the binary config file and does
+NOT extend to IPC payloads, where `null` is emitted only via the
+`canonical_json.NULL` sentinel and untagged tables are an encoder
+error.)
+
+**Filename and mode.** The on-disk path is
+`<temp>/wezsesh-<pid-or-seq>-config.json`. The `<pid>` slot uses
+`wezterm.procinfo.pid()` when that mlua API is available; when it is
+absent (some sandbox configurations expose no pid getter), the
+production fallback is `<unix-seconds>-<seq>` where `<seq>` is a
+process-wide monotonic counter, so two near-simultaneous spawns from
+the same wezterm session do not collide on a `<temp>` filename. The
+mode listed as `0600` in §12.1 is best-effort from the writer side:
+pure-Lua `io.open` honours the calling process's umask and exposes no
+chmod hook, and the binary does NOT re-stat or chmod-down the file on
+read today. The on-disk exposure is bounded by the file's short
+lifetime — the binary deletes it after `config.Load` returns
+(§8.19) — and by the file carrying no secrets (the HMAC key travels
+via env per the next paragraph). A future `wezsesh doctor` check MAY
+warn when the file's effective mode is wider than `0600`; that is the
+intended hardening path.
 
 The HMAC key is NOT in this file — it travels via `WEZSESH_HMAC_KEY`
 env var (Appendix A). Config file has wider on-disk exposure than env.
@@ -2765,12 +3154,16 @@ env var (Appendix A). Config file has wider on-disk exposure than env.
 
 | Key | Type | Default | Validation |
 |---|---|---|---|
-| `binary` | string | `"wezsesh"` | non-empty |
+| `binary` | string\|nil | `"wezsesh"` (when neither `binary` nor `plugin_root` is set) | non-empty if string; wins over `plugin_root` (§9.2) |
+| `plugin_root` | string\|nil | nil | non-empty if string; used as `<plugin_root>/wezsesh` only when `binary` is unset (§9.2) |
 | `keybinding` | `{key, mods}` | `{"W", "LEADER\|SHIFT"}` | type check both fields |
 | `spawn_mode` | string | `"tab"` | enum: `"tab"`, `"window"` |
 | `snapshot_dir` | string\|nil | nil | nil → §12.5 auto-detect |
 | `state_dir` | string\|nil | nil | nil → §12.5 auto-detect |
 | `runtime_dir` | string\|nil | nil | nil → §12.5; if string, §13.9 SUN_PATH |
+| `data_dir` | string\|nil | nil | nil → §12.5 auto-detect |
+| `target_window_id` | int\|nil | `-1` (§3.3 "any window" sentinel) | int; threaded into `ipc.register` per §9.1 step (d). The default `-1` is the apply-time placeholder — `apply_to_config` runs before any wezterm window is bound to the binary, so a concrete window id is not available. End users do not set this; it exists in the schema so the apply-time call site reads `opts.target_window_id or -1` (NEVER `… or 0`, which would collide with wezterm's first window). |
+| `resurrect` | table\|nil | nil | when set, must be the resurrect.wezterm plugin module table (i.e. expose `state_manager.change_state_save_dir` as a function); used by §9.1 step (c) to lock resurrect's `save_state_dir` — no-op when `opts.snapshot_dir` is unset (§9.1 step (c) defers to §12.5 auto-detect + §8.17.1 doctor; see §11.5). Falls back to `_G.resurrect` when nil — see §11.5 |
 | `force_close` | bool | `false` | — |
 | `sort` | string | `"live_first"` | enum |
 | `default_action` | string | `"switch"` | enum |
@@ -2788,7 +3181,7 @@ env var (Appendix A). Config file has wider on-disk exposure than env.
 | `hooks.run_hooks` | bool | `true` | — |
 | `hooks.prompt_on_untrusted` | bool | `false` | — |
 | `hooks.timeout_seconds` | int | `600` | min 1; max 86400 |
-| `resurrect_argv_allowlist` | string[] | `[]` | each is a basename |
+| `resurrect_argv_allowlist` | string[] | §9.12 `default_allowlist.lua` contents (the plugin substitutes the non-empty default list when this opt is `nil` or unset; a caller-supplied empty `{}` only round-trips as `[]` on wezterm builds that expose `wezterm.json_array_metatable`, otherwise the default list is substituted — see `manager.resolve_argv_allowlist`) | each is a basename |
 | `log_level` | string | `"info"` | enum |
 | `keys.*` | string\|false | (per §11.1) | string key spec or `false` to disable |
 | `on_before_op` | function\|nil | nil | pcall-wrapped at dispatch |
@@ -2803,7 +3196,7 @@ keys = {
     switch = "s", load = "l", rename = "r", delete = "d",
     save = "S", new = "n", pin = "p", tag = "t",
     mark = "Tab", mark_alt = "Space", clear_marks = "c",
-    help = "?", filter = "/", quit = "q",
+    help = "?", filter = "/", preview = "P", quit = "q",
     up = "k", down = "j", top = "gg", bottom = "G",
 }
 ```
@@ -2831,6 +3224,10 @@ two-key state machine for `g_` prefixes.
 | `WEZSESH_NO_HOOKS` | `=1` disables hooks entirely | yes |
 | `WEZSESH_NERDFONT` | hint for doctor + TUI | n/a |
 
+Directory-resolution env vars (`WEZSESH_SNAPSHOT_DIR`, `WEZSESH_STATE_DIR`,
+`WEZSESH_RUNTIME_DIR`, `WEZSESH_DATA_DIR`) follow the §11.4 resolution chain
+and are not listed here.
+
 ### §11.4 — Resolution table (env vs config file)
 
 For the binary's runtime configuration, fields resolve in this order
@@ -2841,10 +3238,11 @@ For the binary's runtime configuration, fields resolve in this order
 | `snapshot_dir` | `WEZSESH_SNAPSHOT_DIR` | `snapshot_dir` | §12.5 |
 | `state_dir` | `WEZSESH_STATE_DIR` | `state_dir` | §12.5 |
 | `runtime_dir` | `WEZSESH_RUNTIME_DIR` | `runtime_dir` | §12.5 |
+| `data_dir` | `WEZSESH_DATA_DIR` | `data_dir` | §12.5 |
 | `log_level` | `WEZSESH_LOG` | `log_level` | `"info"` |
 | `hooks.run_hooks` | `WEZSESH_NO_HOOKS=1` ⇒ false | `hooks.run_hooks` | true |
 
-For `log_level`, `ResolveLevel(envLevel, optsLevel)` returns the
+For `log_level`, `ResolveLevel(optsLevel, envLevel)` returns the
 **more verbose** of the two (lower numeric value); env can only make
 logging noisier, never quieter. Other fields: env wins outright when
 set.
@@ -2852,6 +3250,69 @@ set.
 The binary reads env vars at startup; the config file is read once
 during `LoadFromEnv`. Direct in-Lua post-call assignments (§11.2)
 cannot reach the binary because the file is already written.
+
+### §11.5 — `resurrect` resolution path
+
+§9.1 step (c) calls `resurrect.state_manager.change_state_save_dir(...)`
+to keep resurrect's `save_state_dir` in lockstep with wezsesh's
+`snapshot_dir` (the "drift impossible by construction" guarantee).
+The plugin resolves the resurrect module table by a two-step lookup,
+both paths blessed by this spec:
+
+1. **Primary — `opts.resurrect`.** The user passes the
+   resurrect.wezterm plugin module table on the opts. Typical usage:
+
+   ```lua
+   local resurrect = wezterm.plugin.require(
+       "https://github.com/MLFlexer/resurrect.wezterm")
+   local wezsesh = wezterm.plugin.require(
+       "https://github.com/Grady-Saccullo/wezsesh")
+   wezsesh.apply_to_config(config, {
+       snapshot_dir = "/path/to/snapshots",
+       resurrect = resurrect,
+   })
+   ```
+
+2. **Fallback — `_G.resurrect`.** When `opts.resurrect == nil`, the
+   plugin reads `rawget(_G, "resurrect")`. This is not a hack:
+   resurrect.wezterm publishes itself onto `_G.resurrect` as a
+   side-effect of `wezterm.plugin.require`, so a user who has
+   loaded resurrect (in any order, in any file) before
+   `wezsesh.apply_to_config` runs has already populated this slot.
+   The fallback covers the common case where the user never wires
+   `opts.resurrect` explicitly.
+
+The plugin validates the resolved table by structural typing — it
+must be a table whose `state_manager.change_state_save_dir` is a
+function — and silently no-ops when the validation fails OR when
+`opts.snapshot_dir` is unset (the §11 default that delegates to
+§12.5 auto-detect; see §9.1 step (c) for why auto-detect must NOT
+be resolved at apply_to_config time). The doctor's
+`snapshot.dir.matches.resurrect` check (§8.17.1) is the runtime
+fallback that catches any remaining drift.
+
+This dual-resolution path is the spec contract for §9.1 step (c)
+specifically, not an implementation accident: for the
+`change_state_save_dir` lockstep call both lookup sites are normative
+and either one MUST be honoured.
+
+**Scope caveat — verb dispatch is `_G.resurrect`-only.** The
+dual-resolution guarantee above applies to §9.1 step (c) and nowhere
+else. The §9.4.1 (restore-class `switch` / `load`) and §9.4.2 (`save`)
+verb-dispatch handlers in `plugin/wezsesh/ops.lua` resolve resurrect
+via `rawget(_G, "resurrect")` only (see `default_resurrect`); they do
+NOT consult `opts.resurrect`, which is read once at apply-to-config
+time and not retained for later dispatch. A user who wires
+`opts.resurrect` but whose host has not also published resurrect onto
+`_G` (the standard `wezterm.plugin.require` side-effect described
+above) will see `save` reply `SAVE_FAILED` and `load` / `switch`
+(saved-not-live) reply `SNAPSHOT_LOAD_FAILED`, both with the message
+`resurrect plugin unavailable`. In practice this is a non-issue:
+resurrect.wezterm publishes `_G.resurrect` unconditionally on require,
+so any opts-wired user has already populated the dispatch path's
+lookup. The asymmetry is documented here so a stripped-down host
+that swaps in a custom `opts.resurrect` table without `_G` publication
+gets a predictable failure mode rather than a surprise.
 
 ---
 
@@ -2861,7 +3322,7 @@ cannot reach the binary because the file is already written.
 
 | Path | Purpose | Mode | Created by |
 |---|---|---|---|
-| `$XDG_STATE_HOME/wezsesh/` | state dir parent | 0700 | `state.Open` (MkdirAll) |
+| `$XDG_STATE_HOME/wezsesh/` | state dir parent | 0700 | `internal/logger.New` (MkdirAll); subsequently verified by `state.Open` (Enforce(SymlinkRefuse)) |
 | `$XDG_STATE_HOME/wezsesh/state.json` | usage + live_pins | 0600 | `safefs.AtomicWriteFile` |
 | `$XDG_STATE_HOME/wezsesh/wezsesh.log` | rotated log | 0600 | `internal/logger` (Enforce(SymlinkRefuse)) |
 | `$XDG_DATA_HOME/wezsesh/` | data dir parent | 0700 | `trust.Open` (MkdirAll) |
@@ -2871,10 +3332,10 @@ cannot reach the binary because the file is already written.
 | `<snapshot_dir>/workspace/<encoded>.wezsesh.json` | snapshot sidecar | 0600 | `safefs.AtomicWriteFile` |
 | `<picked_path>/.wezsesh.json` | project sidecar | user-authored | user |
 | `<reply_dir>/` | reply socket parent | 0700 | binary, with umask 0077 |
-| `<reply_dir>/<8-hex>.sock` | reply socket | 0600 | `net.Listen` after umask |
+| `<reply_dir>/<8hex>.sock` | reply socket | 0600 | `net.Listen` after umask |
 | `<runtime_dir>/req/` | request-file parent dir (§3.1 sidecar) | 0700 | binary, MkdirAll on Dispatcher init; `Enforce(SymlinkRefuse)` |
-| `<runtime_dir>/req/<8-hex>.json` | per-request canonical-JSON file (§3.1 Phase 1) | 0600 | `safefs.AtomicWriteFile` (tmp+rename); `<8-hex>` matches the request's reply-socket prefix |
-| `<temp>/wezsesh-<pid>-config.json` | binary config (per-spawn) | 0600 | Lua `manager.write_config_file` |
+| `<runtime_dir>/req/<8hex>.json` | per-request canonical-JSON file (§3.1 Phase 1) | 0600 | `safefs.AtomicWriteFile` (tmp+rename); `<8hex>` matches the request's reply-socket prefix (see §3.1) |
+| `<temp>/wezsesh-<pid-or-seq>-config.json` | binary config (per-spawn) | 0600 (umask-bound; see §10.7) | Lua `manager.write_config_file` |
 
 ### §12.2 — Reply directory + request directory selection
 
@@ -2892,9 +3353,8 @@ Linux without $XDG_RUNTIME_DIR → "/tmp/wezsesh-<uid>/"
 Both directories are created with mode 0700 + `Enforce(SymlinkRefuse)`
 on first access. The reply-socket child is the existing
 `<runtime_dir>/`-rooted layout; the §3.1 request-file child is
-`<runtime_dir>/req/`. Both share the same first-8-hex-of-ULID file
-prefix per request so post-mortem inspection can correlate by visual
-scan.
+`<runtime_dir>/req/`. Both share the §3.1 prefix per request so
+post-mortem inspection can correlate by visual scan.
 
 ### §12.3 — Filename encoding
 
@@ -2906,8 +3366,8 @@ transform.
 ### §12.4 — Cleanup rules
 
 - Reply socket: `defer cleanup()` after `StartListener`
-  (close + remove, `sync.Once`); `InstallSignalHandler` runs the same
-  on SIGINT/SIGTERM/SIGHUP.
+  (close + remove, `sync.Once`); `cmd/wezsesh/main.go`'s SIGINT /
+  SIGTERM / SIGHUP handler invokes the same `cleanup` (§8.7, §8.20.1).
 - Request file (§3.1): plugin-side `os.remove(path)` after read on the
   happy path. Best-effort — if the unlink fails, the doctor sweep
   picks it up. Binary side does NOT remove on success (the plugin
@@ -2972,6 +3432,12 @@ etc.), the binary auto-detects:
   - darwin: `~/.local/state/wezsesh/` (XDG semantics on darwin too,
     matching PRD §6.8).
   - Override via `WEZSESH_STATE_DIR` or `--state-dir`.
+- `data_dir`:
+  - Linux: `$XDG_DATA_HOME/wezsesh/` (default
+    `~/.local/share/wezsesh/`).
+  - darwin: `~/.local/share/wezsesh/` (XDG semantics on darwin too,
+    matching PRD §6.8).
+  - Override via `WEZSESH_DATA_DIR` or `--data-dir`.
 - `runtime_dir`: per §12.2.
 
 Doctor reports the resolved paths and how each was determined
@@ -3018,7 +3484,7 @@ Doctor reports the resolved paths and how each was determined
         └── "partial"   → terminal; cleanup()
 
 NOTE — request-file ownership. The plugin's pre-step (§9.3 step 4)
-takes ownership of <runtime_dir>/req/<8-hex>.json after read and
+takes ownership of <runtime_dir>/req/<8hex>.json after read and
 unlinks it on the happy path. The binary does NOT delete the file;
 on early-exit before plugin ack, the §12.4 startup sweep + the
 doctor `runtime.dir.req_orphans` check (§8.17.1) reap orphans.
@@ -3052,13 +3518,12 @@ acceptLoop (sequential — one connection at a time):
   for {
     conn, err := listener.Accept()
     if errors.Is(err, net.ErrClosed) { return }
-    if err != nil { log_warn; continue }
+    if err != nil { log_warn; sleep 10ms; continue }   // backoff avoids tight-spin on EMFILE/ENFILE
     func() {
       defer conn.Close()
       conn.SetReadDeadline(now + 2s)
       bytes, _ := io.ReadAll(io.LimitReader(conn, 1<<20))
-      reply := parseReply(bytes)
-      replies <- reply         // buffered, cap 2
+      replies <- bytes         // raw bytes; canonical-JSON parse lives in internal/ipcdispatcher (§8.7, §8.6); buffered, cap 2
     }()
   }
 
@@ -3098,8 +3563,9 @@ for ctx.Err() == nil:
   if succeeded { return nil }
 
   tick_elapsed := now - tick_start
-  if tick_elapsed < 100ms: cadence_ms = 50
-  elif tick_elapsed >= 1s:  cadence_ms = 250    -- slow mux; back off
+  if tick_elapsed < 100ms:    cadence_ms = 50
+  elif tick_elapsed >= 1s:    cadence_ms = 250   -- slow mux; back off
+  else:                       cadence_ms = cadence_ms   -- 100ms ≤ tick_elapsed < 1s: silent middle band, preserve previous cadence (no flip)
   time.Sleep(cadence_ms)
 
 on ctx.Done(): return ErrMuxUnreachable
@@ -3283,6 +3749,27 @@ trust.Revoke(ctx, oldPath, cmdBytes)         // remove old hash file
 If the new path's command bytes differ from the old, the rebind
 refuses (would be a silent uplift of approval scope) — the user must
 run `wezsesh trust <new>` manually.
+
+**Multi-hook eligibility.** A sidecar may carry both `on_create` and
+`on_restore`; each hook produces an independent trust entry (§13.5).
+Rebind is permitted only when the **present-hook set on the source
+matches the present-hook set on the destination** AND **every present
+hook's `command_bytes` is byte-identical across the two sidecars**.
+The CLI walks `on_create` and `on_restore` in §10.2 field order; for
+each hook kind, "present on one side only" or "present on both sides
+with differing bytes" is a divergence and refuses the entire rebind
+(no per-hook partial uplift). Concretely, if the source carries only
+`on_create` and the destination adds `on_restore`, rebind refuses —
+approving the new shape would silently uplift the trust scope from
+"create-only" to "create + restore". Refusal preserves the silent-
+uplift refusal invariant; the user runs `wezsesh trust --sidecar
+<new-abs>` to approve the new shape under explicit consent.
+
+When every present hook is byte-equal across both sides, the CLI
+issues one `store.Rebind` call per present hook in turn. Any
+`TRUST_REBIND_MISSING` (source approval absent for that hook) exits
+non-zero on the first miss so the caller learns the rebind is
+incomplete and can re-approve manually.
 
 ### §13.6 — Encrypted snapshot operations
 
@@ -3582,26 +4069,77 @@ return success
 
 ### §13.13 — Unknown-verb handling
 
-Lua's `ops.dispatch` (§9.4) checks `dispatch_table[payload.op]`. When
-nil:
+Unknown verbs are rejected by §4.2's verb-keyed verifier path at
+`ipc.lua` step (e), BEFORE HMAC verify runs and BEFORE
+`ops.dispatch` is invoked:
 
-```
-log_warn("UNKNOWN_VERB op=" .. payload.op .. " id=" .. payload.id)
-result.reply_error(payload, "UNKNOWN_VERB",
-                   "unknown verb: " .. payload.op,
-                   { received_op = payload.op })
-return
+```lua
+local verb_args_shape = canonical_json.verb_args_shape[payload.op]
+if verb_args_shape == nil then
+    log_warn("ipc: no shape registered for op=" .. tostring(payload.op))
+    return
+end
 ```
 
-This is a terminal `completed` reply with `ok=false`. The reply
-satisfies the TUI's first-reply ceiling (5 s) so the user sees a
-specific error rather than a generic `IPC_TIMEOUT`.
+The lookup is structural — the verifier MUST tag the parsed payload
+before re-encoding for HMAC (§4.2), and `tag_in_place` requires the
+verb-keyed shape; without it the encoder cannot proceed and an
+unauthenticated payload would otherwise have to skip HMAC verify to
+"let `ops.dispatch` decide", which would be a security bug. The
+handler therefore silent-drops with an internal `log_warn` and writes
+nothing on the wire.
+
+Wire effect: the binary observes `IPC_TIMEOUT` after the §14.1 5 s
+first-reply ceiling; the TUI surfaces a generic timeout toast rather
+than a specific `UNKNOWN_VERB`. Operators diagnose unknown-verb
+conditions via:
+
+- the wezterm log (search for `ipc: no shape registered for op=`),
+- the §17.4 verb / shape parity CI lint, which prevents adding a
+  `dispatch_table` entry without a matching `verb_args_shape` entry
+  (and conversely catches an orphaned shape entry in code review).
+
+The §6.0 universal-error row for `UNKNOWN_VERB` is therefore listed
+as `(silent on the wire)`; §7 carries it as `wire-silent`. The code
+remains in the catalog for operator-facing log discoverability and
+to keep the §17.5 fuzz mutation class (`unknown_verb`) self-naming.
+
+#### §13.13.1 — Why not reply on the wire
+
+A wire reply for `UNKNOWN_VERB` would require one of:
+
+1. A verb-independent HMAC-pre-verify skeleton (canonical-encode the
+   `{v, id, ts, op, args, reply_sock, target_window_id}` envelope
+   without `tag_in_place`, recompute HMAC over those bytes, then
+   dispatch on `op`). This breaks §4.2's "no untagged tables"
+   invariant — `args` arrives from `wezterm.json_parse` with no
+   array/object discriminator, so the encoder cannot produce
+   byte-equal output to the Go signer's tagged encoding. The
+   alternative ("define a global root shape that allows any
+   `args`") would force the canonical encoder to special-case the
+   verifier path, reintroducing the v2 sentinel-key hazard the §4.2
+   shape-table approach was chosen to avoid.
+2. Skipping HMAC verify and dispatching the unauthenticated request
+   to `ops.dispatch` (which would then reply `UNKNOWN_VERB`). This
+   trivially admits unauthenticated payloads to the dispatcher and
+   is rejected outright on threat-model grounds (Appendix D).
+
+Both routes carry larger costs than the loss of a specific error
+toast on the TUI side. Path (b) — silent drop at step (e) — is the
+implementation reality.
 
 ### §13.14 — Non-TUI subcommand panic paths
 
 Each subcommand has a thin top-level recover that:
 1. Logs the panic with stack at LevelError (the synchronous flush
    guarantees crash-loss is bounded by the kernel write barrier).
+   Carve-out: `keygen` routes in §8.20.1 step 3 (minimal env, no
+   listener) before §8.20.1 step 4.3 constructs the logger, so its
+   recover invokes a nilable log seam (`keygenPanicLog`) that
+   production does not wire. For `keygen` the LevelError-log is
+   best-effort; steps 2 + 3 alone still satisfy the §5.2 fallback
+   contract (clean stdout + rc=3). Any future subcommand routed in
+   §8.20.1 step 3 inherits the same carve-out.
 2. Prints a one-line error to stderr in the form
    `wezsesh <subcommand>: panic: <err>`.
 3. Exits with status:
@@ -3649,12 +4187,10 @@ is the only one that emits a wire sentinel.
   `internal/tui` MUST have a top-level `defer recover()` that logs and
   exits cleanly. Lint-checked (§17.4).
 - All tests exercising `StartListener`, `StartSwitchPoller`,
-  `InstallSignalHandler`, `ipcdispatcher.New`, or `tea.Run` MUST end
-  with:
-  ```go
-  defer goleak.VerifyNone(t,
-      goleak.IgnoreTopFunction("internal/ipcsock.installSignalHandlerWorker"))
-  ```
+  `ipcdispatcher.New`, or `tea.Run` MUST end with `defer
+  goleak.VerifyNone(t, ...)`. Signal-handler installation lives in
+  `cmd/wezsesh/main.go` (§8.7, §8.20.1) and is exercised only by the
+  binary's end-to-end smoke test, not by package-level tests.
 - Cancellation primitive: `context.Context` only. Never raw
   `time.AfterFunc`. `tea.Tick` is the only timer in `tea.Cmd` bodies
   (`tea.After` does not exist in any released bubbletea version).
@@ -3724,18 +4260,35 @@ Failure → `ILLEGAL_NAME` with `details.field = "tags[i]"`.
 | No NUL byte | byte scan |
 | Strip trailing `\r` | preprocess |
 | Non-empty after trim | check |
-| Tilde-expandable (`~/...` only; `~user/...` not supported) | `os.UserHomeDir()` |
+| Tilde-expandable (see cases below) | `os.UserHomeDir()` |
 | `filepath.IsAbs` after expand | check |
 | `os.Stat`.IsDir | check |
 | Symlinked dirs accepted | (no rejection) |
 
-Failure → log and skip the line; do not abort the picker.
+Tilde expansion enumerates exactly four cases, in order:
+
+1. The line does not start with `~` → returned unchanged for the next
+   rules.
+2. The line is exactly `~` (one byte, no `/`, no name) → expands to
+   `$HOME` (i.e. treated as `~/`); equivalent to `os.UserHomeDir()`.
+3. The line starts with `~/` → expands to `$HOME` joined with the
+   remainder after the `~`.
+4. The line starts with `~` followed by any non-`/` byte (the
+   `~user/...`, `~user`, `~~`, ... family) → unsupported; the line is
+   skipped with reason `"tilde expansion"`.
+
+Failure (any rule above, including case 4 and a `$HOME` lookup error in
+cases 2 or 3) → log and skip the line; do not abort the picker.
 
 ### §15.4 — Render-time sanitization
 
-`SanitizeForDisplay(s)` replaces every byte in `0x00`–`0x1F` (except
-`\t`) and `0x7F` with U+FFFD. Also handles valid-UTF-8 representations
-of `U+0080`–`U+009F`. Apply at:
+`SanitizeForDisplay(s)` replaces each of the following with U+FFFD:
+every byte in the C0 range `0x00`–`0x1F` except `\t` (0x09); the DEL
+byte `0x7F`; the valid-UTF-8 C1 controls `U+0080`–`U+009F`; the line
+and paragraph separators U+2028 LINE SEPARATOR and U+2029 PARAGRAPH
+SEPARATOR; and every byte of any invalid-UTF-8 sequence (per-byte
+replacement). The function is total: regardless of input it always
+returns valid UTF-8 with none of the above classes present. Apply at:
 - Picker row render (lipgloss)
 - Preview pane render (lipgloss)
 - Modal labels
@@ -3771,19 +4324,34 @@ mode, or in-house if not available. Cell width via
 
 ```
 go.mod          : go 1.26.2
-release build   : go build -trimpath \
+release build   : CGO_ENABLED=0 go build -trimpath \
                           -ldflags="-s -w -X main.version=v$(git describe --tags --always)"
 ```
+
+`CGO_ENABLED=0` is required for the release channel: it produces a fully
+static binary with no glibc / libSystem bind, which keeps the published
+artefacts portable across host distributions and host glibc versions on
+linux and avoids picking up the GitHub Actions runner's libSystem on
+darwin. The release workflow (`.github/workflows/release.yml`) sets
+`CGO_ENABLED=0` explicitly in the `reproducible build` step; the spec
+recipe above and the workflow's recipe are required to match.
+
+The local-parity `Makefile` `build:` target intentionally OMITS
+`CGO_ENABLED=0`. The `Makefile` is not the release channel — it builds
+against the developer's own toolchain for parity with `go build ./...`,
+`go vet`, and `staticcheck` on the same machine, and the release-flag
+profile (static link, stripped symbols) is the GitHub Actions workflow's
+job rather than the local dev loop's.
 
 ### §16.2 — Pinned dependencies (Go)
 
 | Module | Version | Notes |
 |---|---|---|
-| `github.com/charmbracelet/bubbletea/v2` | `v2.0.6` | module path `/v2` |
-| `github.com/charmbracelet/bubbles/v2` | `v2.1.0` | |
-| `github.com/charmbracelet/lipgloss/v2` | `v2.0.3` | |
-| `github.com/charmbracelet/x/ansi` | `v0.11.7` | |
-| `github.com/charmbracelet/huh/v2` | `v2.0.3` | modal forms |
+| `charm.land/bubbletea/v2` | `v2.0.6` | module path `/v2`; upstream `module` directive declares `charm.land/...` at this version |
+| `charm.land/bubbles/v2` | `v2.1.0` | |
+| `charm.land/lipgloss/v2` | `v2.0.3` | |
+| `github.com/charmbracelet/x/ansi` | `v0.11.7` | not migrated upstream; retains `github.com/...` path |
+| `charm.land/huh/v2` | `v2.0.3` | modal forms |
 | `github.com/sahilm/fuzzy` | `v0.1.1` | NUL-byte panic fix included |
 | `github.com/mattn/go-runewidth` | latest | display-width measurement |
 | `golang.org/x/sys/unix` | latest | `O_NOFOLLOW`, `Openat`, `Renameat`, `Umask`, `F_OFD_SETLK` (Linux) |
@@ -3798,6 +4366,23 @@ plugin/wezsesh/vendor/sha2.lua            ← Egor-Skriptunoff/pure_lua_SHA
 plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 ```
 
+**Require-name contract.** Every vendored Lua module on disk at
+`plugin/wezsesh/vendor/<modname>.lua` MUST be loaded from any non-vendor file
+under `plugin/` as `require("wezsesh.vendor.<modname>")`. For the file shown
+above the require name is `require("wezsesh.vendor.sha2")`; the bare-prefix
+form `require("vendor.sha2")` is NOT a valid alternative and MUST NOT appear
+in any `plugin/wezsesh/*.lua` file (the `plugin/wezsesh/vendor/` tree is the
+only exception, where the modules may rely on relative `require` of their own
+internal helpers if upstream uses any). Rationale: at production load time
+wezterm injects exactly `<plugin_root>/plugin/?.lua` into `package.path` (and
+nothing further), so `require("wezsesh.vendor.sha2")` resolves to
+`<plugin_root>/plugin/wezsesh/vendor/sha2.lua` while `require("vendor.sha2")`
+has no resolvable path entry and fails the load. A `script_dir`-shimmed test
+harness that adds `<plugin_root>/plugin/wezsesh/?.lua` to `package.path` will
+appear to accept the bare form, but the production wezterm process does not
+add that entry; the dotted-prefix form is the only spelling that resolves in
+both environments. The §16.5 grep lint enforces this contract at PR time.
+
 ### §16.4 — Required CI gates
 
 | Gate | Command |
@@ -3808,7 +4393,7 @@ plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 | Vet | `go vet ./...` |
 | Vendored crypto integrity | `sha256sum -c plugin/wezsesh/vendor/SOURCES.lock` |
 | `default_allowlist.lua` codegen freshness | `go run ./internal/argvallow/codegen --check` |
-| Reproducible build | `go build -trimpath -ldflags='-s -w -X main.version=v...'` |
+| Reproducible build | `CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -X main.version=v...'` (must match §16.1) |
 | Canonical-JSON locale | `LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...` |
 | Build matrix | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`; CI runners pin macos-13 and macos-14 |
 | Lua version assertion | wezterm shipped Lua `_VERSION` ≥ "Lua 5.3" |
@@ -3819,22 +4404,104 @@ plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 | Lint | Implementation | Failure |
 |---|---|---|
 | `unix.F_OFD_SETLK` outside `internal/safefs/lock_linux.go` | grep + AST walk | build error |
-| `os.WriteFile`/`os.OpenFile`/`syscall.Open` in `internal/{snapshots,state,trust}` etc | AST walk | build error |
+| `os.WriteFile`/`os.OpenFile`/`syscall.Open` in any restricted package (see §16.5.1) | AST walk | build error |
 | Direct `wezterm cli` invocation outside `internal/wezcli/` | grep `exec.Command` + `"wezterm"` | build error |
 | Concrete Dispatcher construction outside `internal/ipcdispatcher/` | grep `ipcsock.StartListener` callsites | build error |
 | Lua handler sync-only between markers (a)–(h) | `internal/lualint` parser | PR fail |
 | `tea.After` references | grep | build error |
 | `pcall`-wrap on `wezterm.background_child_process` calls | AST walk in `result.lua`, `ipc.lua` | PR fail |
-| `defer recover()` presence in goroutines in restricted packages | AST walk for `go func` and goroutine-bodies | PR fail |
-| `log.Println`/`fmt.Fprintln(os.Stderr, ...)` in restricted packages | AST walk; must use `internal/logger` | PR fail |
+| `defer recover()` presence in goroutines in any restricted package (see §16.5.1) | AST walk for `go func` and goroutine-bodies | PR fail |
+| `log.Println`/`fmt.Fprintln(os.Stderr, ...)` in any restricted package (see §16.5.1) | AST walk; must use `internal/logger` | PR fail |
 | `verb_args_shape` parity | reflective check: keyset(dispatch_table) == keyset(verb_args_shape) | PR fail |
 | `_G.wezterm` reference in `plugin/wezsesh/*.lua` | grep `_G%.wezterm` | build error (use `local wezterm = require("wezterm")`) |
 | `debug.*` reference in `plugin/wezsesh/*.lua` (incl. `init.lua`) | grep `\bdebug%.` | build error (mlua sandbox lacks debug library) |
 | `dofile(` in `plugin/wezsesh/*.lua` (incl. `init.lua`) | grep `\bdofile%s*\(` | build error (stripped from apply_to_config; use `loadfile(path)()` per §9.0.1) |
+| `require("vendor.` in `plugin/wezsesh/*.lua` (incl. `init.lua`), excluding `plugin/wezsesh/vendor/` | grep `require\("vendor\.` | PR fail (use `require("wezsesh.vendor.<modname>")`; the bare form does not resolve under wezterm's `<plugin_root>/plugin/?.lua` search root — see §16.3) |
 | Line-leading `(` after an expression-call statement | structural check on `plugin/wezsesh/*.lua` (incl. `init.lua`): any line whose first non-whitespace character is `(`, when the previous non-blank, non-comment line ends with `)` outside of strings/comments. Implementation parses each `.lua` file with `internal/lualint`'s tokeniser rather than a regex; greedy regex-based linters miss nested calls (`f(g(x))(y)`), method chains (`x:m()`), and string-method targets. | PR fail (Lua expression-call ambiguity, §9.0.1.1) |
 | `package.loaded["wezsesh.*"] = nil` bust loop in `init.lua` | grep | build error if `apply_to_config` body lacks the loop |
 | Nested-table value into `wezterm.GLOBAL` | grep `wezterm%.GLOBAL[%w_.]*%s*=%s*{` outside canonical-JSON | PR fail (use scalar or JSON-encoded string per §5.4) |
 | `uservar.WriteOSC` payload size > 256 B | runtime check inside `WriteOSC` body — explicit `if len(out) > 256 { return ErrOSCTooBig }` | runtime error (the §3.1 single-syscall property is correctness-load-bearing; oversized OSCs would re-open the spike-#3 race) |
+| `resurrect_error.register()` invocation in `apply_to_config` (spike-#2) | grep `plugin/init.lua`'s `apply_to_config` body for `resurrect_error.register(` (or a `require("wezsesh.resurrect_error")` alias's `.register(` call) | PR fail (absence leaves the `resurrect.error` listener uninstalled and silently breaks the spike-#2 dual-path detector) |
+| `wezterm.on("resurrect.error", …)` outside `resurrect_error.register()` (spike-#2) | grep `plugin/wezsesh/*.lua` (incl. `init.lua`) excluding `plugin/wezsesh/resurrect_error.lua` | PR fail (the owning module keeps the listener idempotent via a `_G` install gate; a duplicate elsewhere fans out N copies on every `resurrect.error` emission) |
+| `wezterm.on("resurrect.workspace_state.restore_workspace.finished", …)` and the `restore_window.finished` / `restore_tab.finished` siblings (spike-#2) | grep anywhere in `plugin/wezsesh/*.lua` (incl. `init.lua`) | PR fail (the three events fire only on the success path and are never a completion signal; use `resurrect_error.with_capture` instead) |
+| `pcall` of `resurrect.state_manager.save_state` outside `resurrect_error.with_capture` (spike-#2) | grep + AST walker on `plugin/wezsesh/*.lua` for `pcall(<chain>.state_manager.save_state, …)` not lexically enclosed by a `with_capture(...)` call | PR fail (bare pcall silently misses the I/O failure path; `with_capture` is the side-channel buffer that observes the swallowed `resurrect.error` emission) |
+| `pcall` of `resurrect.state_manager.load_state` outside `resurrect_error.with_capture` (spike-#2) | grep + AST walker on `plugin/wezsesh/*.lua` for `pcall(<chain>.state_manager.load_state, …)` not lexically enclosed by a `with_capture(...)` call | PR fail (same shape as save_state — silent decrypt failures escape detection without `with_capture`) |
+
+The five spike-#2 rows above mirror the §17.4 enumeration row-for-row; the
+§17.4 entries remain the canonical wording for the CI lint suite. A reader of
+§16.5 alone gets the same five-rule surface as a reader of §17.4 alone.
+
+#### §16.5.1 — Restricted-package set
+
+The lint rules above that say "in any restricted package" target this exact
+set of 19 Go packages. Membership is closed: a package is restricted iff it
+appears in this list. Adding a package to the set is a spec change and
+requires updating this section.
+
+```
+cmd/wezsesh
+internal/argvallow
+internal/canonicaljson
+internal/config
+internal/doctor
+internal/find
+internal/hmac
+internal/ipc
+internal/ipcdispatcher
+internal/ipcsock
+internal/nameval
+internal/pathpicker
+internal/safefs
+internal/snapshots
+internal/state
+internal/trust
+internal/tui
+internal/uservar
+internal/wezcli
+```
+
+A reader of this section can determine, without consulting the lint
+implementation, whether a given Go file is in the restricted set: take the
+file's package import path and check it against the list above. Sub-packages
+are not transitively included — `internal/argvallow/codegen` is **not** in
+the set even though `internal/argvallow` is. Test files (`*_test.go`) inside
+restricted packages follow §16.5.2.
+
+Packages **not** in the restricted set that are sometimes confused for one:
+
+- `internal/logger` — implements the centralised log API. Bans on
+  `log.*` / `fmt.Fprintln(os.Stderr, ...)` would self-trip; the package is
+  excluded by design.
+- `internal/lualint`, `cmd/lualint` — lint tooling; writes diagnostics to
+  stderr by definition.
+- `internal/argvallow/codegen` — generator-only sub-package; writes to
+  stdout / stderr / disk as part of `go run ./internal/argvallow/codegen`.
+- `internal/safefs` itself is in the restricted set, but it is also the
+  implementation of the `os.WriteFile`/`os.OpenFile`/`syscall.Open` ban — see
+  §16.5.2 for the package-level exemption that resolves this.
+
+#### §16.5.2 — Per-file and per-package exemptions
+
+Each lint above is implemented in `internal/lualint/rules/exemptions.go`
+with an explicit allow-list. The exemptions exist because some files are
+themselves the implementation of the API the lint protects, or pre-date
+§16.5 with a reviewed pattern. The full set:
+
+| Lint | Exempt path | Reason |
+|---|---|---|
+| `unix.F_OFD_SETLK` outside `internal/safefs/lock_linux.go` | `internal/safefs/lock_linux.go` | The build-tagged file IS the syscall site. |
+| `os.WriteFile`/`os.OpenFile`/`syscall.Open` in restricted packages | `internal/safefs/*.go` (whole package) | safefs IS the file-write API. Every other restricted package routes writes through `safefs.AtomicWriteFile`. |
+| `os.WriteFile`/`os.OpenFile`/`syscall.Open` in restricted packages | `internal/uservar/writer.go` | The §3.1 single-syscall OSC writer opens `/dev/tty` directly; per-FILE exemption inside an otherwise restricted package. |
+| `os.WriteFile`/`os.OpenFile`/`syscall.Open` in restricted packages | `internal/snapshots/repo.go` | Sidecar lock-sentinel uses `os.OpenFile` with `O_CREATE\|O_EXCL`; data writes still route through safefs. Per-FILE exemption. |
+| Direct `wezterm cli` invocation outside `internal/wezcli/` | `internal/wezcli/*.go` (whole package) | wezcli IS the wezterm-cli gateway. |
+| Concrete Dispatcher construction outside `internal/ipcdispatcher/` | `internal/ipcdispatcher/*.go` (whole package) | ipcdispatcher IS the concrete dispatcher. |
+| `log.Println`/`fmt.Fprintln(os.Stderr, ...)` in restricted packages | `internal/logger/*.go` (whole package) | logger IS the logger. (Note: `internal/logger` is not itself in the §16.5.1 set, but it explicitly waives the rule it implements so that future additions of `internal/logger` to the set would not self-trip.) |
+| `defer recover()` in goroutines in restricted packages | `internal/safefs/netfs.go` | Bounded goroutines that pre-date §16.5; reviewed pattern. Per-FILE exemption. |
+| All bans except the global `unix.F_OFD_SETLK` rule | `*_test.go` everywhere | Test files exercise the banned APIs deliberately (e.g. constructing concrete dispatchers, writing fixtures, stderr asserts). The F_OFD_SETLK rule is grep-shaped and global, so it applies to test files too. |
+| `log.Println`/`fmt.Fprintln(os.Stderr, ...)` (advisory; these paths are not in §16.5.1) | `internal/lualint/*.go`, `cmd/lualint/*.go`, `internal/argvallow/codegen/*.go` | Tooling stderr is part of the contract. Listed for clarity; not strictly required as exemptions because the parent paths are outside the restricted set. |
+
+The exemption list is closed: an addition is a spec change and requires
+updating this table together with `internal/lualint/rules/exemptions.go`.
 
 ---
 
@@ -3844,10 +4511,22 @@ plugin/wezsesh/vendor/SOURCES.lock        ← upstream commit + sha256 of file
 
 Fixture file format (committed):
 ```
-testdata/canonical_json/<name>.lua_input    -- expression that produces the value (e.g., M.object{x = 1})
-testdata/canonical_json/<name>.go_input     -- Go literal expression
-testdata/canonical_json/<name>.expected     -- raw expected canonical bytes
+internal/canonicaljson/testdata/golden/<name>.json    -- raw expected canonical bytes
 ```
+
+Each `<name>.json` is the byte-exact canonical-JSON output for fixture
+`<name>`. The input value is held in the test source — Go's `goldenInputs`
+map in `internal/canonicaljson/encoder_test.go`, and the analogous Lua-side
+declaration in the `plugin/wezsesh/` test spec — and is encoded fresh by
+each side's encoder, then byte-diff'd against the same `<name>.json`.
+
+The triplet form (`<name>.{lua_input,go_input,expected}`) named in earlier
+drafts of this spec was collapsed to a single committed `.json` plus
+in-test literals: discriminating fixtures (`int_min`, `int_max`,
+`explicit_null`, `boolean_true`) carry typed values (`int64`, the `Null`
+sentinel, native booleans) that have no clean cross-language file
+encoding without a per-language input parser, so the inputs are spelled
+in each language's native test-source instead.
 
 Required vectors (`<name>` and what it tests):
 
@@ -3913,6 +4592,7 @@ for the run-time byte-equality artefacts.
 | Test | Package | Asserts |
 |---|---|---|
 | Multi-window broadcast (#3524) | `plugin` integration | only window with matching `target_window_id` dispatches |
+| Dispatcher rejects TargetWindowID < -1 | `internal/ipcdispatcher` | `New(Deps{TargetWindowID: -2})` returns `ErrInvalidConfig`; sentinel `-1` and any `>= 0` accepted |
 | Save flock serialisation (Phase A) | `internal/safefs`, `cmd/wezsesh` | one succeeds, other gets `SNAPSHOT_LOCKED` during Phase A |
 | Save first-write (no expected_hash) | `internal/safefs`, `cmd/wezsesh` | `AcquireExclusiveOrCreate` creates, locks, releases; concurrent first-saves serialise via the per-name in-process mutex |
 | Save with stale hash (Phase A reject) | `cmd/wezsesh` | mismatch → `SNAPSHOT_CHANGED`; user re-confirm with refreshed hash succeeds |
@@ -3931,12 +4611,13 @@ for the run-time byte-equality artefacts.
 | Two-phase find client pinning | `internal/find` | second client gaining "most recent" mid-poll does NOT flip predicate |
 | Two-phase find window scoping | `internal/find` | closing wezterm window mid-Phase-1 → `MUX_UNREACHABLE` |
 | Resurrect race | `internal/snapshots` | mid-write parse failure recovers via 3× retry |
+| Sidecar concurrent-writers atomicity | `internal/snapshots` | two writers × distinct payloads → final file parses cleanly to exactly one of the two; parent-dir sentinel `<workspaceDir>/.wezsesh.sidecar.lock` (acquired via `safefs.AcquireExclusiveOrCreate`) serialises across the full AtomicWriteFile rename window |
 | Reply socket lifecycle | `internal/ipcsock` | listener exits via `net.ErrClosed`; cleanup is `sync.Once` |
 | Reply socket sequential accept | `internal/ipcsock` | second connection waits for first to close |
 | Reply channel buffer | `internal/ipcsock` | producer blocks at cap 2; never panics |
-| Request-file atomic write (spike-#3) | `internal/ipc*`, `internal/safefs` | concurrent `Dispatch` produces disjoint `<8-hex>.json` files; tmp+rename is observably atomic; `O_EXCL` rejects collisions |
+| Request-file atomic write (spike-#3) | `internal/ipc*`, `internal/safefs` | concurrent `Dispatch` produces disjoint `<8hex>.json` files; tmp+rename is observably atomic; `O_EXCL` rejects collisions |
 | Request-file lifecycle (spike-#3) | `cmd/wezsesh`, `plugin` | file persists until plugin `os.remove`; orphan sweep cleans stale entries; doctor reports them via `runtime.dir.req_orphans` |
-| Pointer-shape validation (spike-#3) | `plugin` | malformed pointer JSON / path outside `<runtime_dir>/req/` / wrong mode / symlink / `pointer.id ≠ payload.id` → silent-drop + `log_warn REQ_POINTER_REJECTED`. The reply socket is already bound (§3.2 establishes it before forward dispatch); the plugin simply does not write a reply. The binary observes `IPC_TIMEOUT` after 5 s. |
+| Pointer-shape validation (spike-#3) | `plugin` | malformed pointer JSON / path not beginning with `<runtime_dir>/req/` / `pointer.id ≠ payload.id` → silent-drop + `log_warn REQ_POINTER_REJECTED` (unconditional). Wrong mode / symlink → silent-drop + `log_warn REQ_POINTER_REJECTED` (stat-guard subset; conditional on a `_deps.stat_path` shim being bound — see §3.1; the default plugin's `_default_stat_path` returns `nil` and short-circuits these checks to OK). The reply socket is already bound (§3.2 establishes it before forward dispatch); the plugin simply does not write a reply. The binary observes `IPC_TIMEOUT` after 5 s. |
 | OSC ≤ 256 B contract (spike-#3) | `internal/uservar` | `WriteOSC` rejects payloads whose on-the-wire OSC envelope > 256 B with an explicit error rather than emit a multi-syscall write that could race with bubbletea |
 | `tea.Tick` retransmit cancellation | `cmd/wezsesh` | timer goroutine exits within 100 ms of `tea.Run` return |
 | F_OFD_SETLK build-tag | CI | reference outside `lock_linux.go` fails build |
@@ -3968,7 +4649,7 @@ for the run-time byte-equality artefacts.
 | SUN_PATH overflow | `plugin` + `cmd/wezsesh` | over-budget runtime_dir → Lua sentinel + 10s toast; Go `IPC_INIT_FAILED` |
 | `wezsesh keygen` output | `cmd/wezsesh` | exits 0; stdout is exactly 65 bytes (64 hex + `\n`); 64-hex matches `^[a-f0-9]{64}$` |
 | Reply `v` field echo | `cmd/wezsesh`, `plugin` | request `v=1` → reply has `v=1`; reply with missing `v` is rejected at Reply parse |
-| Unknown verb reply | `plugin` | `op="bogus"` → reply `error.code=UNKNOWN_VERB`, `ok=false`, `status=completed` |
+| Unknown verb silent-drop | `plugin` | `op="bogus"` (with HMAC otherwise wired correctly over the envelope-shape bytes) → no reply on socket; `log_warn("ipc: no shape registered for op=…")` fires at step (e); HMAC verify never runs; `ops.dispatch` not invoked; binary observes `IPC_TIMEOUT` |
 | Hook env: WEZSESH_LOG survives | `cmd/wezsesh` | hook sees `$WEZSESH_LOG`; does NOT see `$WEZSESH_HMAC_KEY` / `$WEZSESH_PROTO_VERSION` / `$WEZSESH_CONFIG_FILE` |
 | Logger Warn/Error sync flush | `internal/logger` | crash-after-Warn → log file contains the Warn line on disk |
 | Config Exclude invalid regex | `internal/config`, `internal/doctor` | bad regex → ExcludeErrors populated; doctor reports it; runtime treats element as no-op |
@@ -3978,11 +4659,11 @@ for the run-time byte-equality artefacts.
 | Lint | Tool | Trigger |
 |---|---|---|
 | Lua handler `.await`-free | `internal/lualint` AST walker | call to known-async fn between markers `(a)`–`(h)` in `ipc.lua` |
-| `os.WriteFile`/`os.OpenFile`/`syscall.Open` ban | AST walker | usage in restricted packages |
+| `os.WriteFile`/`os.OpenFile`/`syscall.Open` ban | AST walker | usage in any restricted package (§16.5.1) |
 | `unix.F_OFD_SETLK` outside `lock_linux.go` | grep | any reference |
 | `tea.After` reference | grep | any reference |
 | `pcall`-wrap on async spawns | AST walker | unwrapped `wezterm.background_child_process` |
-| `defer recover()` in goroutines | AST walker | bare `go func() { ... }` without top-level recover in restricted packages |
+| `defer recover()` in goroutines | AST walker | bare `go func() { ... }` without top-level recover in any restricted package (§16.5.1) |
 | Direct `wezterm cli` exec outside `internal/wezcli/` | grep | bare `exec.Command("wezterm", ...)` outside the package |
 | Concrete Dispatcher outside `internal/ipcdispatcher/` | grep | `ipcsock.StartListener` callsite outside the package |
 | Vendored SHA tampering | `sha256sum -c` | mismatch |
@@ -4015,15 +4696,18 @@ control_char_field        name = "\x00\x01\x1b[2J"
 empty_args_per_verb       args = {} for each verb in §6
 hmac_corrupted            valid payload, last hex char flipped
 ts_boundary               ts in {now-31, now-30, now+30, now+31}
-unknown_verb              op = "bogus"  (asserts UNKNOWN_VERB reply, not panic)
+unknown_verb              op = "bogus"  (asserts step-(e) silent-drop; no reply; no panic)
 v_field_swap              v="1", v=2, v=null  (asserts strict numeric == 1)
 ```
 
 Assertions per fuzz iteration:
 - No Lua error escapes the `user-var-changed` handler.
 - `ops.dispatch` invocation count remains zero unless the input passes
-  HMAC verify (impossible for random mutations against a known key).
-- No reply written on HMAC mismatch (silent-drop verification).
+  HMAC verify (impossible for random mutations against a known key,
+  and impossible for the `unknown_verb` mutation class regardless of
+  HMAC because step (e) short-circuits before HMAC verify).
+- No reply written on HMAC mismatch or on unknown-verb step-(e)
+  short-circuit (silent-drop verification — §13.13).
 - Frame paint time stays < 50 ms throughout.
 
 ### §17.6 — End-to-end smoke test
@@ -4105,10 +4789,27 @@ The HMAC key is intentionally an env var, NOT inside the config file:
 config-file-on-disk has a wider exposure surface than env (which only
 inherits to direct children).
 
-`WEZSESH_SNAPSHOT_DIR`, `WEZSESH_STATE_DIR`, `WEZSESH_RUNTIME_DIR` are
-NOT set on the spawn invocation — they live in `WEZSESH_CONFIG_FILE`
-(§10.7). The binary's auto-detect path (§12.5) is used only when
-invoked outside spawn (e.g., `wezsesh doctor` from a shell).
+`WEZSESH_SNAPSHOT_DIR`, `WEZSESH_STATE_DIR`, `WEZSESH_RUNTIME_DIR`,
+`WEZSESH_DATA_DIR` are NOT set on the spawn invocation — they live in
+`WEZSESH_CONFIG_FILE` (§10.7). The binary's auto-detect path (§12.5)
+is used only when invoked outside spawn (e.g., `wezsesh doctor` from
+a shell).
+
+The plugin additionally sets `PATH` on the spawn env vector so the
+spawned binary's `exec.LookPath("wezterm")` resolves regardless of the
+PATH the wezterm process itself was launched with. When
+`wezterm.executable_dir` is a non-empty string, the value is
+`<wezterm.executable_dir>:<inherited PATH>`; otherwise the value is the
+inherited PATH alone. The inherited PATH is `os.getenv("PATH")`, falling
+back to `/usr/bin:/bin:/usr/sbin:/sbin` when that is also unset. The
+load-bearing case is the macOS GUI launch: launchd hands wezterm.app's
+children a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) which does
+not contain the wezterm CLI, so without the prefix the spawned binary
+cannot locate `wezterm` to issue follow-up `wezterm cli` calls.
+
+The four `WEZSESH_*` keys above are mandatory on every spawn invocation;
+`PATH` is the only additional key permitted on the env vector. No other
+keys are set by the plugin.
 
 ---
 

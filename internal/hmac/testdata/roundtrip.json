@@ -1,0 +1,15 @@
+{
+  "key_hex": "a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1",
+  "payload": {
+    "args": {},
+    "id": "01JABCDEFGHJKMNPQRSTVWXYZA",
+    "op": "noop",
+    "reply_sock": "/tmp/x.sock",
+    "target_window_id": 1,
+    "ts": 1700000000,
+    "v": 1
+  },
+  "canonical_sans_hmac": "{\"args\":{},\"id\":\"01JABCDEFGHJKMNPQRSTVWXYZA\",\"op\":\"noop\",\"reply_sock\":\"/tmp/x.sock\",\"target_window_id\":1,\"ts\":1700000000,\"v\":1}",
+  "canonical_sans_hmac_sha256": "f23dc13717d2c992a06d216528f9a0fb62ffd0d2b896ddf66e5dd3931911f616",
+  "expected_hmac": "52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5"
+}

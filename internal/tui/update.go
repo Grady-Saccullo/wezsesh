@@ -1,0 +1,407 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
+	"github.com/Grady-Saccullo/wezsesh/internal/nameval"
+)
+
+// dispatchSeqCounter is a process-global monotonic counter for matching
+// tea.Tick deliveries to the in-flight op. The model keeps its own
+// dispatchSeq snapshot so an in-flight op's Tick is ignored once the
+// model has moved on (terminal reply, timeout, or manual cancellation).
+var dispatchSeqCounter uint64
+
+// Init satisfies tea.Model. The picker has no startup side effects;
+// every dispatch is keyed off a user action.
+func (m *Model) Init() tea.Cmd {
+	return nil
+}
+
+// Update handles every tea.Msg. The function is intentionally large but
+// flat — each branch is one screen tall and self-contained — so the
+// invariants (replyReceived guard, op_in_flight bookkeeping, mode
+// discipline) are visible at a glance.
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	case tea.KeyPressMsg:
+		return m.handleKey(msg)
+
+	case dispatchStartedMsg:
+		// dispatchStartedMsg is the synchronous result of the Cmd that
+		// called Dispatcher.Dispatch. err non-nil means the dispatch
+		// never made it onto the wire (listener bind failed, OSC ceiling,
+		// etc.). The op is no longer in flight.
+		if msg.dispatchID != m.dispatchSeq {
+			return m, nil // stale; another op already replaced this one.
+		}
+		if msg.err != nil {
+			m.opInFlight = false
+			m.replyCh = nil
+			m.status = nameval.SanitizeForDisplay(
+				fmt.Sprintf("dispatch failed: %s", msg.err.Error()))
+			return m, nil
+		}
+		m.replyCh = msg.ch
+		m.currentVerb = msg.verb
+		m.currentTarget = msg.target
+		// Schedule the §14.1 retransmit + IPC timeout. Both are tea.Tick
+		// (NOT tea.After / time.AfterFunc) so the goroutines exit cleanly
+		// when tea.Run returns.
+		return m, tea.Batch(
+			m.scheduleRetransmit(msg.dispatchID),
+			m.scheduleTimeout(msg.dispatchID),
+			m.waitForReply(msg.dispatchID, msg.ch),
+		)
+
+	case replyMsg:
+		if msg.dispatchID != m.dispatchSeq {
+			return m, nil
+		}
+		if msg.closed {
+			// Channel drained — terminal already delivered or ctx cancelled.
+			m.finishOp("")
+			return m, nil
+		}
+		m.replyReceived = true
+		// Non-terminal "started" replies leave op_in_flight true; the
+		// dispatcher will deliver another reply (terminal). Terminal
+		// replies are "completed" or "partial" (§13.1).
+		if msg.reply.Status == "started" {
+			// Continue draining for the follow-up.
+			return m, m.waitForReply(msg.dispatchID, m.replyCh)
+		}
+		// Terminal reply.
+		status := ""
+		if msg.reply.OK {
+			status = nameval.SanitizeForDisplay(
+				fmt.Sprintf("%s completed", m.currentVerb))
+		} else if msg.reply.Error != nil {
+			status = nameval.SanitizeForDisplay(
+				fmt.Sprintf("%s failed: %s", m.currentVerb, msg.reply.Error.Message))
+		} else {
+			status = nameval.SanitizeForDisplay(
+				fmt.Sprintf("%s: %s", m.currentVerb, msg.reply.Status))
+		}
+		m.finishOp(status)
+		// Continue reading until the channel closes so we observe the
+		// drain goroutine's clean-up; the dispatcher closes the channel
+		// after a terminal reply.
+		return m, m.waitForReply(msg.dispatchID, m.replyCh)
+
+	case retransmitMsg:
+		// The §14.2 replyReceived guard. Without it the second OSC fires
+		// for ops that completed in <2 s (replay-guard suppressed on the
+		// Lua side, but it is still a wasted roundtrip).
+		if msg.dispatchID != m.dispatchSeq {
+			return m, nil
+		}
+		if m.replyReceived || !m.opInFlight {
+			return m, nil
+		}
+		// In a fully wired binary the retransmit re-emits the SAME
+		// pointer OSC against the existing request file. The current
+		// Dispatcher seam does not expose a Retransmit verb yet — that
+		// surface lands with the reply-socket lifecycle work. For T-701
+		// we surface a status hint so the gate ("timer goroutine exits
+		// within 100 ms of tea.Run return") is testable: the Cmd has
+		// already fired, the model state is updated, and no new
+		// goroutine is spawned.
+		statusMsg := fmt.Sprintf("%s: awaiting reply (retransmit due)", m.currentVerb)
+		if m.currentTarget != "" {
+			statusMsg = fmt.Sprintf("%s %s: awaiting reply (retransmit due)",
+				m.currentVerb, m.currentTarget)
+		}
+		m.status = nameval.SanitizeForDisplay(statusMsg)
+		return m, nil
+
+	case timeoutMsg:
+		if msg.dispatchID != m.dispatchSeq {
+			return m, nil
+		}
+		if m.replyReceived || !m.opInFlight {
+			return m, nil
+		}
+		m.finishOp(nameval.SanitizeForDisplay(
+			fmt.Sprintf("%s: IPC_TIMEOUT", m.currentVerb)))
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleKey routes a key press through the modal discipline. The two
+// modes (nav, filter) plus the inline quit-confirm overlay are the only
+// state machines that touch user input.
+func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Future modal overlays (rename, tag-edit, confirm-delete) will
+	// claim the key stream first. v0.1 always reports modalNone.
+	if m.activeModal() != modalNone {
+		// Placeholder routing seam — T-702 lands real modal handlers.
+		return m, nil
+	}
+
+	// Quit-mid-op inline confirm overlay. Per §13.8: y → quit; any
+	// other key dismisses the prompt and returns control to the
+	// underlying mode.
+	if m.confirmQuit {
+		switch msg.String() {
+		case "y", "Y":
+			m.quitting = true
+			m.shutdown()
+			return m, tea.Quit
+		}
+		m.confirmQuit = false
+		m.status = ""
+		return m, nil
+	}
+
+	var action keyAction
+	var r rune
+	if m.mode == modeFilter {
+		action, r = matchFilterKey(msg)
+	} else {
+		action = matchNavKey(m.cfg.Keys, msg)
+	}
+
+	switch action {
+	case actUp:
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case actDown:
+		visible := m.visibleRows()
+		if m.cursor+1 < len(visible) {
+			m.cursor++
+		}
+	case actTop:
+		m.cursor = 0
+	case actBottom:
+		visible := m.visibleRows()
+		if len(visible) > 0 {
+			m.cursor = len(visible) - 1
+		}
+	case actSwitch, actLoad:
+		row, ok := m.rowAt(m.cursor)
+		if !ok {
+			return m, nil
+		}
+		verb := "switch"
+		if action == actLoad {
+			verb = "load"
+		}
+		return m, m.startDispatch(verb, row.Name)
+	case actFilterEnter:
+		m.mode = modeFilter
+		m.filterBuf = ""
+		m.refreshFilter()
+	case actFilterExit:
+		m.mode = modeNav
+		m.filterBuf = ""
+		m.refreshFilter()
+	case actFilterClear:
+		m.filterBuf = ""
+		m.refreshFilter()
+	case actFilterDel:
+		if len(m.filterBuf) > 0 {
+			// Trim one rune from the right.
+			r := []rune(m.filterBuf)
+			m.filterBuf = string(r[:len(r)-1])
+			m.refreshFilter()
+		}
+	case actHelp:
+		m.help = !m.help
+	case actPreview:
+		m.previewShown = !m.previewShown
+	case actQuit:
+		if m.opInFlight {
+			// §13.8: render inline status; do NOT quit yet.
+			m.confirmQuit = true
+			m.status = "op in progress, quit anyway? [y/N]"
+			return m, nil
+		}
+		m.quitting = true
+		m.shutdown()
+		return m, tea.Quit
+	case actMark, actClearMarks, actPin:
+		// Marks / pins land in T-702+; for v0.1 the action surface is
+		// stubbed so the bindings parse without crashing. The status
+		// line surfaces the no-op so users see we received the key.
+		m.status = nameval.SanitizeForDisplay("not implemented yet")
+	case actNone:
+		if m.mode == modeFilter && r != 0 {
+			m.filterBuf += string(r)
+			m.refreshFilter()
+		}
+	}
+	return m, nil
+}
+
+// startDispatch kicks off a verb against `target`. It allocates the
+// dispatch sequence, marks op_in_flight, and returns a Cmd whose body
+// performs Dispatcher.Dispatch synchronously. The synchronous call is
+// what satisfies the §14.2 / §17.3 gate ("StartListener called from
+// Update synchronously"): the dispatcher's StartListener runs inside
+// Dispatch before the OSC is emitted.
+func (m *Model) startDispatch(verb, target string) tea.Cmd {
+	if m.disp == nil {
+		m.status = nameval.SanitizeForDisplay("dispatch unavailable")
+		return nil
+	}
+	id := atomic.AddUint64(&dispatchSeqCounter, 1)
+	m.dispatchSeq = id
+	m.opInFlight = true
+	m.replyReceived = false
+	m.status = ""
+	if m.dispatchCancel != nil {
+		m.dispatchCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.dispatchCtx = ctx
+	m.dispatchCancel = cancel
+	disp := m.disp
+	args := map[string]any{"name": target}
+	return func() (resultMsg tea.Msg) {
+		// §16.5 / §17.4: every goroutine in internal/tui (tea.Cmd bodies
+		// run as goroutines per tea.go handleCommands) MUST top-level
+		// defer recover(). On panic we surface a dispatchStartedMsg with
+		// err set so Update clears op_in_flight without crashing the
+		// program.
+		defer func() {
+			if r := recover(); r != nil {
+				resultMsg = dispatchStartedMsg{
+					dispatchID: id,
+					verb:       verb,
+					target:     target,
+					err:        fmt.Errorf("dispatch panic: %v", r),
+				}
+			}
+		}()
+		// SYNCHRONOUS — Dispatch returns only after StartListener has
+		// bound and the OSC has been written. The "defer cleanup()
+		// immediately following" semantic is owned by the dispatcher's
+		// drain goroutine (§13.2): when the channel closes the listener
+		// cleanup runs.
+		ch, err := disp.Dispatch(ctx, verb, args)
+		return dispatchStartedMsg{
+			dispatchID: id,
+			verb:       verb,
+			target:     target,
+			ch:         ch,
+			err:        err,
+		}
+	}
+}
+
+// scheduleRetransmit returns a tea.Tick Cmd that fires at +retransmitDelay.
+// Crucially this is tea.Tick (NOT tea.After — which does not exist in
+// any released bubbletea — and NOT time.AfterFunc, which would leak a
+// goroutine past tea.Run return).
+//
+// The returned Tick callback is a tea.Cmd body running on a bubbletea
+// goroutine; §16.5 / §17.4 require a top-level defer recover() so a
+// panic in the message constructor does not tear down the program.
+func (m *Model) scheduleRetransmit(id uint64) tea.Cmd {
+	return tea.Tick(m.retransmitDelay, func(time.Time) (resultMsg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				resultMsg = nil // dropped silently; tea ignores nil msgs.
+			}
+		}()
+		return retransmitMsg{dispatchID: id}
+	})
+}
+
+// scheduleTimeout returns a tea.Tick Cmd that fires the IPC_TIMEOUT.
+//
+// As with scheduleRetransmit, the Tick callback is wrapped in a
+// defer recover() per §16.5 / §17.4.
+func (m *Model) scheduleTimeout(id uint64) tea.Cmd {
+	return tea.Tick(m.timeoutDelay, func(time.Time) (resultMsg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				resultMsg = nil
+			}
+		}()
+		return timeoutMsg{dispatchID: id}
+	})
+}
+
+// waitForReply returns a Cmd that reads ONE reply from ch (or detects
+// channel close). Re-issued from Update on each reply so the bubbletea
+// dispatch stays single-threaded; this avoids needing program.Send.
+//
+// The Cmd body runs as a goroutine; §16.5 / §17.4 require a top-level
+// defer recover(). A panic during the channel read surfaces as a
+// "closed" replyMsg so the model's finishOp path runs.
+func (m *Model) waitForReply(id uint64, ch <-chan ipc.Reply) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() (resultMsg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				resultMsg = replyMsg{dispatchID: id, closed: true}
+			}
+		}()
+		reply, ok := <-ch
+		if !ok {
+			return replyMsg{dispatchID: id, closed: true}
+		}
+		return replyMsg{dispatchID: id, reply: reply}
+	}
+}
+
+// finishOp resets in-flight bookkeeping and stamps an optional status
+// line. dispatchSeq is bumped so any pending tea.Tick deliveries
+// (retransmit / timeout) fall through the dispatchID guard in Update.
+func (m *Model) finishOp(status string) {
+	m.opInFlight = false
+	m.replyReceived = false
+	m.dispatchSeq = atomic.AddUint64(&dispatchSeqCounter, 1)
+	if status != "" {
+		m.status = status
+	}
+	if m.dispatchCancel != nil {
+		m.dispatchCancel()
+		m.dispatchCancel = nil
+	}
+	m.replyCh = nil
+	m.currentVerb = ""
+	m.currentTarget = ""
+}
+
+// refreshFilter applies the current filterBuf to m.rows and resets the
+// cursor to the first match. Empty filter ⇒ filtered=nil ("show all").
+func (m *Model) refreshFilter() {
+	defer func() {
+		visible := m.visibleRows()
+		if m.cursor >= len(visible) {
+			m.cursor = max(0, len(visible)-1)
+		}
+	}()
+	if m.filterBuf == "" {
+		m.filtered = nil
+		return
+	}
+	needle := strings.ToLower(m.filterBuf)
+	out := make([]int, 0, len(m.rows))
+	for i, r := range m.rows {
+		if strings.Contains(strings.ToLower(r.Name), needle) {
+			out = append(out, i)
+		}
+	}
+	m.filtered = out
+	m.cursor = 0
+}

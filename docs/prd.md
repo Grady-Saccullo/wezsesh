@@ -323,7 +323,7 @@ The binary base64-encodes the canonical JSON of the request and emits it as an O
 4. Hex-encode the digest (lowercase).
 5. Set the `hmac` field on the payload structure to the hex digest.
 6. Re-serialize the now-complete payload (including `hmac`) for wire emission. The wire form is base64'd; the HMAC was computed over the pre-`hmac`-insert canonical bytes.
-7. **Verifier** (Lua side): parse the received payload; remove the `hmac` field from the parsed structure; canonical-serialize the rest; compute HMAC; compare against the received `hmac` value via the constant-time helper `ct_eq` (§6.14 Layer 2).
+7. **Verifier** (Lua side): parse the received payload; apply verb-aware tagging per `docs/design.md` §4.2 (so empty `{}` vs `[]` containers re-acquire canonical shape); remove the `hmac` field from the tagged structure; canonical-serialize what remains; compute HMAC; compare against the received `hmac` value via the constant-time helper `ct_eq` (§6.14 Layer 2). Tag-before-remove is load-bearing: `ROOT_PAYLOAD_SHAPE` (§4.2) declares `hmac` as a required key, so tagging a payload from which `hmac` had already been dropped would raise `CANONICAL_SHAPE_MISMATCH`. See `docs/design.md` §4.3 for the normative sequence.
 
 The forbidden alternative is "set `hmac=""` then serialize then compute": that produces a different byte sequence (`,"hmac":"",` vs. no `hmac` key at all). Both sides MUST remove the key entirely before the HMAC-input serialization.
 
@@ -398,7 +398,7 @@ The forbidden alternative is "set `hmac=""` then serialize then compute": that p
 "op": "noop",    "args": {}
 ```
 
-The plugin treats unknown verbs as `noop` and logs a warning.
+Unknown verbs are silent-dropped at `ipc.lua` step (e) with `wezterm.log_warn("ipc: no shape registered for op=…")` and **no wire reply** — the §4.2 verb-keyed shape lookup runs before HMAC verify, so an unknown `op` short-circuits before `ops.dispatch` is reached. The binary observes `IPC_TIMEOUT` after the 5 s first-reply ceiling and surfaces a generic timeout toast; operators diagnose unknown-verb conditions via the wezterm log. See `docs/design.md` §13.13 (and §0.1 row 35) for the full rationale.
 
 #### Response
 
@@ -428,6 +428,8 @@ Returned via Unix socket, JSON, no envelope.
     "details": { /* optional */ }
 } }
 ```
+
+Note: `UNKNOWN_VERB` is wire-silent in design v3 (see `docs/design.md` §0.1 row 35 / §13.13); it is listed in the union above for catalog completeness and to keep operator-facing log lines / fuzz mutation classes self-naming, but it is never emitted on the wire — an unknown `op` short-circuits at `ipc.lua` step (e) with no reply, and the binary observes `IPC_TIMEOUT`.
 
 The `status` field disambiguates terminal from non-terminal replies. The TUI's reply listener accepts connections in a loop on the same socket until a terminal status (`"completed"` or `"partial"`) arrives or the per-status ceiling is hit (§6.2 step 10).
 
@@ -1194,7 +1196,7 @@ The binary's own pane ID is read from `WEZTERM_PANE` (injected automatically by 
 | HMAC mismatch | `wezterm.log_error` + `window:toast_notification("wezsesh", "Rejected unsigned operation", nil, 4000)` |
 | Stale `ts` | `wezterm.log_warn` + reply with `STALE_PAYLOAD` |
 | Replayed `id` | Silent drop (deduplication, not attack) |
-| Unknown verb | Reply with `UNKNOWN_VERB` + `log_warn` |
+| Unknown verb | Silent drop at `ipc.lua` step (e); `log_warn("ipc: no shape registered for op=…")`; no wire reply (binary hits `IPC_TIMEOUT`). See `docs/design.md` §13.13 / §0.1 row 35. |
 | **Listener invoked with `wezterm.GLOBAL.wezsesh_session_key == nil`** (keygen failed at plugin load; see §7.1) | Silent `log_warn("wezsesh: ignoring op, HMAC key unavailable")` + drop. Never proceed to dispatch. |
 | **Binary unexpected exit / panic** | Two-layer detection. **(1) Go-side panic-recover** — `cmd/wezsesh/main.go` installs a top-level `defer func() { if r := recover(); r != nil { writePanicReply(...); os.Exit(2) } }()` before `tea.Run`. The recovery handler writes a sentinel reply over the OSC channel (or to any open reply socket) with `status: "completed"`, `ok: false`, `error.code: "UNEXPECTED_EXIT"`. The Lua side does NOT need any pane-closed listener; the binary itself signals its own death before exiting. Out-of-recover crashes (SIGSEGV in cgo, SIGKILL, OOM-killer) cannot trigger this path — fall through to (2). **(2) IPC_TIMEOUT fallback** — after 5s with no reply, the TUI's parent surfaces the standard timeout error. The earlier PRD claim of a `wezterm.on('pane-closed', ...)` listener is **dropped**: source-code reading (wezterm-gui/src/termwindow/mod.rs match arms; wezterm.org/config/lua/window-events/) confirms `pane-closed` is NOT a Lua-surfaced event in wezterm — `MuxNotification::PaneRemoved` exists internally but is unhandled in the Lua emit path. The early-warning toast is therefore non-implementable as previously specced. |
 | **Binary not on PATH at first run** (version handshake `run_child_process` returns `ok=false`) | Distinct toast: `wezsesh binary not found on PATH. Install: go install github.com/Grady-Saccullo/wezsesh/cmd/wezsesh@latest`. Keybinding stubs out. **Do not conflate with version mismatch** (which is `ok=true` + version regex fails `compatible()`). |
@@ -1258,10 +1260,22 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
         return
     end
 
-    -- (e) Canonical-JSON re-serialize for HMAC verify. The canonical encoder
-    --     can raise on float subtype values (Lua numbers that aren't
-    --     integers per math.type), invalid UTF-8, untagged tables, or deep
-    --     nesting. Wrap in pcall.
+    -- (e) Canonical-JSON re-serialize for HMAC verify. Tag-before-remove
+    --     is load-bearing per `docs/design.md` §4.3 step 7:
+    --     `ROOT_PAYLOAD_SHAPE` (§4.2) declares `hmac` as a required key, so
+    --     tagging a payload from which `hmac` had already been dropped
+    --     would raise `CANONICAL_SHAPE_MISMATCH`. Order: tag full payload
+    --     (with `hmac` still present) → copy_without('hmac') → encode the
+    --     copy. Both tag and encode can raise (tag on shape mismatch;
+    --     encode on float subtype values per math.type, invalid UTF-8,
+    --     untagged tables, or deep nesting); both are pcall-wrapped.
+    local ok_tag = pcall(canonical_json.tag_in_place, payload,
+                         canonical_json.ROOT_PAYLOAD_SHAPE,
+                         canonical_json.verb_args_shape[payload.op])
+    if not ok_tag then
+        wezterm.log_error('wezsesh: canonical-JSON tag failed')
+        return
+    end
     local payload_minus_hmac = canonical_json.copy_without(payload, 'hmac')
     local ok2, canonical_bytes = pcall(canonical_json.encode, payload_minus_hmac)
     if not ok2 then
@@ -1999,8 +2013,8 @@ wezsesh.apply_to_config(config, {
     keys = {
         switch = "s", load = "l", rename = "r", delete = "d",
         save = "S", new = "n", pin = "p", tag = "t",
-        mark = "Tab", mark_alt = " ", clear_marks = "c",
-        help = "?", filter = "/", quit = "q",
+        mark = "Tab", mark_alt = "Space", clear_marks = "c",
+        help = "?", filter = "/", preview = "P", quit = "q",
         up = "k", down = "j", top = "gg", bottom = "G",
     },
 
@@ -2044,14 +2058,14 @@ end
 ```
 
 On result:
-- `bin_v == "missing"` → toast `wezsesh binary not found on PATH. Install: go install github.com/Grady-Saccullo/wezsesh/cmd/wezsesh@latest` (8s); keybinding stubs out. **Distinct from version mismatch** — the user's first-run experience must not say "wrong version" when nothing is installed.
+- `bin_v == "missing"` → toast `wezsesh binary not found on PATH. Install: go install github.com/Grady-Saccullo/wezsesh/cmd/wezsesh@latest` (10s); keybinding stubs out. **Distinct from version mismatch** — the user's first-run experience must not say "wrong version" when nothing is installed.
 - `bin_v == "unparseable"` → toast `wezsesh binary returned unrecognized version string`; keybinding stubs out.
 - `compatible() == false` → toast `wezsesh binary v<X> doesn't match plugin v<Y>. Run 'wezsesh doctor' for details.`; keybinding stubs out.
 - `compatible() == true` → proceed with full setup.
 
 In all error cases:
 - `wezterm.log_error(...)` (always; visible in debug overlay).
-- One-shot `window:toast_notification("wezsesh", message, nil, 8000)` registered via `wezterm.on('gui-startup', ...)`.
+- One-shot `window:toast_notification("wezsesh", message, nil, 10000)` registered via `wezterm.on('gui-startup', ...)`.
 - **The plugin does not raise a Lua error**; that would break the user's whole wezterm config.
 
 #### `apply_to_config` body wrapped in `pcall`
@@ -2067,7 +2081,7 @@ This guards against vendored Lua module syntax errors, unexpected `wezterm.run_c
 
 `apply_to_config` writes `wezterm.GLOBAL.wezsesh_plugin_version = M.VERSION` on every load. Before reading any other `wezsesh_*` GLOBAL key, it compares the stored version to `M.VERSION`. **On mismatch (including downgrade), wipe all `wezsesh_*` GLOBAL keys and re-initialize.** Any in-flight TUI session from the old version is in an undefined state post-update; better to drop it cleanly than to read stale-shape entries with new code. This handles the `wezterm.plugin.update_all()` flow without state-migration logic.
 
-The Go binary embeds its version via `-ldflags="-X main.version=v$(git describe --tags --always)"` in CI / Nix / Goreleaser, with `runtime/debug.ReadBuildInfo()` as a fallback for `go install module@vX.Y.Z` users.
+The Go binary embeds its version via `-ldflags="-X main.version=v$(git describe --tags --always)"` in CI / Nix / Goreleaser. Without that linker injection — including `go install github.com/Grady-Saccullo/wezsesh/cmd/wezsesh@vX.Y.Z`, since `go install` does not auto-set ldflags — `version` falls back to the literal string `dev` (`cmd/wezsesh/version.go`).
 
 `wezterm.plugin.list()` is **constrained**: it returns only `{url, component, plugin_dir}`, no commit/tag. The embedded constant is the only viable mechanism for plugin self-identification.
 
@@ -2253,11 +2267,11 @@ There is no portable Lua API to bound a filesystem syscall by a wall-clock deadl
 - **Pre-rename collision check** in `internal/wezcli/RenameWorkspace`: before invoking `wezterm cli rename-workspace <old> <new>`, the binary calls `cli list` and verifies no live workspace already uses `<new>`. wezterm's CLI does NOT enforce uniqueness; without the pre-check, the rename either silently merges or surfaces a stderr error we can't reliably parse. Same-name renames (`<old> == <new>`) short-circuit as no-ops.
 
 **Pinned dependencies** (revised v1.8 — charmbracelet v2 stack is now stable; round-3 had pinned v1 because v2 was RC, that's resolved)
-- `github.com/charmbracelet/bubbletea/v2 v2.0.6` (released 2025-04-16; module path changed from `bubbletea` → `bubbletea/v2`).
-- `github.com/charmbracelet/bubbles/v2 v2.1.0`.
-- `github.com/charmbracelet/lipgloss/v2 v2.0.3`.
-- `github.com/charmbracelet/x/ansi v0.11.7`.
-- `github.com/charmbracelet/huh/v2 v2.0.3` (modal forms — rename / save / new dialogs).
+- `charm.land/bubbletea/v2 v2.0.6` (released 2025-04-16; module path is `charm.land/bubbletea/v2` — upstream migrated from the old `charmbracelet` org path to `charm.land` at this version).
+- `charm.land/bubbles/v2 v2.1.0`.
+- `charm.land/lipgloss/v2 v2.0.3`.
+- `github.com/charmbracelet/x/ansi v0.11.7` (not migrated upstream; retains `github.com/...` path).
+- `charm.land/huh/v2 v2.0.3` (modal forms — rename / save / new dialogs).
 - `github.com/sahilm/fuzzy v0.1.1` (last commit 2025-08-02, includes the NUL-byte panic fix).
 - `golang.org/x/sys/unix` (for safefs `O_NOFOLLOW`/`Openat`/`Renameat`/`Umask`).
 - `golang.org/x/text/unicode/norm` (NFC normalization for §6.17 names).

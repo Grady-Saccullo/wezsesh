@@ -1,0 +1,209 @@
+# wezsesh release workflow — see docs/release.md (operator runbook) and
+# docs/design.md §16.4 (build matrix) / §16.1 (reproducible-build flags).
+#
+# Triggered by tag pushes matching `v[0-9]+.[0-9]+.[0-9]+` plus pre-release
+# suffixes (e.g. v0.1.0, v0.1.0-rc1, v1.2.3-beta.4). Builds the four
+# §16.4 targets natively on the same runners as the CI test matrix so the
+# released binaries come from the same hardware as the tested ones.
+#
+# Pipeline:
+#   1. build (matrix × 4): native go build with -trimpath -s -w and
+#      -X main.version=${TAG}; tar.gz + binary + LICENSE? + README.md.
+#   2. checksums: download all matrix artefacts, write a single
+#      sha256sum-format SHA256SUMS file.
+#   3. release: create the GitHub Release for the tag, upload the four
+#      tarballs and SHA256SUMS.
+#
+# Cosign keyless signing of SHA256SUMS is deferred — see docs/release.md
+# "Future work" for the rationale.
+
+name: release
+
+on:
+  push:
+    tags:
+      # Glob (not regex). The trailing `*` consumes pre-release suffixes
+      # like `-rc1`, `-beta.4`, or empty for a stable tag.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+concurrency:
+  # Per-tag group. cancel-in-progress is false: a duplicated tag push
+  # should never abort an in-flight build that may already have produced
+  # uploadable artefacts.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - target: darwin-amd64
+            runner: macos-13
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        # fetch-depth defaults to 1. The release build derives the
+        # version from ${{ github.ref_name }} (the tag), so full git
+        # history is not required.
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: reproducible build
+        env:
+          # Belt-and-braces: GOOS/GOARCH match the host runner. The
+          # matrix `target` is the source of truth for artefact naming;
+          # setting these explicitly guards against a future runner
+          # image whose default GOOS/GOARCH drifts.
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          TAG: ${{ github.ref_name }}
+        run: |
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${TAG}" \
+            -o wezsesh \
+            ./cmd/wezsesh
+
+      - name: package tarball
+        env:
+          TAG: ${{ github.ref_name }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          # Acceptance-gate artefact format: wezsesh_${TAG}_${OS}_${ARCH}.tar.gz
+          # (underscore between OS and ARCH, not hyphen — the matrix
+          # `target` field uses hyphen for human readability but the
+          # tarball name is locked by the spec).
+          STAGE="wezsesh_${TAG}_${GOOS}_${GOARCH}"
+          mkdir -p "${STAGE}"
+          cp wezsesh "${STAGE}/"
+          # Conditionally include LICENSE: it is not yet present at
+          # repo root (see operator pre-flight in docs/release.md).
+          # Treat absence as a soft-warning so the workflow does not
+          # hard-fail before the LICENSE lands.
+          if [ -f LICENSE ]; then
+            cp LICENSE "${STAGE}/"
+          else
+            echo "::warning::LICENSE file absent at repo root; tarball will ship without it"
+          fi
+          if [ -f README.md ]; then
+            cp README.md "${STAGE}/"
+          else
+            echo "::warning::README.md absent at repo root; tarball will ship without it"
+          fi
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          # Sanity print the version the binary reports — validates
+          # acceptance gate 5 in CI logs (the published binary's
+          # --version output is verified post-tag per the runbook).
+          # A non-zero exit fails the job loudly: a broken ldflag
+          # should not survive into a published release.
+          if [ "${{ matrix.goos }}" = "$(go env GOOS)" ] && [ "${{ matrix.goarch }}" = "$(go env GOARCH)" ]; then
+            ./wezsesh --version
+          fi
+
+      - name: upload tarball artefact
+        uses: actions/upload-artifact@v4
+        with:
+          # Artefact storage uses the same name as the tarball
+          # (underscore-separated GOOS_GOARCH) so download-artifact in
+          # the checksums job lays them out under dist/ unmodified.
+          name: wezsesh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: wezsesh_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: download all tarball artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          # Single text file, sha256sum --check format. Sorted for
+          # reproducibility across re-runs of the same tag.
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: upload SHA256SUMS artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: checksums
+    runs-on: ubuntu-24.04
+    permissions:
+      # Least privilege: only the release-creation job needs write
+      # access to repo contents (to publish the GitHub Release).
+      contents: write
+    steps:
+      - name: download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list artefacts
+        run: ls -la dist/
+
+      - name: create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # Pre-release tags carry a hyphenated suffix (e.g. -rc1).
+          # Mark those as pre-release on the GitHub UI.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/wezsesh_*.tar.gz
+            dist/SHA256SUMS
+          body: |
+            wezsesh ${{ github.ref_name }}
+
+            Download the tarball matching your platform, verify the
+            checksum against `SHA256SUMS`, then extract:
+
+            ```
+            sha256sum -c SHA256SUMS --ignore-missing
+            tar -xzf wezsesh_${{ github.ref_name }}_<os>_<arch>.tar.gz
+            ./wezsesh_${{ github.ref_name }}_<os>_<arch>/wezsesh --version
+            ```
+
+            See `docs/release.md` for the full operator runbook.

@@ -1,0 +1,24 @@
+# §17.5 fuzz harness regression seeds.
+#
+# One integer per line. Comments (this header, blank lines, lines
+# starting with `#`) are ignored. cmd/lua-fuzzer reads this file via
+# `--seeds=<path>` and invokes fuzz_spec.lua once per seed; any
+# failing seed propagates a non-zero exit and the seed name appears
+# in the spec's `FAILED ... seed: <N>` summary line.
+#
+# When a CI flake names a new seed, append it here:
+#     echo $SEED >> plugin/wezsesh/fuzz/seeds.txt
+# and commit alongside whatever fix the failing seed exposes. Do not
+# remove seeds; their value is regression coverage on whatever bug
+# they originally caught.
+#
+# Seeded replay is portable only across the same Lua version (LOW-1,
+# round 1): math.random's state-machine differs between 5.3 and 5.4,
+# so a seed reproducing on lua5.4 may not reproduce on lua5.3. CI
+# pins lua5.4.
+#
+# Initial set: the three seeds covered by the round-1 default-tested
+# `lua plugin/wezsesh/fuzz/fuzz_spec.lua` runs.
+1
+2
+3

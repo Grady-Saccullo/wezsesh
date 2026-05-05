@@ -1,0 +1,8 @@
+# wezsesh vendored Lua — supply chain manifest
+# See docs/design.md §16.3.
+#
+# source: https://github.com/Egor-Skriptunoff/pure_lua_SHA
+# commit: 6adac177c16c3496899f69d220dfb20bc31c03df
+# file:   sha2.lua
+# url:    https://raw.githubusercontent.com/Egor-Skriptunoff/pure_lua_SHA/6adac177c16c3496899f69d220dfb20bc31c03df/sha2.lua
+62d2e0885931a1f14db87e61cb3d74936bb5b1e19eb2b4994ab04c03d78f9ed6  plugin/wezsesh/vendor/sha2.lua

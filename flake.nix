@@ -35,6 +35,210 @@
         # should run against the same major.
         lua = pkgs.lua5_4;
 
+        # ── Task scripts (`nix run .#<target>`) ───────────────────────────
+        # Single source of truth for build/test commands. Mirrors the
+        # required CI gates in §16.4. Each script is a self-contained
+        # writeShellApplication: callers do not need to be inside
+        # `nix develop`, since runtimeInputs supplies the toolchain.
+        #
+        # Usage:
+        #   nix run .#ci              — full local-CI suite
+        #   nix run .#test-race       — single target
+        #   nix run .#e2e             — gated end-to-end smoke (§17.6)
+        mkScript = name: deps: body:
+          pkgs.writeShellApplication {
+            inherit name;
+            runtimeInputs = [go pkgs.coreutils pkgs.git] ++ deps;
+            text = ''
+              repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+                echo "error: not in a git repository" >&2
+                exit 1
+              }
+              cd "$repo_root"
+              ${body}
+            '';
+          };
+
+        scripts = rec {
+          verify = mkScript "wezsesh-verify" [] ''
+            go mod verify
+          '';
+
+          vet = mkScript "wezsesh-vet" [] ''
+            go vet ./...
+          '';
+
+          staticcheck = mkScript "wezsesh-staticcheck" [pkgs.go-tools] ''
+            staticcheck ./...
+          '';
+
+          govulncheck = mkScript "wezsesh-govulncheck" [pkgs.govulncheck] ''
+            govulncheck ./...
+          '';
+
+          crypto = mkScript "wezsesh-crypto" [] ''
+            sha256sum -c plugin/wezsesh/vendor/SOURCES.lock
+          '';
+
+          codegen = mkScript "wezsesh-codegen" [] ''
+            if [ -f plugin/wezsesh/default_allowlist.lua ]; then
+              go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
+            else
+              echo "[placeholder] default_allowlist.lua not yet generated (T-605)"
+            fi
+          '';
+
+          test-canonical = mkScript "wezsesh-test-canonical" [] ''
+            LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...
+          '';
+
+          test-race = mkScript "wezsesh-test-race" [] ''
+            go test -race ./...
+          '';
+
+          # Local-parity build. Intentionally OMITS CGO_ENABLED=0 — the
+          # release channel (.github/workflows/release.yml) is the source
+          # of truth for the published binary; this target exists for
+          # quick local verification of the ldflags shape.
+          build = mkScript "wezsesh-build" [] ''
+            if [ -f cmd/wezsesh/main.go ]; then
+              go build -trimpath \
+                -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
+                ./cmd/wezsesh
+            else
+              echo "[placeholder] cmd/wezsesh not yet present (T-800)"
+            fi
+          '';
+
+          # Full local-CI suite — mirrors the required gates in
+          # .github/workflows/ci.yml so contributors can pre-flight a PR
+          # without round-tripping through GitHub Actions.
+          ci = mkScript "wezsesh-ci" [pkgs.go-tools pkgs.govulncheck] ''
+            go mod verify
+            go vet ./...
+            staticcheck ./...
+            govulncheck ./...
+            sha256sum -c plugin/wezsesh/vendor/SOURCES.lock
+            if [ -f plugin/wezsesh/default_allowlist.lua ]; then
+              go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
+            else
+              echo "[placeholder] default_allowlist.lua not yet generated (T-605)"
+            fi
+            LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...
+            go test -race ./...
+            if [ -f cmd/wezsesh/main.go ]; then
+              go build -trimpath \
+                -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
+                ./cmd/wezsesh
+            else
+              echo "[placeholder] cmd/wezsesh not yet present (T-800)"
+            fi
+          '';
+
+          # End-to-end smoke (§17.6 / T-900). The test compiles
+          # unconditionally under `-tags e2e` and skips at runtime when
+          # WEZSESH_E2E is unset; this means the same target runs green
+          # on hosts without wezterm.
+          #
+          #   nix run .#e2e               # gated; skips cleanly without wezterm
+          #   WEZSESH_E2E=1 nix run .#e2e # full run (requires wezterm on PATH)
+          e2e = mkScript "wezsesh-e2e" [] ''
+            go test -tags e2e -count=1 -timeout 5m ./e2e/...
+          '';
+
+          e2e-vet = mkScript "wezsesh-e2e-vet" [] ''
+            go vet -tags e2e ./e2e/...
+          '';
+
+          e2e-build = mkScript "wezsesh-e2e-build" [] ''
+            go build -tags e2e ./e2e/...
+          '';
+
+          # ── Release pre-flight ───────────────────────────────────────────
+          # Mirror what .github/workflows/release.yml does per matrix entry,
+          # so an operator can rehearse a tag locally before pushing it.
+          # The actual publish (GitHub Release upload, multi-runner native
+          # parity) stays in the workflow — see docs/release.md.
+          #
+          # Tag resolution: use $TAG if set, else `v$(git describe --tags
+          # --always)`. The workflow uses ${{ github.ref_name }}, which is
+          # the literal tag string with leading `v`; matching that here
+          # keeps the tarball name and the embedded version identical to
+          # what CI would produce.
+          #
+          # Output layout (matches the workflow's staging):
+          #   dist/wezsesh_${TAG}_${GOOS}_${GOARCH}/wezsesh
+          #   dist/wezsesh_${TAG}_${GOOS}_${GOARCH}.tar.gz   (release-package)
+          #   dist/SHA256SUMS                                (release-build-all)
+          release-build = mkScript "wezsesh-release-build" [] ''
+            tag="''${TAG:-v$(git describe --tags --always)}"
+            goos="''${GOOS:-$(go env GOOS)}"
+            goarch="''${GOARCH:-$(go env GOARCH)}"
+            stage="dist/wezsesh_''${tag}_''${goos}_''${goarch}"
+            mkdir -p "$stage"
+            echo "release-build: tag=$tag goos=$goos goarch=$goarch -> $stage/wezsesh"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath \
+                -ldflags="-s -w -X main.version=''${tag}" \
+                -o "$stage/wezsesh" \
+                ./cmd/wezsesh
+            if [ "$goos" = "$(go env GOOS)" ] && [ "$goarch" = "$(go env GOARCH)" ]; then
+              "$stage/wezsesh" --version
+            fi
+          '';
+
+          release-package = mkScript "wezsesh-release-package" [pkgs.gnutar pkgs.gzip release-build] ''
+            tag="''${TAG:-v$(git describe --tags --always)}"
+            goos="''${GOOS:-$(go env GOOS)}"
+            goarch="''${GOARCH:-$(go env GOARCH)}"
+            base="wezsesh_''${tag}_''${goos}_''${goarch}"
+            stage="dist/$base"
+
+            TAG="$tag" GOOS="$goos" GOARCH="$goarch" wezsesh-release-build
+
+            if [ -f LICENSE ]; then
+              cp LICENSE "$stage/"
+            else
+              echo "warning: LICENSE absent at repo root; tarball will ship without it (see docs/release.md pre-flight)" >&2
+            fi
+            if [ -f README.md ]; then
+              cp README.md "$stage/"
+            else
+              echo "warning: README.md absent at repo root; tarball will ship without it" >&2
+            fi
+
+            (cd dist && tar -czf "''${base}.tar.gz" "$base")
+            echo "release-package: dist/''${base}.tar.gz"
+          '';
+
+          # Cross-compile + package all four §16.4 targets locally and write
+          # a SHA256SUMS file. NOTE: this rehearses the workflow's *shape*,
+          # not its byte-for-byte output — the published binaries are
+          # native builds across four GitHub runners, while this target
+          # cross-compiles from one host. Use it for layout/version
+          # sanity, NOT as a substitute for the workflow.
+          release-build-all = mkScript "wezsesh-release-build-all" [pkgs.gnutar pkgs.gzip release-package] ''
+            tag="''${TAG:-v$(git describe --tags --always)}"
+            echo "release-build-all: tag=$tag (cross-compiled local pre-flight; see docs/release.md)"
+
+            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+              goos="''${target%-*}"
+              goarch="''${target#*-}"
+              TAG="$tag" GOOS="$goos" GOARCH="$goarch" wezsesh-release-package
+            done
+
+            (
+              cd dist
+              if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum wezsesh_''${tag}_*.tar.gz | sort -k2 > SHA256SUMS
+              else
+                shasum -a 256 wezsesh_''${tag}_*.tar.gz | sort -k2 > SHA256SUMS
+              fi
+              cat SHA256SUMS
+            )
+          '';
+        };
+
         # ── wezsesh package ────────────────────────────────────────────────
         src = lib.fileset.toSource {
           root = ./.;
@@ -63,7 +267,7 @@
         # `claude` must be on PATH; this driver does NOT install it.
         buildLoop = pkgs.writeShellApplication {
           name = "wezsesh-build-loop";
-          runtimeInputs = [pkgs.git pkgs.coreutils];
+          runtimeInputs = [pkgs.jujutsu pkgs.git pkgs.coreutils];
           text = ''
             # We manage exit codes per-iteration; don't bail on /next-task rc.
             set +o errexit
@@ -79,30 +283,46 @@
             }
             cd "$repo_root"
 
-            if [[ -n "$(git status --porcelain)" ]]; then
-              echo "error: working tree is dirty — commit or stash first" >&2
-              git status --short | head -10 >&2
+            if [[ ! -d .jj ]]; then
+              echo "error: not jj-colocated (.jj missing). Run 'jj git init --colocate' first." >&2
+              exit 1
+            fi
+
+            # Precondition: working-copy commit must be empty. jj auto-snapshots
+            # any file changes into @, so a non-empty @ means uncommitted work.
+            wc_dirty=$(jj log -r '@ & ~empty()' --no-graph -T 'change_id ++ "\n"' 2>/dev/null)
+            if [[ -n "$wc_dirty" ]]; then
+              echo "error: working-copy commit is non-empty — uncommitted changes:" >&2
+              jj diff --name-only 2>/dev/null | head -10 >&2
+              echo "  resolve with: /next-task (resume), 'jj abandon', or 'jj op restore <op-id>'" >&2
               exit 1
             fi
 
             max_iters="''${MAX_ITERS:-50}"
             log_file="''${LOG:-build.log}"
-            extra_args=("$@")  # passed through to `claude` (e.g. --dangerously-skip-permissions)
+            extra_args=("$@")  # passed through to `claude` (e.g. --permission-mode auto)
 
             echo "wezsesh-build-loop: max_iters=$max_iters log=$log_file"
-            echo "stop conditions: HEAD doesn't advance, or iter cap hit, or ctrl-C"
+            echo "stop conditions: main bookmark doesn't advance, iter cap hit, or ctrl-C"
+
+            # Progress signal: commit_id of `main`. /next-task advances main on
+            # every committing operation; if main doesn't move across an
+            # iteration, no work landed and we stop.
+            main_id() {
+              jj log -r main --no-graph -T 'commit_id' 2>/dev/null
+            }
 
             for ((i=1; i<=max_iters; i++)); do
-              before=$(git rev-parse HEAD)
+              before=$(main_id)
               printf '\n=== iter %d  %s ===\n' "$i" "$(date -Iseconds)" | tee -a "$log_file"
 
               claude "''${extra_args[@]}" -p '/next-task' 2>&1 | tee -a "$log_file"
               rc=''${PIPESTATUS[0]}
               echo "[loop] claude rc=$rc" | tee -a "$log_file"
 
-              after=$(git rev-parse HEAD)
+              after=$(main_id)
               if [[ "$before" == "$after" ]]; then
-                echo "[loop] no new commits — stopping" | tee -a "$log_file"
+                echo "[loop] main didn't advance — stopping (all done, blocked, or needs-review)" | tee -a "$log_file"
                 exit 0
               fi
             done
@@ -169,6 +389,11 @@
               program = lib.getExe buildLoop;
             };
           }
+          // lib.mapAttrs (_: drv: {
+            type = "app";
+            program = lib.getExe drv;
+          })
+          scripts
           // lib.optionalAttrs hasGoMod {
             default = {
               type = "app";
@@ -209,7 +434,7 @@
             # `coreutils` provides sha256sum on darwin where it isn't system.
             pkgs.coreutils
             pkgs.git
-            pkgs.gnumake
+            pkgs.jujutsu # jj — VCS used by /next-task; repo is jj-colocated
             pkgs.jq
 
             # /next-task loop driver — runs claude -p in fresh processes so
@@ -231,18 +456,29 @@
             echo "Test against a different wezterm rev:"
             echo "  nix develop --override-input nixpkgs github:NixOS/nixpkgs/<rev>"
             echo ""
-            echo "Common tasks:"
-            echo "  go build ./cmd/wezsesh         # build binary"
-            echo "  go test ./...                  # unit tests"
-            echo "  staticcheck ./...              # static analysis"
-            echo "  govulncheck ./...              # CVE scan"
-            echo "  go mod verify                  # go.sum tamper check"
-            echo "  nix build                      # reproducible build"
-            echo "  nix flake check                # run all flake checks"
+            echo "Common tasks (single source of truth — flake.nix):"
+            echo "  nix run .#ci                   # full local-CI suite (§16.4)"
+            echo "  nix run .#test-race            # go test -race ./..."
+            echo "  nix run .#test-canonical       # LC_ALL=C canonical-JSON tests"
+            echo "  nix run .#staticcheck          # static analysis"
+            echo "  nix run .#govulncheck          # CVE scan"
+            echo "  nix run .#crypto               # vendored Lua sha256sum -c"
+            echo "  nix run .#build                # local-parity reproducible build"
+            echo "  nix run .#e2e                  # gated end-to-end smoke (§17.6)"
+            echo "  nix build                      # nix-built reproducible binary"
+            echo "  nix flake check                # all flake checks"
+            echo ""
+            echo "Release pre-flight (rehearse the workflow locally — see docs/release.md):"
+            echo "  TAG=v0.1.0 nix run .#release-build       # one host-native build"
+            echo "  TAG=v0.1.0 nix run .#release-package     # build + tarball"
+            echo "  TAG=v0.1.0 nix run .#release-build-all   # cross-compile all 4 targets + SHA256SUMS"
             echo ""
             echo "Drive the build (one /next-task per fresh claude process):"
-            echo "  wezsesh-build-loop             # (or: nix run .#build-loop)"
-            echo "  MAX_ITERS=5 wezsesh-build-loop"
+            echo "  wezsesh-build-loop --permission-mode auto"
+            echo "  MAX_ITERS=5 wezsesh-build-loop --permission-mode auto"
+            echo ""
+            echo "VCS: jj-colocated (.jj/ + .git/). Use jj for commits/diffs;"
+            echo "git tooling (CI, IDE) sees the colocated .git/ normally."
           '';
         };
 

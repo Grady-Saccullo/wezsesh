@@ -1,0 +1,161 @@
+# wezsesh CI — see docs/design.md §16.4 (required gates) and §16.1 (Go version & flags).
+#
+# Two jobs:
+#   - lint: language-agnostic gates that need only one runner.
+#   - test: go test + reproducible-build, run across the §16.4 build matrix.
+#
+# §16.5 custom lints are NOT wired here — they belong to T-005.
+#
+# Tool pins:
+#   - actions/checkout@v4, actions/setup-go@v5 (major-version tags).
+#   - go-version-file: go.mod (tracks the `go 1.26.2` directive).
+#   - staticcheck @2025.1.1 — honnef.co/go/tools v0.5.x (the 2024.1.x
+#     release) does not compile under Go 1.26.2 (`tokeninternal.go:64:
+#     invalid array length -delta * delta`); 2025.1.1 (v0.6.1) is the
+#     lowest tag that builds. §16.4 specifies only `staticcheck ./...`
+#     with no version pin, so this is a tooling choice, not spec drift.
+#   - govulncheck @v1.1.4 — pinned per task brief.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (linux-amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: vendored crypto integrity
+        run: sha256sum -c plugin/wezsesh/vendor/SOURCES.lock
+
+      - name: codegen freshness (default_allowlist.lua)
+        run: |
+          if [ -f plugin/wezsesh/default_allowlist.lua ]; then
+            go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
+          else
+            echo "[placeholder] default_allowlist.lua not yet generated (T-605)"
+          fi
+
+      - name: custom CI lints (§16.5 / §17.4)
+        # T-005: builds the lualint binary and runs every §16.5 / §17.4
+        # rule against the repo. Exit 1 on any SevError finding fails
+        # the lint job and the PR.
+        run: |
+          go build -o /tmp/lualint ./cmd/lualint
+          /tmp/lualint .
+
+      - name: verb/shape parity
+        # T-005 wired the verb / shape parity check into the lualint
+        # binary above. The standalone step is preserved for log
+        # readability so a parity failure is grep-friendly in CI logs.
+        run: /tmp/lualint --rule=lua-verb-shape-parity .
+
+      - name: Lua version assertion
+        run: echo "[placeholder] Lua version assertion deferred until plugin tests land"
+
+      - name: Lua handler fuzz harness (§17.5)
+        # Pin to lua5.4 explicitly. math.random's seed mapping changed
+        # between 5.3 and 5.4 (xoshiro256** in 5.4); the regression
+        # seeds in plugin/wezsesh/fuzz/seeds.txt only replay
+        # deterministically against a fixed Lua version (LOW-1, round
+        # 1). ubuntu-24.04 ships lua5.4 via apt-get but no `lua`
+        # symlink, so install + symlink so cmd/lua-fuzzer's
+        # `exec.LookPath` resolves it.
+        #
+        # MUST NOT pass --iters: any non-zero --iters silently waives
+        # the §17.5 BYTE_FLOOR=10000 gate inside fuzz_spec.lua
+        # (MEDIUM-3, round 1). The first invocation defaults --seeds
+        # to plugin/wezsesh/fuzz/seeds.txt (every committed
+        # regression seed). The second invocation passes
+        # --seeds=none to bypass the default, scoping coverage to a
+        # single fresh non-historical seed so coverage is not pinned
+        # to historical seeds only.
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y lua5.4
+          sudo ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
+          go run ./cmd/lua-fuzzer
+          go run ./cmd/lua-fuzzer --seeds=none --seed=$GITHUB_RUN_NUMBER
+
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            # WHY: GitHub-hosted arm64 linux runner. Native arm64 is required
+            # so `go test -race` runs (the race detector cannot execute under
+            # cross-compilation).
+            runner: ubuntu-24.04-arm
+          - target: darwin-amd64
+            runner: macos-13
+          - target: darwin-arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # WHY: reproducible-build placeholder uses `git describe --tags
+          # --always` for main.version. Full history avoids `unknown` tags.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: canonical-JSON locale (LC_ALL=C)
+        env:
+          LC_ALL: C
+        run: go test ./internal/canonicaljson/... ./plugin/...
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: reproducible build
+        run: |
+          if [ -f cmd/wezsesh/main.go ]; then
+            go build -trimpath \
+              -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
+              ./cmd/wezsesh
+          else
+            echo "[placeholder] cmd/wezsesh not yet present (T-800)"
+          fi
