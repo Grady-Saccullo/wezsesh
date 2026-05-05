@@ -42,12 +42,8 @@ package.path = script_dir() .. "/?.lua;"
 -- wezterm shim — installed BEFORE require("result")
 -- ────────────────────────────────────────────────────────────────────
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
 -- Pure-Lua JSON encode sufficient for the flat envelopes result.lua
 -- builds. We don't need byte-equality with Go here (the reply path is

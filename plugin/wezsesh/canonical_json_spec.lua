@@ -27,16 +27,10 @@ package.path = script_dir() .. "/?.lua;"
 -- canonical_json's verb_args_shape now sources from wezsesh.verbs at
 -- module load. Loading verbs pulls in result.lua and runtime/globals.lua,
 -- which both `require("wezterm")` at the top. The encoder itself is
--- pure-Lua and never calls a wezterm function, so a minimal table-with-
--- empty-GLOBAL shim is enough to satisfy the indirect requires.
-package.preload["wezterm"] = function()
-    return {
-        GLOBAL = setmetatable({}, {
-            __index    = function() return nil end,
-            __newindex = function() end,
-        }),
-    }
-end
+-- pure-Lua and never calls a wezterm function, so the minimal shim is
+-- enough to satisfy the indirect requires.
+local helpers = require("spec_helpers")
+package.preload["wezterm"] = function() return helpers.minimal_wezterm() end
 
 local cj = require("canonical_json")
 

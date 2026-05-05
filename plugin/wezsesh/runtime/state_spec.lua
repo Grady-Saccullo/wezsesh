@@ -30,7 +30,9 @@ local function script_dir()
     local src = arg and arg[0] or "plugin/wezsesh/state_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;" .. package.path
+package.path = script_dir() .. "/?.lua;"
+            .. script_dir() .. "/../../?.lua;"
+            .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
 -- wezterm shim — installed BEFORE require("state")
@@ -50,12 +52,8 @@ package.path = script_dir() .. "/?.lua;" .. package.path
 --   * a test-only `__store`/`__write_count`/`__inject_raw` surface for
 --     the spec's assertions. Production code never sees these.
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
 local function make_global()
     local store = {}

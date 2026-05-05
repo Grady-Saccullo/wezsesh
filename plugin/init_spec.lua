@@ -47,32 +47,10 @@ package.path = script_dir() .. "/?.lua;"
 -- wezterm shim
 -- ────────────────────────────────────────────────────────────────────
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
--- Snapshot-on-read GLOBAL proxy: matches the shape state.lua / ipc.lua
--- depend on. Init.lua now writes GLOBAL directly (the §10.6 plugin
--- version stamp + cross-version wipe loop) so the proxy MUST also
--- support `pairs(...)` enumeration via __pairs — production wezterm's
--- GLOBAL userdata is iterable; we mirror that here so the wipe loop
--- in init.lua is exercisable under tests.
-local global_store = {}
-local global_proxy = setmetatable({}, {
-    __index = function(_, k) return deepcopy(global_store[k]) end,
-    __newindex = function(_, k, v) global_store[k] = deepcopy(v) end,
-    __pairs  = function(_)
-        local function iter(_, prev)
-            local k, v = next(global_store, prev)
-            if k == nil then return nil end
-            return k, deepcopy(v)
-        end
-        return iter, nil, nil
-    end,
-})
+local global_proxy = helpers.make_global_proxy()
 
 -- Recording slots for assertions.
 local on_calls       = {}    -- { {name, fn}, ... }
@@ -286,7 +264,7 @@ local function reset_state()
 
     rawset(_G, "resurrect", nil)
     -- Reset GLOBAL.
-    for k in pairs(global_store) do global_store[k] = nil end
+    for k in pairs(global_proxy) do global_proxy[k] = nil end
 
     -- Re-install preloads (a previous test may have nilled some).
     install_wezsesh_preloads()
@@ -394,43 +372,43 @@ describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
     it("stamps wezsesh_plugin_version on first load (no wipe needed)",
     function()
         -- Pre-state empty; the stamp must equal init.VERSION afterwards.
-        assert_nil(global_store.wezsesh_plugin_version,
+        assert_nil(global_proxy.wezsesh_plugin_version,
             "pre-state had a stamp")
         init.apply_to_config({}, {})
-        assert_eq(global_store.wezsesh_plugin_version, init.VERSION,
+        assert_eq(global_proxy.wezsesh_plugin_version, init.VERSION,
             "version stamp not written on first load")
     end)
 
     it("wipes every wezsesh_* GLOBAL key when stored stamp mismatches " ..
         "(upgrade path)", function()
-        global_store.wezsesh_plugin_version = "0.0.0-old"
-        global_store.wezsesh_dispatcher_socket = "/tmp/x"
-        global_store.wezsesh_state = { ["123"] = "stale" }
-        global_store.wezsesh_seen_ids = { ["01ABCDEF"] = 1700000000 }
-        global_store.wezsesh_writing = { ["/x.json"] = true }
+        global_proxy.wezsesh_plugin_version = "0.0.0-old"
+        global_proxy.wezsesh_dispatcher_socket = "/tmp/x"
+        global_proxy.wezsesh_state = { ["123"] = "stale" }
+        global_proxy.wezsesh_seen_ids = { ["01ABCDEF"] = 1700000000 }
+        global_proxy.wezsesh_writing = { ["/x.json"] = true }
         -- Sentinel that MUST survive (different prefix).
-        global_store.unrelated_global_key = "keepme"
+        global_proxy.unrelated_global_key = "keepme"
 
         init.apply_to_config({}, {})
 
-        assert_nil(global_store.wezsesh_dispatcher_socket,
+        assert_nil(global_proxy.wezsesh_dispatcher_socket,
             "wezsesh_dispatcher_socket not wiped")
-        assert_nil(global_store.wezsesh_state,
+        assert_nil(global_proxy.wezsesh_state,
             "wezsesh_state not wiped")
-        assert_nil(global_store.wezsesh_seen_ids,
+        assert_nil(global_proxy.wezsesh_seen_ids,
             "wezsesh_seen_ids not wiped")
-        assert_nil(global_store.wezsesh_writing,
+        assert_nil(global_proxy.wezsesh_writing,
             "wezsesh_writing not wiped")
-        assert_eq(global_store.wezsesh_plugin_version, init.VERSION,
+        assert_eq(global_proxy.wezsesh_plugin_version, init.VERSION,
             "version stamp not re-written after wipe")
-        assert_eq(global_store.unrelated_global_key, "keepme",
+        assert_eq(global_proxy.unrelated_global_key, "keepme",
             "non-wezsesh key wiped (prefix matched too broadly)")
-        global_store.unrelated_global_key = nil
+        global_proxy.unrelated_global_key = nil
     end)
 
     it("wipes on downgrade as well as upgrade", function()
-        global_store.wezsesh_plugin_version = "9.9.9-future"
-        global_store.wezsesh_session_key = "deadbeef"
+        global_proxy.wezsesh_plugin_version = "9.9.9-future"
+        global_proxy.wezsesh_session_key = "deadbeef"
         init.apply_to_config({}, {})
         -- session_key gets re-populated by manager.ensure_session_key
         -- (the shim returns "aaaa..."), so we assert the stamp landed
@@ -439,15 +417,15 @@ describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
         -- stamp moving from 9.9.9-future → init.VERSION; without the
         -- wipe the stamp would have remained 9.9.9-future because
         -- our shim does NOT touch the version key.
-        assert_eq(global_store.wezsesh_plugin_version, init.VERSION,
+        assert_eq(global_proxy.wezsesh_plugin_version, init.VERSION,
             "downgrade path did not re-stamp")
     end)
 
     it("is idempotent on same-version reload (no wipe, no churn)",
     function()
-        global_store.wezsesh_plugin_version = init.VERSION
-        global_store.wezsesh_session_key = "should-survive"
-        global_store.wezsesh_state = { ["1"] = "should-survive" }
+        global_proxy.wezsesh_plugin_version = init.VERSION
+        global_proxy.wezsesh_session_key = "should-survive"
+        global_proxy.wezsesh_state = { ["1"] = "should-survive" }
 
         init.apply_to_config({}, {})
 
@@ -457,12 +435,12 @@ describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
         -- that happens after stamp_and_maybe_wipe_globals. The state
         -- key is the cleanest probe — neither init.lua nor the
         -- manager shim touches it on same-version reload.
-        assert_true(global_store.wezsesh_state ~= nil,
+        assert_true(global_proxy.wezsesh_state ~= nil,
             "wezsesh_state was wiped on same-version reload " ..
             "(idempotency violated)")
-        assert_eq(global_store.wezsesh_state["1"], "should-survive",
+        assert_eq(global_proxy.wezsesh_state["1"], "should-survive",
             "wezsesh_state contents lost on same-version reload")
-        assert_eq(global_store.wezsesh_plugin_version, init.VERSION,
+        assert_eq(global_proxy.wezsesh_plugin_version, init.VERSION,
             "stamp drifted on same-version reload")
     end)
 
@@ -472,20 +450,20 @@ describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
         -- freshly-written session key would be nuked. We instrument
         -- the relevant calls and read GLOBAL state at each one to
         -- assert the stamp is in place by the time those writes happen.
-        global_store.wezsesh_plugin_version = "0.0.0-old"
-        global_store.wezsesh_session_key = "stale"
+        global_proxy.wezsesh_plugin_version = "0.0.0-old"
+        global_proxy.wezsesh_session_key = "stale"
 
         local stamp_when_register, stamp_when_keygen
         resurrect_error_shim.register = function()
             resurrect_error_calls.register =
                 resurrect_error_calls.register + 1
-            stamp_when_register = global_store.wezsesh_plugin_version
+            stamp_when_register = global_proxy.wezsesh_plugin_version
             wezterm_shim.on("resurrect.error", function() end)
         end
         manager_shim.ensure_session_key = function(bin)
             manager_calls.ensure_session_key[
                 #manager_calls.ensure_session_key + 1] = bin
-            stamp_when_keygen = global_store.wezsesh_plugin_version
+            stamp_when_keygen = global_proxy.wezsesh_plugin_version
             return string.rep("a", 64)
         end
 

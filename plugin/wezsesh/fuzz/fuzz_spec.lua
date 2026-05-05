@@ -86,187 +86,14 @@ math.randomseed(SEED)
 -- wezterm shim — minimum surface to satisfy ipc.lua + transitive deps
 -- ────────────────────────────────────────────────────────────────────
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
-local function json_encode_shim(v)
-    local function emit(x)
-        local t = type(x)
-        if t == "number" then
-            if math.type and math.type(x) == "integer" then
-                return tostring(x)
-            end
-            return string.format("%.17g", x)
-        end
-        if t == "boolean" then return x and "true" or "false" end
-        if t == "string" then
-            local out = { '"' }
-            for i = 1, #x do
-                local b = x:byte(i)
-                if b == 0x22 then out[#out + 1] = '\\"'
-                elseif b == 0x5c then out[#out + 1] = "\\\\"
-                elseif b < 0x20 then
-                    out[#out + 1] = string.format("\\u%04x", b)
-                else out[#out + 1] = string.char(b)
-                end
-            end
-            out[#out + 1] = '"'
-            return table.concat(out)
-        end
-        if t == "table" then
-            local mt = getmetatable(x)
-            local kind = mt and mt.__wezsesh_canonical
-            if kind == "null" then return "null" end
-            if kind == "array" then
-                local parts = {}
-                for i = 1, #x do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local n = 0
-            local is_array = true
-            for k in pairs(x) do
-                if type(k) ~= "number" then is_array = false; break end
-                n = n + 1
-            end
-            if is_array and n > 0 and kind ~= "object" then
-                local parts = {}
-                for i = 1, n do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local keys = {}
-            for k in pairs(x) do keys[#keys + 1] = k end
-            table.sort(keys, function(a, b)
-                return tostring(a) < tostring(b)
-            end)
-            local parts = {}
-            for _, k in ipairs(keys) do
-                parts[#parts + 1] = emit(tostring(k)) .. ":" .. emit(x[k])
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-        if t == "nil" then return "null" end
-        error("json_encode_shim: unsupported type " .. t)
-    end
-    return emit(v)
-end
+local codec = helpers.make_json_codec()
+local json_encode_shim = codec.encode
+local json_parse_shim  = codec.decode
 
-local function json_parse_shim(s)
-    if type(s) ~= "string" then
-        error("json_parse_shim: input must be string", 0)
-    end
-    local pos = 1
-    local function err(msg)
-        error("json_parse_shim: " .. msg .. " at " .. pos, 0)
-    end
-    local function skip_ws()
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == " " or c == "\t" or c == "\n" or c == "\r" then
-                pos = pos + 1
-            else return end
-        end
-    end
-    local parse_value
-    local function parse_string()
-        if s:sub(pos, pos) ~= '"' then err("expected string") end
-        pos = pos + 1
-        local out = {}
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == '"' then pos = pos + 1; return table.concat(out) end
-            if c == "\\" then
-                pos = pos + 1
-                local esc = s:sub(pos, pos)
-                if esc == "u" then
-                    out[#out + 1] = s:sub(pos + 1, pos + 4)
-                    pos = pos + 5
-                else
-                    out[#out + 1] = esc
-                    pos = pos + 1
-                end
-            else
-                out[#out + 1] = c
-                pos = pos + 1
-            end
-        end
-        err("unterminated string")
-    end
-    local function parse_number()
-        local s2 = s:sub(pos)
-        local num_str = s2:match("^%-?%d+%.?%d*[eE]?[%-+]?%d*")
-        if not num_str or num_str == "" then err("bad number") end
-        pos = pos + #num_str
-        local n = tonumber(num_str)
-        if not num_str:find("[.eE]") then
-            n = math.tointeger(n) or n
-        end
-        return n
-    end
-    local function parse_object()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "}" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            local k = parse_string()
-            skip_ws()
-            if s:sub(pos, pos) ~= ":" then err("expected ':'") end
-            pos = pos + 1; skip_ws()
-            out[k] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "}" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or '}'") end
-            pos = pos + 1
-        end
-    end
-    local function parse_array()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "]" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            out[#out + 1] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "]" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or ']'") end
-            pos = pos + 1
-        end
-    end
-    parse_value = function()
-        skip_ws()
-        local c = s:sub(pos, pos)
-        if c == "{" then return parse_object() end
-        if c == "[" then return parse_array() end
-        if c == '"' then return parse_string() end
-        if c == "t" then
-            if s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true end
-            err("bad literal")
-        end
-        if c == "f" then
-            if s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false end
-            err("bad literal")
-        end
-        if c == "n" then
-            if s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
-            err("bad literal")
-        end
-        return parse_number()
-    end
-    skip_ws()
-    return parse_value()
-end
-
-local global_store = {}
-local global_proxy = setmetatable({}, {
-    __index = function(_, k) return deepcopy(global_store[k]) end,
-    __newindex = function(_, k, v) global_store[k] = deepcopy(v) end,
-})
+local global_proxy = helpers.make_global_proxy()
 
 local log_warn_calls = {}
 local log_error_calls = {}
@@ -324,7 +151,7 @@ local function reset_world()
     log_warn_calls = {}
     log_error_calls = {}
     state.wipe_all()
-    global_store = {}
+    for k in pairs(global_proxy) do global_proxy[k] = nil end
     global_proxy.wezsesh_session_key = DEFAULT_KEY
     state.set_state(DEFAULT_PANE_ID, {
         target_window_id = DEFAULT_WINDOW_ID,
