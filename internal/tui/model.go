@@ -33,6 +33,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
+	"github.com/Grady-Saccullo/wezsesh/internal/logger"
 	"github.com/Grady-Saccullo/wezsesh/internal/nameval"
 	"github.com/Grady-Saccullo/wezsesh/internal/snapshots"
 	"github.com/Grady-Saccullo/wezsesh/internal/state"
@@ -68,14 +69,17 @@ const (
 	ColTags   Column = "tags"
 )
 
-// Markers configures the per-row glyphs (§8.16). Empty strings render
-// as a blank cell.
+// Markers configures the per-row glyphs. Empty strings render as a
+// blank cell. External marks rows that came from a dir_providers
+// adapter (zoxide, fd, ad-hoc tables, etc.) — not yet a live workspace
+// nor a saved snapshot.
 type Markers struct {
-	Active  string
-	Live    string
-	Marked  string
-	Unsaved string
-	Pinned  string
+	Active   string
+	Live     string
+	Marked   string
+	Unsaved  string
+	Pinned   string
+	External string
 }
 
 // Colors holds optional foreground colour overrides. Nil leaves the
@@ -168,17 +172,36 @@ type Data struct {
 	ActiveWindowID  int
 }
 
-// WorkspaceRow is one picker row (§8.16). Snapshot is non-nil when a
-// snapshot file backs the row (used by the preview pane).
+// Source classifies where a picker row came from. The value drives
+// dispatch routing (live/saved use cwd:"" on switch; external passes
+// the provider's CWD), preview rendering, and the live > saved >
+// external sort order.
+type Source int
+
+const (
+	// SourceLive — the workspace currently exists in the wezterm mux.
+	SourceLive Source = iota
+	// SourceSaved — a snapshot file exists for the name (no live mux entry).
+	SourceSaved
+	// SourceExternal — a dir_providers adapter surfaced this row at
+	// runtime; not yet a live workspace nor a saved snapshot. Selecting
+	// it dispatches `switch` with the provider-supplied CWD so the
+	// rename-trick path can `cd` the active pane after the rename.
+	SourceExternal
+)
+
+// WorkspaceRow is one picker row. Snapshot is non-nil when a snapshot
+// file backs the row (used by the preview pane). Active is meaningful
+// only for SourceLive; CWD is meaningful only for SourceExternal.
 type WorkspaceRow struct {
 	Name     string
-	Live     bool
+	Source   Source
 	Active   bool
-	Saved    bool
 	Tabs     int
 	Mtime    time.Time
 	Tags     []string
 	Pinned   bool
+	CWD      string
 	Snapshot *snapshots.Entry
 }
 
@@ -234,6 +257,14 @@ type Model struct {
 	cfg  Config
 	data Data
 	disp ipc.Dispatcher
+
+	// log is the structured logger threaded through from cmd/wezsesh
+	// (env.log). Nil-safe: every (*logger.Logger) method short-circuits
+	// on a nil receiver, so tests that construct Model directly can pass
+	// nil and observability calls become no-ops. The logger's Warn/Error
+	// fast-path sync-flushes (logger.go:125-143) so an IPC_TIMEOUT line
+	// survives even if the user closes the TUI immediately afterwards.
+	log *logger.Logger
 
 	// rows is the sanitised + sorted workspace list. Sanitisation is
 	// pre-applied at construction so the per-render hot path does not
@@ -319,15 +350,35 @@ type Model struct {
 	styles styles
 }
 
+// Option is an additive constructor knob. Used so cmd/wezsesh can plumb
+// the structured logger (and any future field) into Model without
+// changing the existing 3-arg call shape.
+type Option func(*Model)
+
+// WithLogger threads the binary-side *logger.Logger into Model so the
+// timeout / failure code paths inside Update can write structured log
+// lines to <state>/wezsesh.log. Pass nil to disable (the logger
+// methods are nil-safe; calls become no-ops). Production wires this
+// from env.log; tests typically omit it.
+func WithLogger(log *logger.Logger) Option {
+	return func(m *Model) {
+		m.log = log
+	}
+}
+
 // New constructs the §8.16 Model. The returned tea.Model is *Model
 // directly; pointer-receiver Update / View / Init satisfy the interface.
-func New(cfg Config, initial Data, d ipc.Dispatcher) tea.Model {
-	return newModel(cfg, initial, d)
+//
+// opts is a variadic options slice (currently WithLogger only). Keeping
+// the optional fields out of the positional signature lets cmd/wezsesh
+// add observability without ripple-editing every existing call site.
+func New(cfg Config, initial Data, d ipc.Dispatcher, opts ...Option) tea.Model {
+	return newModel(cfg, initial, d, opts...)
 }
 
 // newModel is the internal constructor used by tests so they can keep
 // the *Model receiver type without round-tripping through tea.Model.
-func newModel(cfg Config, initial Data, d ipc.Dispatcher) *Model {
+func newModel(cfg Config, initial Data, d ipc.Dispatcher, opts ...Option) *Model {
 	if cfg.Keys == (KeyMap{}) {
 		cfg.Keys = DefaultKeyMap()
 	}
@@ -354,13 +405,19 @@ func newModel(cfg Config, initial Data, d ipc.Dispatcher) *Model {
 		timeoutDelay:    5 * time.Second,
 		styles:          buildStyles(cfg.Colors),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
+	}
 	return m
 }
 
 // sanitiseRows runs every disk-sourced string field through
 // SanitizeForDisplay so the renderer's hot path never sees raw bytes.
 // The terminal-injection acceptance test ("snapshot named \x1b[2J does
-// not clear terminal") is what this guards.
+// not clear terminal") is what this guards. CWD is disk-sourced too
+// (provider output) and joins the sanitisation set.
 func sanitiseRows(in []WorkspaceRow) []WorkspaceRow {
 	if len(in) == 0 {
 		return nil
@@ -368,6 +425,9 @@ func sanitiseRows(in []WorkspaceRow) []WorkspaceRow {
 	out := make([]WorkspaceRow, len(in))
 	for i, r := range in {
 		r.Name = nameval.SanitizeForDisplay(r.Name)
+		if r.CWD != "" {
+			r.CWD = nameval.SanitizeForDisplay(r.CWD)
+		}
 		if len(r.Tags) > 0 {
 			t := make([]string, len(r.Tags))
 			for j, tag := range r.Tags {
@@ -428,10 +488,13 @@ func sortRows(rows []WorkspaceRow, mode SortMode, st *state.Store) {
 			if rows[i].Pinned != rows[j].Pinned {
 				return rows[i].Pinned
 			}
-			if rows[i].Live != rows[j].Live {
-				return rows[i].Live
+			// Source enum iota is ordered live(0) < saved(1) < external(2),
+			// so a smaller Source value sorts first — yielding the
+			// "live > saved > external" rank.
+			if rows[i].Source != rows[j].Source {
+				return rows[i].Source < rows[j].Source
 			}
-			if rows[i].Live && rows[j].Live {
+			if rows[i].Source == SourceLive {
 				if rows[i].Active != rows[j].Active {
 					return rows[i].Active
 				}

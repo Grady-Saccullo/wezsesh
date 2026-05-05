@@ -341,6 +341,9 @@ function M.handle_user_var(window, pane, name, value, opts)
     if session == nil then
         -- No matching spawn record. Either a stale OSC after
         -- window-config-reloaded blew the bucket, or a foreign emitter.
+        -- This branch is intentionally log-silent: the multi-window
+        -- broadcast (#3524) means every foreign-pane SetUserVar=wezsesh_op
+        -- emission would otherwise spam log_warn for every window.
         return
     end
 
@@ -376,6 +379,18 @@ function M.handle_user_var(window, pane, name, value, opts)
         return
     end
 
+    -- Re-hydrate `string_or_null` args slots before the tag-walk.
+    -- `wezterm.json_parse` decodes JSON `null` as Lua `nil`, which is
+    -- indistinguishable from a missing key. Without this, every
+    -- nullable slot the binary signed as `null` (e.g. first-save's
+    -- `expected_hash`) would trip
+    -- `CANONICAL_SHAPE_MISMATCH: missing required key`, AND the sans-
+    -- hmac re-encode would drop the slot entirely, breaking HMAC
+    -- parity with the binary's pre-sign bytes. Walks ONLY the
+    -- declared `string_or_null` slots so genuine shape violations
+    -- (an unexpected nil on a required `string` slot) still raise.
+    canonical_json.rehydrate_nullable_args(payload, verb_args_shape)
+
     -- Tag the FULL parsed payload (with `hmac` still in place) using
     -- the verb-keyed shape, then drop `hmac` from a copy and encode.
     -- `canonical_json.ROOT_PAYLOAD_SHAPE` declares `hmac` as a root
@@ -383,11 +398,12 @@ function M.handle_user_var(window, pane, name, value, opts)
     -- must tag-with-hmac, copy_without-hmac, encode. Reversing the
     -- order (copy_without then tag) trips
     -- `CANONICAL_SHAPE_MISMATCH: missing required key: hmac`.
-    local ok_tag = pcall(canonical_json.tag_in_place, payload,
+    local ok_tag, tag_err = pcall(canonical_json.tag_in_place, payload,
                          canonical_json.ROOT_PAYLOAD_SHAPE,
                          verb_args_shape)
     if not ok_tag then
-        log.warn("ipc: canonical tag failed")
+        log.warn("ipc: canonical tag failed (op=" .. tostring(payload.op)
+                 .. "): " .. tostring(tag_err))
         return
     end
 
@@ -441,7 +457,9 @@ function M.handle_user_var(window, pane, name, value, opts)
     then
         -- Multi-window broadcast (#3524): wezterm fires user-var-changed
         -- in EVERY listening window. Only the window matching the
-        -- request's target_window_id should dispatch.
+        -- request's target_window_id should dispatch. Log-silent for the
+        -- same reason as step (a): every off-target broadcast would
+        -- otherwise produce a per-window log_warn.
         return
     end
 
@@ -502,9 +520,10 @@ function M.register(opts)
     if type(opts) ~= "table" then
         error("ipc.register: opts table required", 0)
     end
-    -- Idempotency-sensitive: re-registering on Ctrl+Shift+R reload would
-    -- compound handlers. wezterm wipes registered handlers when the Lua
-    -- state is rebuilt, so a single register-per-load matches the cache.
+    -- Validation runs unconditionally (before the idempotency gate) so
+    -- a misconfigured opts.runtime_dir raises a sentinel even on the
+    -- second call. The gate only skips the wezterm.on registration —
+    -- the structural opts checks are cheap and worth re-running.
     local expanded = M.validate_runtime_dir(opts.runtime_dir)
     local req_dir_prefix = expanded
     if req_dir_prefix:sub(-1) ~= "/" then
@@ -515,6 +534,17 @@ function M.register(opts)
     if type(opts.target_window_id) ~= "number" then
         error("ipc.register: opts.target_window_id must be a number", 0)
     end
+
+    -- Idempotency gate. wezterm.on has no de-register API, so a second
+    -- call in the same Lua state would compound handlers — every OSC
+    -- would fan out N copies of the gate (each a full canonical-encode +
+    -- HMAC verify). On a real reload wezterm rebuilds the Lua state and
+    -- _G is fresh; on a config re-eval without a state rebuild this
+    -- gate skips re-registration. Mirrors resurrect_error.register.
+    if _G._wezsesh_user_var_listener_installed then
+        return
+    end
+
     local frozen = {
         req_dir_prefix   = req_dir_prefix,
         target_window_id = opts.target_window_id,
@@ -531,6 +561,7 @@ function M.register(opts)
             log.warn("ipc: handler raised: " .. tostring(err))
         end
     end)
+    _G._wezsesh_user_var_listener_installed = true
 end
 
 return M

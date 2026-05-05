@@ -170,7 +170,11 @@ local function build_signed_payload(overrides)
     if args == nil then
         if op == "noop" then
             args = canonical_json.object{}
-        elseif op == "switch" or op == "load" then
+        elseif op == "switch" then
+            args = canonical_json.object{ name = "main", cwd = "" }
+        elseif op == "list_dirs" then
+            args = canonical_json.object{ query = "" }
+        elseif op == "load" then
             args = canonical_json.object{ name = "main" }
         elseif op == "new" then
             args = canonical_json.object{
@@ -470,7 +474,7 @@ local function gen_control_char_field()
     return build_file_class(payload, payload.id)
 end
 
-local VERBS = { "noop", "switch", "load", "save", "new" }
+local VERBS = { "noop", "switch", "load", "save", "new", "list_dirs" }
 
 local function gen_hmac_corrupted()
     -- Properly signed payload, last hex char of payload.hmac flipped

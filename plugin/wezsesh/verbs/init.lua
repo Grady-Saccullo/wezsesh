@@ -6,11 +6,13 @@
 -- change: drop a new module under `verbs/`, register it here.
 --
 -- Verb catalog:
---   * switch — switch to workspace; restore-class when saved-not-live.
---   * load   — restore `name` snapshot into the current workspace.
---   * save   — snapshot current workspace; dual-path detector.
---   * new    — spawn a new workspace from a cwd.
---   * noop   — TUI cancellation marker. No-op.
+--   * switch    — switch to workspace; covers live, saved-not-live,
+--                 and brand-new (rename-current-window) targets.
+--   * load      — restore `name` snapshot into the current workspace.
+--   * save      — snapshot current workspace; dual-path detector.
+--   * new       — spawn a fresh window into a new workspace (CLI-only).
+--   * noop      — TUI cancellation marker. No-op.
+--   * list_dirs — read-side: query stashed dir_providers for picker rows.
 --
 -- Why save and load go through `resurrect_error.with_capture` (and not
 -- a bare `pcall(state_manager.{save,load}_state, …)`): resurrect's
@@ -66,13 +68,14 @@ function M.register(name, mod)
     M.dispatch_table[name] = mod and mod.dispatch or nil
 end
 
--- Built-in verb registrations. Adding a sixth verb means dropping a
--- file in `verbs/`, requiring it here, and adding one register call.
-M.register("noop",   require("wezsesh.verbs.noop"))
-M.register("save",   require("wezsesh.verbs.save"))
-M.register("load",   require("wezsesh.verbs.load"))
-M.register("switch", require("wezsesh.verbs.switch"))
-M.register("new",    require("wezsesh.verbs.new"))
+-- Built-in verb registrations. Adding a verb means dropping a file in
+-- `verbs/`, requiring it here, and adding one register call.
+M.register("noop",      require("wezsesh.verbs.noop"))
+M.register("save",      require("wezsesh.verbs.save"))
+M.register("load",      require("wezsesh.verbs.load"))
+M.register("switch",    require("wezsesh.verbs.switch"))
+M.register("new",       require("wezsesh.verbs.new"))
+M.register("list_dirs", require("wezsesh.verbs.list_dirs"))
 
 -- Build `{ verb_name = mod.args_shape }` from the registry. Returns a
 -- fresh table on each call; consumers cache the result themselves if

@@ -529,6 +529,36 @@ describe("change_state_save_dir", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
+-- opts.dir_providers stashed via runtime/dir_providers
+-- ────────────────────────────────────────────────────────────────────
+
+describe("dir_providers stash", function()
+    it("opts.dir_providers is forwarded to runtime/dir_providers.set",
+    function()
+        local function p() return { { path = "/x", name = "x" } } end
+        init.apply_to_config({}, { dir_providers = { p } })
+        -- init.lua's cache-bust loop drops package.loaded[
+        -- "wezsesh.runtime.dir_providers"] on entry and re-requires
+        -- a fresh instance, so we MUST grab the post-call instance to
+        -- read the stashed list — a require() before apply_to_config
+        -- yields a different module table.
+        local dir_providers = require("wezsesh.runtime.dir_providers")
+        local stashed = dir_providers.get()
+        assert_eq(#stashed, 1,
+            "expected exactly one stashed provider")
+        assert_true(stashed[1] == p,
+            "stashed provider identity not preserved")
+    end)
+
+    it("absent opts.dir_providers normalises to empty list", function()
+        init.apply_to_config({}, {})
+        local dir_providers = require("wezsesh.runtime.dir_providers")
+        assert_eq(#dir_providers.get(), 0,
+            "absent opts.dir_providers did not yield an empty stash")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
 -- opts.binary / opts.plugin_root precedence
 -- ────────────────────────────────────────────────────────────────────
 

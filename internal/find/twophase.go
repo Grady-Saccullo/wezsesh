@@ -60,6 +60,7 @@ func runPhase1(
 	// dispatcher's drain goroutine exit.
 	replies, err := d.Dispatch(dispCtx, "switch", map[string]any{
 		"name": match.Workspace,
+		"cwd":  "",
 	})
 	if err != nil {
 		dispCancel()

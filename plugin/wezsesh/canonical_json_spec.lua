@@ -139,7 +139,9 @@ local golden_inputs = {
     forward_slash  = "a/b",
 
     -- Per-verb fixtures.
-    verb_switch_args     = cj.object{ name = "work" },
+    verb_switch_args     = cj.object{
+        name = "work", cwd = "/home/user/code",
+    },
     verb_load_args       = cj.object{ name = "work" },
     verb_save_args       = cj.object{
         name = "work", overwrite = false,
@@ -153,6 +155,16 @@ local golden_inputs = {
         name = "~/code", cwd = "/home/user/code",
     },
     verb_noop_args       = cj.object{},
+    verb_list_dirs_args  = cj.object{ query = "" },
+    verb_list_dirs_reply_data = cj.object{
+        dirs = cj.array{
+            cj.object{ name = "code", path = "/home/user/code" },
+            cj.object{ name = "srv",  path = "/srv" },
+        },
+    },
+    verb_list_dirs_reply_data_empty = cj.object{
+        dirs = cj.array{},
+    },
 }
 
 -- Locate the golden corpus relative to either the repo root (CI/normal

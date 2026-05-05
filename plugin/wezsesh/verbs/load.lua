@@ -10,14 +10,22 @@ local M = {}
 
 M.args_shape = { _shape = "object", name = "string" }
 
-function M.dispatch(payload, _window, _pane)
+function M.dispatch(payload, window, _pane)
     local name = (payload.args and payload.args.name) or ""
     -- Data shape on success: { name, workspace } — mirrors the verb
     -- catalog. The TUI reads `name` to position its cursor and
     -- `workspace` to update the active marker.
+    --
+    -- `window` is the GUI Window the user-var-changed handler fired
+    -- in; passing it as `opts.window` lets resurrect adopt the
+    -- caller's active tab/pane as the snapshot's first
+    -- tab/pane (legacy `smart_workspace_switcher.workspace_switcher.created`
+    -- behaviour). The workspace is NOT switched — load is "replay
+    -- this snapshot into the current workspace", distinct from
+    -- `switch`'s "make me be in workspace X."
     return restore.load_and_restore(payload, name, function(n)
         return { name = n, workspace = n }
-    end)
+    end, { window = window })
 end
 
 return M

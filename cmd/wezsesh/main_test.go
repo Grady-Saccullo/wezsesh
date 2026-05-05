@@ -227,10 +227,24 @@ func newSaveDeps(t *testing.T, disp ipc.Dispatcher) (saveDeps, *snapshots.Repo, 
 	}
 	mutexes := map[string]*sync.Mutex{}
 	var mutexesMu sync.Mutex
+	// Per-test logger so the saveDeps.log Error calls (IPC_TIMEOUT
+	// observability) have a real sink. Writes to a file under tmp; the
+	// test framework cleans the tempdir.
+	logDir := filepath.Join(tmp, "log")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		t.Fatalf("mkdir log: %v", err)
+	}
+	lg, err := logger.New(logDir, logger.LevelError)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+
 	deps := saveDeps{
 		disp:  disp,
 		repo:  repo,
 		store: store,
+		log:   lg,
 		nameLock: func(name string) *sync.Mutex {
 			mutexesMu.Lock()
 			defer mutexesMu.Unlock()
@@ -1089,17 +1103,17 @@ func TestBuildTUIData_UnionsLivePinsAndSidecarPins(t *testing.T) {
 	}
 	if r, ok := byName["live-only"]; !ok {
 		t.Errorf("missing live-only row")
-	} else if !r.Live || !r.Pinned || r.Saved {
+	} else if r.Source != tui.SourceLive || !r.Pinned || r.Snapshot != nil {
 		t.Errorf("live-only row = %+v", r)
 	}
 	if r, ok := byName["sidecar-only"]; !ok {
 		t.Errorf("missing sidecar-only row")
-	} else if r.Live || !r.Pinned || !r.Saved || r.Snapshot == nil {
+	} else if r.Source != tui.SourceSaved || !r.Pinned || r.Snapshot == nil {
 		t.Errorf("sidecar-only row = %+v", r)
 	}
 	if r, ok := byName["both"]; !ok {
 		t.Errorf("missing both row")
-	} else if !r.Live || !r.Pinned || !r.Saved || r.Snapshot == nil {
+	} else if r.Source != tui.SourceLive || !r.Pinned || r.Snapshot == nil {
 		t.Errorf("both row = %+v", r)
 	}
 }
@@ -1190,7 +1204,7 @@ func TestBuildTUIData_SurfacesUnpinnedSnapshots(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing pinned-saved row")
 	}
-	if !r.Saved || !r.Pinned || r.Live || r.Snapshot == nil {
+	if r.Source != tui.SourceSaved || !r.Pinned || r.Snapshot == nil {
 		t.Errorf("pinned-saved row = %+v", r)
 	}
 	if r.Mtime.IsZero() {
@@ -1207,14 +1221,11 @@ func TestBuildTUIData_SurfacesUnpinnedSnapshots(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing unpinned-saved row")
 	}
-	if !r.Saved {
-		t.Errorf("unpinned-saved row Saved = false; want true")
+	if r.Source != tui.SourceLive {
+		t.Errorf("unpinned-saved row Source = %v; want SourceLive (paneID 13 lives there, merging the saved row up)", r.Source)
 	}
 	if r.Pinned {
 		t.Errorf("unpinned-saved row Pinned = true; want false")
-	}
-	if !r.Live {
-		t.Errorf("unpinned-saved row Live = false; want true (paneID 13 lives there)")
 	}
 	if r.Snapshot == nil {
 		t.Errorf("unpinned-saved row Snapshot pointer is nil")
@@ -1233,7 +1244,7 @@ func TestBuildTUIData_SurfacesUnpinnedSnapshots(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing live-only row")
 	}
-	if !r.Live || r.Saved || r.Pinned || r.Snapshot != nil {
+	if r.Source != tui.SourceLive || r.Pinned || r.Snapshot != nil {
 		t.Errorf("live-only row = %+v", r)
 	}
 

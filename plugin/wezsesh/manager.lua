@@ -152,6 +152,17 @@ local function bytes_to_hex(bytes)
 end
 
 function M.ensure_session_key(bin)
+    -- Reuse the existing key if one is already stored in GLOBAL. The
+    -- binary's WEZSESH_HMAC_KEY env is frozen at spawn-time, so any
+    -- regeneration here invalidates every in-flight TUI's HMAC and
+    -- causes silent IPC drops at step (f). apply_to_config can re-run
+    -- (config auto-reload, plugin updates, user calls); only the very
+    -- first call should mint a key.
+    local existing = globals.session_key()
+    if valid_hex_64(existing) then
+        return existing
+    end
+
     -- Step 1: exec the binary's keygen subcommand.
     if type(bin) == "string" and bin ~= "" then
         local ok, stdout, _stderr =
@@ -503,6 +514,22 @@ function M.register_keybinding(config, opts)
     if type(config.keys) ~= "table" then config.keys = {} end
 
     local kb = opts.keybinding or { key = "W", mods = "LEADER|SHIFT" }
+
+    -- Idempotency. apply_to_config can re-run (config auto-reload,
+    -- plugin updates, user code calling it again) and table.insert
+    -- without a presence check would stack N copies of the binding,
+    -- each spawning its own TUI on a single LEADER+SHIFT+W. Scan the
+    -- existing entries and skip if our (key, mods) tuple is already
+    -- registered. We only own that tuple — the user owns the rest of
+    -- config.keys.
+    for _, entry in ipairs(config.keys) do
+        if type(entry) == "table"
+           and entry.key == kb.key
+           and entry.mods == kb.mods
+        then
+            return config
+        end
+    end
 
     table.insert(config.keys, {
         key    = kb.key,

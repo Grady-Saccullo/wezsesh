@@ -131,9 +131,9 @@ func specialKey(name string) tea.KeyPressMsg {
 // ANSI before checking — the gate is on user-input bytes only.
 func TestRenderSanitization(t *testing.T) {
 	rows := []WorkspaceRow{
-		{Name: "\x1b[2J", Saved: true},
-		{Name: "\x07evil\x1b[31m", Saved: true, Tags: []string{"\x1btag", "ok"}},
-		{Name: "normal", Saved: true},
+		{Name: "\x1b[2J", Source: SourceSaved},
+		{Name: "\x07evil\x1b[31m", Source: SourceSaved, Tags: []string{"\x1btag", "ok"}},
+		{Name: "normal", Source: SourceSaved},
 	}
 	m := newTestModel(t, rows, nil)
 
@@ -173,7 +173,7 @@ func TestRenderSanitization_ActiveAndStatus(t *testing.T) {
 // modal overlay (which would not be in the same string).
 func TestQuitMidOp_InlineStatus(t *testing.T) {
 	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 2)}
-	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Saved: true}}, d)
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceSaved}}, d)
 
 	// Trigger a switch — kicks off a dispatch and sets op_in_flight.
 	if _, cmd := m.Update(specialKey("enter")); cmd != nil {
@@ -601,15 +601,16 @@ func TestSortAlphabetical(t *testing.T) {
 }
 
 // TestSortLiveFirst exercises the default sort: pinned > live-active >
-// live > saved-by-mtime > saved.
+// live > saved-by-mtime > saved > external.
 func TestSortLiveFirst(t *testing.T) {
 	now := time.Now()
 	rows := []WorkspaceRow{
-		{Name: "old", Saved: true, Mtime: now.Add(-72 * time.Hour)},
-		{Name: "active", Live: true, Active: true},
-		{Name: "live", Live: true},
-		{Name: "pinned-saved", Saved: true, Pinned: true, Mtime: now.Add(-time.Hour)},
-		{Name: "fresh", Saved: true, Mtime: now.Add(-time.Minute)},
+		{Name: "old", Source: SourceSaved, Mtime: now.Add(-72 * time.Hour)},
+		{Name: "active", Source: SourceLive, Active: true},
+		{Name: "live", Source: SourceLive},
+		{Name: "pinned-saved", Source: SourceSaved, Pinned: true, Mtime: now.Add(-time.Hour)},
+		{Name: "fresh", Source: SourceSaved, Mtime: now.Add(-time.Minute)},
+		{Name: "ext", Source: SourceExternal, CWD: "/tmp/ext"},
 	}
 	cfg := Config{Sort: SortLiveFirst, Keys: DefaultKeyMap()}
 	m := newModel(cfg, Data{Workspaces: rows}, nil)
@@ -617,7 +618,7 @@ func TestSortLiveFirst(t *testing.T) {
 	for _, r := range m.rows {
 		got = append(got, r.Name)
 	}
-	want := []string{"pinned-saved", "active", "live", "fresh", "old"}
+	want := []string{"pinned-saved", "active", "live", "fresh", "old", "ext"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("live_first order mismatch:\n got=%v\nwant=%v", got, want)
 	}
@@ -641,6 +642,236 @@ func TestDispatchErrorClearsInFlight(t *testing.T) {
 	}
 	if !strings.Contains(m.status, "dispatch failed") {
 		t.Fatalf("expected status to surface error; got %q", m.status)
+	}
+	close(d.repliesC)
+}
+
+// TestInitDispatchesListDirs asserts that the model's Init() returns a
+// startup dispatch Cmd whose body fires the list_dirs verb. The reply
+// path is exercised by TestListDirsReplyMergesExternalRows; this test
+// only confirms the wiring at startup time.
+func TestInitDispatchesListDirs(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
+
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatalf("Init() returned nil cmd; expected list_dirs dispatch")
+	}
+	msg := cmd()
+	started, ok := msg.(dispatchStartedMsg)
+	if !ok {
+		t.Fatalf("Init cmd produced %T, want dispatchStartedMsg", msg)
+	}
+	if started.verb != "list_dirs" {
+		t.Fatalf("Init dispatched verb %q, want list_dirs", started.verb)
+	}
+	// Drain the channel so the waitForReply Cmd (if any) terminates.
+	close(d.repliesC)
+
+	// Confirm the dispatcher recorded the call with the empty-query arg
+	// shape.
+	if d.callCount() != 1 {
+		t.Fatalf("expected 1 dispatch call, got %d", d.callCount())
+	}
+	d.mu.Lock()
+	args := d.calls[0].args
+	d.mu.Unlock()
+	if got, _ := args["query"].(string); got != "" {
+		t.Fatalf("list_dirs args.query = %q, want \"\"", got)
+	}
+}
+
+// TestListDirsReplyMergesExternalRows feeds a synthetic list_dirs
+// terminal reply through Update and asserts the dirs are merged into
+// m.rows as SourceExternal entries with their CWD carried through.
+func TestListDirsReplyMergesExternalRows(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 2)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
+
+	// Drive the startup list_dirs dispatch.
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatalf("Init() returned nil cmd")
+	}
+	startedMsg := cmd().(dispatchStartedMsg)
+	m.Update(startedMsg)
+
+	// Synthesise a terminal reply carrying two dirs.
+	reply := ipc.Reply{
+		ID:     "x",
+		Status: "completed",
+		OK:     true,
+		Data: map[string]any{
+			"dirs": []any{
+				map[string]any{"path": "/srv/proj", "name": "proj"},
+				map[string]any{"path": "/home/u/repos/widget", "name": "widget"},
+			},
+		},
+	}
+	m.Update(replyMsg{dispatchID: m.dispatchSeq, reply: reply})
+
+	byName := map[string]WorkspaceRow{}
+	for _, r := range m.rows {
+		byName[r.Name] = r
+	}
+	if len(byName) != 3 {
+		t.Fatalf("expected 3 rows after merge, got %d (%+v)", len(byName), m.rows)
+	}
+	for _, name := range []string{"proj", "widget"} {
+		r, ok := byName[name]
+		if !ok {
+			t.Fatalf("missing external row %q", name)
+		}
+		if r.Source != SourceExternal {
+			t.Errorf("row %q Source = %v, want SourceExternal", name, r.Source)
+		}
+		if r.CWD == "" {
+			t.Errorf("row %q CWD is empty", name)
+		}
+	}
+	close(d.repliesC)
+}
+
+// TestListDirsReplyDedupesAgainstLive: a live row named "foo" plus a
+// list_dirs entry with name "foo" must yield a single row — the live
+// row wins (richer state, real workspace).
+func TestListDirsReplyDedupesAgainstLive(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 2)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "foo", Source: SourceLive}}, d)
+
+	cmd := m.Init()
+	startedMsg := cmd().(dispatchStartedMsg)
+	m.Update(startedMsg)
+
+	reply := ipc.Reply{
+		ID:     "y",
+		Status: "completed",
+		OK:     true,
+		Data: map[string]any{
+			"dirs": []any{
+				map[string]any{"path": "/somewhere/foo", "name": "foo"},
+			},
+		},
+	}
+	m.Update(replyMsg{dispatchID: m.dispatchSeq, reply: reply})
+
+	if len(m.rows) != 1 {
+		t.Fatalf("expected dedupe to yield 1 row, got %d (%+v)", len(m.rows), m.rows)
+	}
+	if m.rows[0].Source != SourceLive {
+		t.Fatalf("live row should have won; got Source=%v", m.rows[0].Source)
+	}
+	if m.rows[0].CWD != "" {
+		t.Fatalf("live row should not have inherited external CWD; got %q", m.rows[0].CWD)
+	}
+	close(d.repliesC)
+}
+
+// TestEnterOnLiveDispatchesSwitchEmptyCWD: pressing Enter while the
+// cursor is on a SourceLive row must dispatch `switch` with cwd:"".
+func TestEnterOnLiveDispatchesSwitchEmptyCWD(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
+
+	_, cmd := m.Update(specialKey("enter"))
+	if cmd == nil {
+		t.Fatalf("expected dispatch cmd from Enter")
+	}
+	_ = cmd()
+
+	if d.callCount() != 1 {
+		t.Fatalf("expected 1 dispatch call, got %d", d.callCount())
+	}
+	d.mu.Lock()
+	call := d.calls[0]
+	d.mu.Unlock()
+	if call.verb != "switch" {
+		t.Fatalf("verb = %q, want switch", call.verb)
+	}
+	if got, _ := call.args["name"].(string); got != "alpha" {
+		t.Fatalf("args.name = %q, want alpha", got)
+	}
+	cwd, present := call.args["cwd"]
+	if !present {
+		t.Fatalf("args.cwd missing — switch must always carry cwd, even when empty")
+	}
+	if got, _ := cwd.(string); got != "" {
+		t.Fatalf("args.cwd = %q, want \"\" for SourceLive", got)
+	}
+	close(d.repliesC)
+}
+
+// TestEnterOnExternalDispatchesSwitchWithCWD: pressing Enter while the
+// cursor is on a SourceExternal row must dispatch `switch` with the
+// row's CWD threaded through, so the plugin's switch handler can
+// rename the active workspace and `cd` the pane.
+func TestEnterOnExternalDispatchesSwitchWithCWD(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
+	m := newTestModel(t, []WorkspaceRow{
+		{Name: "proj", Source: SourceExternal, CWD: "/srv/proj"},
+	}, d)
+
+	_, cmd := m.Update(specialKey("enter"))
+	if cmd == nil {
+		t.Fatalf("expected dispatch cmd from Enter")
+	}
+	_ = cmd()
+
+	if d.callCount() != 1 {
+		t.Fatalf("expected 1 dispatch call, got %d", d.callCount())
+	}
+	d.mu.Lock()
+	call := d.calls[0]
+	d.mu.Unlock()
+	if call.verb != "switch" {
+		t.Fatalf("verb = %q, want switch", call.verb)
+	}
+	if got, _ := call.args["cwd"].(string); got != "/srv/proj" {
+		t.Fatalf("args.cwd = %q, want /srv/proj for SourceExternal", got)
+	}
+	close(d.repliesC)
+}
+
+// TestNewWorkspaceModalDispatchesSwitch: typing a name into the
+// new-workspace modal and hitting Enter must dispatch `switch` (not
+// `new`). The rename trick keeps the active window in place; spawning
+// a fresh window is the CLI-only `wezsesh new` path now.
+func TestNewWorkspaceModalDispatchesSwitch(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
+
+	// Open the modal with `n`.
+	_, _ = m.Update(keyPress('n'))
+	if m.activeModal() != modalNewWorkspace {
+		t.Fatalf("expected modalNewWorkspace, got %v", m.activeModal())
+	}
+
+	// Type a name.
+	for _, r := range "fresh" {
+		_, _ = m.Update(keyPress(r))
+	}
+	// Submit.
+	_, cmd := m.Update(specialKey("enter"))
+	if cmd == nil {
+		t.Fatalf("expected dispatch cmd from modal Enter")
+	}
+	_ = cmd()
+
+	if d.callCount() != 1 {
+		t.Fatalf("expected 1 dispatch call, got %d", d.callCount())
+	}
+	d.mu.Lock()
+	call := d.calls[0]
+	d.mu.Unlock()
+	if call.verb != "switch" {
+		t.Fatalf("modal Enter dispatched %q, want switch", call.verb)
+	}
+	if got, _ := call.args["name"].(string); got != "fresh" {
+		t.Fatalf("args.name = %q, want fresh", got)
+	}
+	if got, _ := call.args["cwd"].(string); got != "" {
+		t.Fatalf("args.cwd = %q, want \"\" for new-workspace modal", got)
 	}
 	close(d.repliesC)
 }

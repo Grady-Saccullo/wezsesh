@@ -415,6 +415,38 @@ function M.tag_in_place(t, root_shape, args_shape)
     return tag_walk(t, merged)
 end
 
+-- Rehydrate `string_or_null` args slots that the JSON parser dropped.
+--
+-- Why this exists: `wezterm.json_parse` (and the spec_helpers shim)
+-- decodes JSON `null` as Lua `nil`, and a Lua table key set to `nil`
+-- is indistinguishable from a missing key. Without rehydration, every
+-- `string_or_null` slot the binary signed as `null` would (a) trip
+-- the tag-walk's "missing required key" raise at step (e), and (b)
+-- even if the walk passed, the sans-hmac re-encode would emit bytes
+-- *without* the slot, breaking HMAC parity with the binary's pre-sign
+-- bytes.
+--
+-- The fix is narrow: only `string_or_null` slots declared in the verb's
+-- args_shape get re-hydrated. Other parser-as-nil values still fall
+-- through to the tag-walker's CANONICAL_SHAPE_MISMATCH so genuine
+-- shape violations stay loud.
+--
+-- Mutates `payload.args` in place; returns nothing. Safe to call with
+-- a missing/non-table args (e.g. envelope-shape failure caught later).
+function M.rehydrate_nullable_args(payload, args_shape)
+    if type(payload) ~= "table" then return end
+    if type(args_shape) ~= "table" then return end
+    local args = payload.args
+    if type(args) ~= "table" then return end
+    for k, sub in pairs(args_shape) do
+        if k ~= "_shape" and sub == "string_or_null" then
+            if args[k] == nil then
+                args[k] = M.NULL
+            end
+        end
+    end
+end
+
 -- Shallow copy minus key k. Preserves metatable so a tagged container
 -- stays tagged after the copy. Used by the HMAC verifier to drop the
 -- `hmac` field before re-encoding for HMAC compute.

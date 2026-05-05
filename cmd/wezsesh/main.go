@@ -46,6 +46,7 @@ import (
 	"github.com/Grady-Saccullo/wezsesh/internal/ipcdispatcher"
 	"github.com/Grady-Saccullo/wezsesh/internal/ipcsock"
 	"github.com/Grady-Saccullo/wezsesh/internal/logger"
+	"github.com/Grady-Saccullo/wezsesh/internal/reqsweep"
 	"github.com/Grady-Saccullo/wezsesh/internal/safefs"
 	"github.com/Grady-Saccullo/wezsesh/internal/snapshots"
 	"github.com/Grady-Saccullo/wezsesh/internal/state"
@@ -234,7 +235,7 @@ func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
 	defer env.cleanup()
 	disp = env.disp
 
-	model := tui.New(buildTUIConfig(env.cfg), env.initialData, env.disp)
+	model := tui.New(buildTUIConfig(env.cfg), env.initialData, env.disp, tui.WithLogger(env.log))
 	prog := tea.NewProgram(model)
 
 	// §8.7 / §12.4 / §14.2: SIGINT / SIGTERM / SIGHUP must drive the
@@ -343,9 +344,14 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error
 		return nil, fmt.Errorf("logger: %w", err)
 	}
 
-	// Sub-step (4): sweep stale reply sockets.
+	// Sub-step (4): sweep stale reply sockets and stale request files.
+	// The req-file sweep mirrors the ipcsock sweep and shares its
+	// best-effort discipline. Threshold is owned by `doctor.ReqOrphanThreshold`.
 	if err := ipcsock.SweepStale(cfg.RuntimeDir, log); err != nil {
 		log.Warn("ipcsock sweep failed", "err", err.Error())
+	}
+	if err := reqsweep.SweepStale(filepath.Join(cfg.RuntimeDir, "req"), log); err != nil {
+		log.Warn("reqsweep failed", "err", err.Error())
 	}
 
 	// Sub-step (5): symlink-refuse top-level managed dirs.
@@ -539,6 +545,9 @@ func buildTUIConfig(c *config.Config) tui.Config {
 			Marked:  c.Markers.Marked,
 			Unsaved: c.Markers.Unsaved,
 			Pinned:  c.Markers.Pinned,
+			// External marker is not yet a config knob; the TUI defaults
+			// to a sensible glyph when this is empty.
+			External: "",
 		},
 		Columns:          cols,
 		NameTruncate:     c.NameTruncate,
@@ -603,7 +612,7 @@ func buildTUIData(ctx context.Context, store *state.Store, repo *snapshots.Repo,
 				snap := e
 				row := tui.WorkspaceRow{
 					Name:     e.Name,
-					Saved:    true,
+					Source:   tui.SourceSaved,
 					Mtime:    e.Mtime,
 					Snapshot: &snap,
 				}
@@ -631,13 +640,13 @@ func buildTUIData(ctx context.Context, store *state.Store, repo *snapshots.Repo,
 		}
 		liveSeen[name] = struct{}{}
 		if idx, ok := seen[name]; ok {
-			d.Workspaces[idx].Live = true
+			d.Workspaces[idx].Source = tui.SourceLive
 			continue
 		}
 		seen[name] = len(d.Workspaces)
 		d.Workspaces = append(d.Workspaces, tui.WorkspaceRow{
-			Name: name,
-			Live: true,
+			Name:   name,
+			Source: tui.SourceLive,
 		})
 	}
 
@@ -654,7 +663,7 @@ func buildTUIData(ctx context.Context, store *state.Store, repo *snapshots.Repo,
 			seen[name] = len(d.Workspaces)
 			d.Workspaces = append(d.Workspaces, tui.WorkspaceRow{
 				Name:   name,
-				Live:   true,
+				Source: tui.SourceLive,
 				Pinned: true,
 			})
 		}
@@ -741,6 +750,7 @@ type saveDeps struct {
 	disp        ipc.Dispatcher
 	repo        *snapshots.Repo
 	store       *state.Store
+	log         *logger.Logger // sync-flushed Warn/Error sink (§17.3)
 	nameLock    func(name string) *sync.Mutex
 	now         func() time.Time
 	lockTimeout time.Duration // §14.1 Phase A budget (5 s prod)
@@ -843,13 +853,23 @@ func runSave(ctx context.Context, deps saveDeps, name, expectedHash string, over
 		return nil, &SaveError{Code: "SAVE_FAILED", Message: err.Error()}
 	}
 	var terminal *ipc.Reply
+	var lastReplyID string // captured from any inbound reply for the timeout-log id slot
 	for terminal == nil {
 		select {
 		case <-ipcCtx.Done():
+			deps.log.Error("ipc save timeout",
+				"id", lastReplyID, "verb", "save", "name", name,
+				"reason", "ctx_done")
 			return nil, &SaveError{Code: "IPC_TIMEOUT"}
 		case reply, ok := <-ch:
 			if !ok {
+				deps.log.Error("ipc save timeout",
+					"id", lastReplyID, "verb", "save", "name", name,
+					"reason", "channel_closed")
 				return nil, &SaveError{Code: "IPC_TIMEOUT"}
+			}
+			if reply.ID != "" {
+				lastReplyID = reply.ID
 			}
 			if reply.Status == "completed" || reply.Status == "partial" {
 				rcopy := reply

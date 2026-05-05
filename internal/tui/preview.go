@@ -35,14 +35,16 @@ func (m *Model) renderPreview() string {
 		sb.WriteString("\n")
 	}
 	statusLine := []string{}
-	if row.Live {
+	switch row.Source {
+	case SourceLive:
 		statusLine = append(statusLine, "live")
+	case SourceSaved:
+		statusLine = append(statusLine, "saved")
+	case SourceExternal:
+		statusLine = append(statusLine, "external")
 	}
 	if row.Active {
 		statusLine = append(statusLine, "active")
-	}
-	if row.Saved {
-		statusLine = append(statusLine, "saved")
 	}
 	if row.Pinned {
 		statusLine = append(statusLine, "pinned")
@@ -51,6 +53,18 @@ func (m *Model) renderPreview() string {
 		sb.WriteString("status: ")
 		sb.WriteString(strings.Join(statusLine, ", "))
 		sb.WriteString("\n")
+	}
+
+	// External rows: surface the provider-supplied CWD as the path.
+	// Selecting one renames the active workspace into row.Name and
+	// `cd`s the active pane into this directory; showing the path here
+	// is the user's only chance to confirm before pressing Enter. Git
+	// status / branch / etc. are v1 future work.
+	if row.Source == SourceExternal && row.CWD != "" {
+		sb.WriteString("path: ")
+		sb.WriteString(nameval.SanitizeForDisplay(row.CWD))
+		sb.WriteString("\n")
+		sb.WriteString("(switching renames the active workspace and cd's the pane)\n")
 	}
 
 	// Mtime.
@@ -74,9 +88,10 @@ func (m *Model) renderPreview() string {
 		sb.WriteString(renderSnapshotState(row.Snapshot.State))
 	}
 
-	// Divergence hint: live + saved with non-zero saved mtime + the row
-	// is currently active (so the user is editing the live copy).
-	if row.Live && row.Saved {
+	// Divergence hint: a live row that also has a snapshot file means
+	// the in-memory state may have drifted from the on-disk snapshot
+	// since the last save.
+	if row.Source == SourceLive && row.Snapshot != nil {
 		sb.WriteString("\nnote: live state may diverge from snapshot\n")
 	}
 

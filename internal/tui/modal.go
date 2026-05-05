@@ -108,9 +108,13 @@ func (m *Model) handleNewWorkspaceKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 			return m, nil
 		}
 		m.closeModal()
-		// §6.4 new args shape: { name: string, cwd: string }. Empty
-		// cwd lets wezterm fall back to the spawning pane's cwd.
-		return m, m.startDispatch("new", name, map[string]any{
+		// New-workspace via the picker takes the rename trick: the
+		// switch verb's "neither live nor saved" branch renames the
+		// active workspace into `name`, keeping the current window in
+		// place. Empty cwd → no `cd` is sent into the pane. The CLI
+		// `wezsesh new` path still dispatches the explicit-spawn
+		// `new` verb when callers want a fresh window.
+		return m, m.startDispatch("switch", name, map[string]any{
 			"name": name,
 			"cwd":  "",
 		})

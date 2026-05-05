@@ -106,6 +106,11 @@ local function reset_state()
     state.wipe_all()
     for k in pairs(global_proxy) do global_proxy[k] = nil end
     global_proxy.wezsesh_session_key = string.rep("a", 64)
+    -- Clear the user-var-changed install gate so each test exercises a
+    -- fresh `M.register` call. Production code relies on this gate to
+    -- avoid stacking handlers on apply_to_config re-runs; tests need to
+    -- bypass it to assert the registration path on every it() block.
+    _G._wezsesh_user_var_listener_installed = nil
 end
 
 local function it(name, fn)
@@ -945,9 +950,9 @@ describe("happy path", function()
 
     it("valid switch payload → dispatch invoked exactly once", function()
         seed_session()
-        -- switch's args shape requires a `name` string. Build the
-        -- payload from scratch so build_payload's signer path picks up
-        -- the `name` key from the start (re-signing after-the-fact would
+        -- switch's args shape requires `name` and `cwd` strings. Build
+        -- the payload from scratch so build_payload's signer path picks
+        -- up the keys from the start (re-signing after-the-fact would
         -- have to invert the in-place tagging build_payload did to the
         -- shared static args object).
         local payload = {
@@ -957,7 +962,10 @@ describe("happy path", function()
             target_window_id = DEFAULT_WINDOW_ID,
             reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
             op               = "switch",
-            args             = canonical_json.object{ name = "main" },
+            args             = canonical_json.object{
+                name = "main",
+                cwd  = "",
+            },
         }
         local sign_shape = { _shape = "object" }
         for k, sub in pairs(canonical_json.ROOT_PAYLOAD_SHAPE) do
@@ -971,6 +979,83 @@ describe("happy path", function()
 
         local calls = drive_handler(payload)
         assert_eq(#calls, 1, "switch didn't dispatch")
+    end)
+
+    it("save with expected_hash=null round-trips through json_parse "
+        .. "(rehydrate_nullable_args)", function()
+        -- Regression: the TUI's first-save path sends
+        -- `expected_hash: canonicaljson.Null`, the binary signs the
+        -- bytes including `"expected_hash":null`, but
+        -- `wezterm.json_parse` decodes JSON `null` as Lua `nil` —
+        -- which is indistinguishable from a missing key. Without the
+        -- rehydrate step before tag_in_place + HMAC re-encode, the
+        -- tag walk raised CANONICAL_SHAPE_MISMATCH (or, if it hadn't,
+        -- the sans-hmac re-encode would have produced bytes WITHOUT
+        -- expected_hash, busting HMAC parity with the binary's pre-
+        -- sign bytes).
+        seed_session()
+
+        -- Build the SAME bytes the binary would sign: a save payload
+        -- with expected_hash = cj.NULL. canonical_json.encode emits
+        -- `"expected_hash":null` for the sentinel.
+        local payload = {
+            v                = 1,
+            id               = valid_ulid(),
+            ts               = 1700000000,
+            target_window_id = DEFAULT_WINDOW_ID,
+            reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
+            op               = "save",
+            args             = canonical_json.object{
+                name          = "work",
+                overwrite     = false,
+                expected_hash = canonical_json.NULL,
+            },
+        }
+        local sign_shape = { _shape = "object" }
+        for k, sub in pairs(canonical_json.ROOT_PAYLOAD_SHAPE) do
+            if k ~= "_shape" and k ~= "hmac" then
+                sign_shape[k] = sub
+            end
+        end
+        canonical_json.tag_in_place(payload, sign_shape,
+            canonical_json.verb_args_shape.save)
+        local pre_sign_bytes = canonical_json.encode(payload)
+        payload.hmac = hmac.compute(pre_sign_bytes, DEFAULT_KEY)
+
+        -- Sanity: the bytes the binary would sign include the JSON
+        -- null literal at the expected_hash slot (this is also the
+        -- shape the spec_helpers json_encode_shim emits for cj.NULL,
+        -- which is what drive_handler will hand to the parser).
+        assert_true(
+            pre_sign_bytes:find('"expected_hash":null', 1, true) ~= nil,
+            "fixture failed: expected_hash:null not in pre-sign bytes")
+
+        local calls = drive_handler(payload)
+
+        -- (1) tag_in_place must not raise after rehydrate.
+        assert_false(log_contains("canonical tag failed"),
+            "tag_in_place raised on parsed-null expected_hash; the "
+            .. "rehydrate step (e) didn't restore the cj.NULL sentinel")
+
+        -- (2) HMAC verify must succeed → silent on the wire is now a
+        -- successful dispatch; the only path to step (i) is HMAC pass.
+        assert_false(log_contains("HMAC mismatch"),
+            "HMAC mismatched after rehydrate — the sans-hmac re-encode "
+            .. "produced bytes != the binary's pre-sign bytes")
+
+        -- (3) dispatch reached step (i) exactly once.
+        assert_eq(#calls, 1,
+            "expected dispatch to fire on parsed-null expected_hash; "
+            .. "did the rehydrate step run before validate / tag_in_place?")
+
+        -- (4) the payload that reached dispatch carries the sentinel,
+        -- not a missing key — downstream verbs reading expected_hash
+        -- can rely on the rehydrated form being present.
+        local dispatched = calls[1][1]
+        local rehydrated = dispatched.args.expected_hash
+        local mt = getmetatable(rehydrated)
+        assert_true(mt and mt.__wezsesh_canonical == "null",
+            "args.expected_hash didn't end up as cj.NULL after rehydrate")
     end)
 
     it("dispatch raise is swallowed (CLAUDE.md invariant 1)", function()

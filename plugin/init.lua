@@ -203,6 +203,60 @@ function M.apply_to_config(config, opts)
             end
         end
 
+        -- Step 4b — Stash the user-supplied directory-row providers.
+        -- Same pattern as resurrect_ref.set: typed runtime accessor,
+        -- linter-enforced ownership boundary
+        -- (`lua-dir-providers-only`), nil-tolerant. Each provider is
+        -- a callable invoked synchronously by the `list_dirs` verb at
+        -- TUI startup.
+        local dir_providers = require("wezsesh.runtime.dir_providers")
+        dir_providers.set(opts.dir_providers or {})
+
+        -- Step 4c — Build the on_pane_restore argv-allowlist policy and
+        -- install it via `on_pane_restore.configure`. Until this runs,
+        -- the module's default policy denies every program (fail-CLOSED),
+        -- so a snapshot restore would land in the cwd-only / newline
+        -- branch — no scrollback, no respawn. The policy union is:
+        --
+        --   default_allowlist  (codegen'd from internal/argvallow/default.txt)
+        --   ∪ basename($SHELL)  (login shell almost always present, but
+        --                        belt-and-braces in case the user's shell
+        --                        was renamed off the default list)
+        --   ∪ opts.resurrect_argv_allowlist  (user additions; passes
+        --                        through to the binary too)
+        --
+        -- The lookup is a hashed set; `allows` returns the boolean
+        -- presence flag. This module is required directly (not through
+        -- a runtime/ accessor) because it owns its own deps state and
+        -- is exempt from the runtime/ ownership rules — same shape as
+        -- `manager.lua` and `ipc.lua`.
+        local on_pane_restore = require("wezsesh.on_pane_restore")
+        local policy_set = {}
+        local default_allowlist = require("wezsesh.default_allowlist")
+        for _, name in ipairs(default_allowlist) do
+            policy_set[name] = true
+        end
+        local shell = os.getenv("SHELL")
+        if type(shell) == "string" and shell ~= "" then
+            local last = shell:match("([^/]+)$") or shell
+            policy_set[last] = true
+        end
+        if type(opts.resurrect_argv_allowlist) == "table" then
+            for _, name in ipairs(opts.resurrect_argv_allowlist) do
+                if type(name) == "string" and name ~= "" then
+                    policy_set[name] = true
+                end
+            end
+        end
+        on_pane_restore.configure({
+            resurrect = function() return resurrect_ref.get() end,
+            policy = {
+                allows = function(prog)
+                    return policy_set[prog] == true
+                end,
+            },
+        })
+
         -- Step 5 — Validate runtime_dir SUN_PATH budget. May raise
         -- WEZSESH_RUNTIME_DIR_TYPE / WEZSESH_SUN_PATH_OVERFLOW. Caught
         -- by the outer pcall.

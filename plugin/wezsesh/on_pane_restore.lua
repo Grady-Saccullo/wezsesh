@@ -1,23 +1,30 @@
 -- on_pane_restore.lua — the wezsesh-installed callback that wraps
--- resurrect's `default_on_pane_restore`. Resurrect calls `cb(pane_tree)`
--- with a single argument; the pane is accessed as `pane_tree.pane`.
+-- resurrect's `tab_state.default_on_pane_restore`. Resurrect calls
+-- `cb(pane_tree)` with a single argument; the pane is accessed as
+-- `pane_tree.pane`.
+--
+-- API path note: resurrect exposes `default_on_pane_restore` at
+-- `resurrect.tab_state.default_on_pane_restore`, NOT at the top level.
+-- An earlier revision called `resurrect.default_on_pane_restore`
+-- directly; the type-check guard hid the typo as a silent no-op, so
+-- every "allowed" pane fell through to "saved process never re-runs."
 --
 -- Decision flow:
 --
 --   1. argv = pane_tree.process and pane_tree.process.argv
 --   2. if not argv or #argv == 0:
---          resurrect.default_on_pane_restore(pane_tree); return
+--          resurrect.tab_state.default_on_pane_restore(pane_tree); return
 --   3. prog = basename(argv[1])
 --   4. if not policy.allows(prog):
 --          send_cwd_or_newline(pane_tree); log; return
 --   5. for each elem in argv: if not bytes_clean(elem) → goto step 4
 --   6. if pane_tree.cwd and not bytes_clean(pane_tree.cwd) → goto step 4
---   7. resurrect.default_on_pane_restore(pane_tree)
+--   7. resurrect.tab_state.default_on_pane_restore(pane_tree)
 --
 -- The entire decision-flow body is `pcall`-wrapped. Fail-CLOSED on any
 -- uncaught error: `pane:send_text("\r\n")` only, log the crash, MUST
--- NOT call `resurrect.default_on_pane_restore` (which would honour the
--- attacker-controlled argv).
+-- NOT call `resurrect.tab_state.default_on_pane_restore` (which would
+-- honour the attacker-controlled argv).
 --
 -- argv indexing: 1-based. `argv[1]` IS the program (NOT the first arg),
 -- opposite of C-convention `argv[0]`.
@@ -161,9 +168,10 @@ local function impl(pane_tree)
     if argv == nil or #argv == 0 then
         local resurrect = resolve_resurrect()
         if resurrect ~= nil
-           and type(resurrect.default_on_pane_restore) == "function"
+           and type(resurrect.tab_state) == "table"
+           and type(resurrect.tab_state.default_on_pane_restore) == "function"
         then
-            resurrect.default_on_pane_restore(pane_tree)
+            resurrect.tab_state.default_on_pane_restore(pane_tree)
         end
         return
     end
@@ -205,9 +213,10 @@ local function impl(pane_tree)
     -- Step 7: resurrect's default (the only success-path call site).
     local resurrect = resolve_resurrect()
     if resurrect ~= nil
-       and type(resurrect.default_on_pane_restore) == "function"
+       and type(resurrect.tab_state) == "table"
+       and type(resurrect.tab_state.default_on_pane_restore) == "function"
     then
-        resurrect.default_on_pane_restore(pane_tree)
+        resurrect.tab_state.default_on_pane_restore(pane_tree)
     end
 end
 
@@ -218,7 +227,7 @@ end
 -- On any uncaught error in impl:
 --   * pane:send_text("\r\n") if pane is available
 --   * log the crash
---   * MUST NOT call resurrect.default_on_pane_restore
+--   * MUST NOT call resurrect.tab_state.default_on_pane_restore
 --
 -- The default-call lives only at step 7 inside impl()'s success path.
 -- A raise from inside impl unwinds before step 7 fires, so the recover

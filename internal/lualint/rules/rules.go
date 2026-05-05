@@ -89,6 +89,8 @@ func AllLuaRules() []lualint.Rule {
 		WeztermGlobalNestedTableRule(),
 		GlobalsOnly(),
 		CryptoVendorOnly(),
+		ProvidersVendorOnly(),
+		DirProvidersOnly(),
 		ResurrectErrorOutsideOwner(),
 		ResurrectRefOnly(),
 		RestoreFinishedBan(),

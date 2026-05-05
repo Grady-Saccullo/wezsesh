@@ -80,8 +80,21 @@ local wezterm_shim = {
     log_error = function(msg)
         log_warns[#log_warns + 1] = "ERR: " .. tostring(msg)
     end,
+    -- `wezterm.action.<Name>(args)` returns a sentinel table the test
+    -- can pattern-match on. Production wezterm builds an opaque
+    -- userdata-shaped Action; the only thing wezsesh ever does with
+    -- it is hand it to `gui_window:perform_action`, so a sentinel
+    -- table is enough for the assertions.
+    action = setmetatable({}, {
+        __index = function(_, name)
+            return function(args)
+                return { _action = name, args = args }
+            end
+        end,
+    }),
     -- mux is a per-test stub. Production wezterm.mux methods used by
-    -- ops.lua: get_workspace_names, set_active_workspace, spawn_window.
+    -- ops.lua: get_workspace_names, set_active_workspace, spawn_window,
+    -- rename_workspace, all_windows.
     mux = setmetatable({}, {
         __index = function(_, k) return mux_stub[k] end,
     }),
@@ -214,8 +227,10 @@ describe("module surface", function()
             "M._reset_deps missing")
     end)
 
-    it("dispatch_table has exactly the five wire verbs", function()
-        local want = { "load", "new", "noop", "save", "switch" }
+    it("dispatch_table has exactly the registered wire verbs", function()
+        local want = {
+            "list_dirs", "load", "new", "noop", "save", "switch",
+        }
         local keys = {}
         for k in pairs(ops.dispatch_table) do keys[#keys + 1] = k end
         table.sort(keys)
@@ -654,11 +669,288 @@ describe("switch", function()
         mux_stub.set_active_workspace = function()
             error("mux gone", 0)
         end
-        local p = fixture_payload("switch", { name = "main" })
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
         ops.dispatch(p, nil, nil)
         local env = decode_envelope()
         assert_eq(env.error.code, "MUX_UNREACHABLE",
             "switch mux-unreachable: error.code wrong")
+    end)
+
+    -- Branch 3 invariant set, post-redesign per wezterm's official
+    -- workspaces model (https://wezterm.org/workspaces.html):
+    --
+    --   "Every MuxWindow is associated with a workspace, which is
+    --    just a label."
+    --   "You can spawn windows into differently named workspaces
+    --    and they won't become visible until you set the active
+    --    workspace to that name."
+    --   "When switching the active workspace, wezterm will swap the
+    --    contents of the GUI windows with the MuxWindows that
+    --    belong to the now-focused workspace."
+    --
+    -- Wezterm hides source-workspace MuxWindows for free when
+    -- `set_active_workspace` flips the active workspace label. The
+    -- implementation MUST NOT try to rename, close, or kill
+    -- source-workspace windows manually — earlier revisions did and
+    -- ended up either re-labelling every source MuxWindow into the
+    -- target (so wezterm correctly showed all of them — Grady's
+    -- "windows aren't closing" bug) or racing the GUI action queue
+    -- via `perform_action(CloseCurrentTab)`.
+    --
+    -- The spec pins:
+    --   * NO rename_workspace call
+    --   * NO mux.spawn_window call from switch.lua itself (resurrect
+    --     does that via spawn_in_workspace)
+    --   * NO `wezterm cli kill-pane` shellouts
+    --   * restore_workspace receives spawn_in_workspace=true with
+    --     no opts.window (so resurrect spawns each window_state at
+    --     its saved cwd)
+    --   * set_active_workspace fires AFTER restore_workspace returns
+    --     (workspace must exist before flipping it active)
+    --   * opts.on_pane_restore is the wezsesh argv-allowlisted
+    --     callback so saved processes / scrollback come back
+    it("saved-not-live: spawn_in_workspace + set_active_workspace; "
+        .. "no rename, no manual window close (wezterm hides source "
+        .. "workspace via the viewport swap)", function()
+        local rename_called = false
+        local rcp_called = false
+        local set_active_with = nil
+        local set_active_call_index = nil
+        local restore_call_index = nil
+        local restore_opts_seen = nil
+        local call_seq = 0
+
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            mux_window = function(_self)
+                return {
+                    window_id = function(_self2) return 1 end,
+                }
+            end,
+        }
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_old, _new)
+            rename_called = true
+        end
+        mux_stub.set_active_workspace = function(n)
+            call_seq = call_seq + 1
+            set_active_call_index = call_seq
+            set_active_with = n
+        end
+        wezterm_shim.executable_dir = "/usr/local/bin"
+        wezterm_shim.run_child_process = function(_argv)
+            rcp_called = true
+            return true, "", ""
+        end
+
+        ops._set_deps{
+            resurrect = {
+                state_manager = {
+                    load_state = function(_name, _kind)
+                        return { window_states = { { dummy = true } } }
+                    end,
+                },
+                workspace_state = {
+                    restore_workspace = function(_state, opts)
+                        call_seq = call_seq + 1
+                        restore_call_index = call_seq
+                        restore_opts_seen = opts
+                    end,
+                },
+            },
+            with_capture = resurrect_error.with_capture,
+        }
+
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
+        ops.dispatch(p, fake_window, nil)
+
+        assert_true(not rename_called,
+            "switch: rename_workspace MUST NOT be called — wezterm's "
+            .. "active-workspace swap handles source-window hiding")
+        assert_true(not rcp_called,
+            "switch: `wezterm cli kill-pane` MUST NOT be called — "
+            .. "source-workspace MuxWindows stay alive (just hidden) "
+            .. "so switching back via set_active_workspace reveals them")
+        assert_true(restore_opts_seen ~= nil,
+            "switch: restore_workspace not called")
+        assert_eq(restore_opts_seen.window, nil,
+            "switch: opts.window MUST be nil so resurrect spawns each "
+            .. "window_state via mux.spawn_window{workspace=target, "
+            .. "cwd=saved}; passing the user's MuxWindow would adopt "
+            .. "the wezsesh TUI tab as the snapshot's first tab")
+        assert_eq(restore_opts_seen.spawn_in_workspace, true,
+            "switch: opts.spawn_in_workspace=true keeps the spawned "
+            .. "MuxWindows under the target workspace label")
+        assert_eq(restore_opts_seen.close_open_tabs, nil,
+            "switch: opts.close_open_tabs MUST be unset — there's no "
+            .. "user window to clear (the snapshot windows are all "
+            .. "fresh spawns)")
+        assert_eq(restore_opts_seen.relative, true,
+            "switch: opts.relative MUST default to true")
+        assert_eq(restore_opts_seen.restore_text, true,
+            "switch: opts.restore_text MUST default to true")
+        assert_true(type(restore_opts_seen.on_pane_restore) == "function",
+            "switch: opts.on_pane_restore must be the wezsesh "
+            .. "argv-allowlisted callback")
+        assert_eq(set_active_with, "main",
+            "switch: set_active_workspace not called with 'main'")
+        assert_true(restore_call_index ~= nil
+            and set_active_call_index ~= nil
+            and restore_call_index < set_active_call_index,
+            "switch: set_active_workspace MUST fire AFTER "
+            .. "restore_workspace; it errors if the workspace doesn't "
+            .. "exist in the mux yet, and the spawn_in_workspace path "
+            .. "is what creates it")
+        local env = decode_envelope(2)
+        assert_eq(env.status, "completed",
+            "switch: terminal status wrong")
+        assert_eq(env.data.active_workspace, "main",
+            "switch: data.active_workspace wrong")
+
+        wezterm_shim.run_child_process = nil
+        wezterm_shim.executable_dir = nil
+    end)
+
+    it("no-op when name == window:active_workspace(); set_active "
+        .. "and rename are NEVER called", function()
+        local set_called = false
+        local rename_called = false
+        mux_stub.get_workspace_names = function()
+            -- Even if `main` shows up live, the no-op branch must
+            -- short-circuit BEFORE the live-switch branch.
+            return { "main" }
+        end
+        mux_stub.set_active_workspace = function(_n)
+            set_called = true
+        end
+        mux_stub.rename_workspace = function(_o, _n)
+            rename_called = true
+        end
+        local fake_window = {
+            active_workspace = function(_self) return "main" end,
+            active_pane = function(_self) return nil end,
+        }
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(not set_called,
+            "switch no-op: set_active_workspace must NOT run")
+        assert_true(not rename_called,
+            "switch no-op: rename_workspace must NOT run")
+        local env = decode_envelope()
+        assert_eq(env.status, "completed",
+            "switch no-op: status wrong")
+        assert_eq(env.data.active_workspace, "main",
+            "switch no-op: data.active_workspace wrong")
+    end)
+
+    it("rename branch: not live, not saved → rename_workspace from "
+        .. "current to target; cwd != '' triggers send_text", function()
+        local rename_calls = {}
+        local sent_text = nil
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(old, new)
+            rename_calls[#rename_calls + 1] = { old = old, new = new }
+        end
+        local fake_pane = {
+            send_text = function(_self, txt) sent_text = txt end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        -- No resurrect plugin wired → get_state_files absent → branch
+        -- 3 declines, branch 4 (rename) fires.
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "newproj",
+            cwd  = "/home/u/proj",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_eq(#rename_calls, 1,
+            "switch rename: expected exactly one rename")
+        assert_eq(rename_calls[1].old, "default",
+            "switch rename: old name wrong")
+        assert_eq(rename_calls[1].new, "newproj",
+            "switch rename: new name wrong")
+        assert_true(sent_text ~= nil,
+            "switch rename: send_text not invoked despite cwd != ''")
+        assert_true(sent_text:find("cd ", 1, true) == 1,
+            "switch rename: send_text did not start with `cd `; got: "
+            .. tostring(sent_text))
+        assert_true(sent_text:find("'/home/u/proj'", 1, true) ~= nil,
+            "switch rename: cwd not single-quoted; got: "
+            .. tostring(sent_text))
+        assert_true(sent_text:sub(-1) == "\r",
+            "switch rename: send_text must end with carriage return")
+        local env = decode_envelope()
+        assert_eq(env.status, "completed",
+            "switch rename: status wrong")
+        assert_eq(env.data.active_workspace, "newproj",
+            "switch rename: data.active_workspace wrong")
+    end)
+
+    it("rename branch: cwd == '' does NOT trigger send_text", function()
+        local sent_text_called = false
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_o, _n) end
+        local fake_pane = {
+            send_text = function(_self, _t) sent_text_called = true end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "newproj",
+            cwd  = "",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(not sent_text_called,
+            "switch rename: send_text fired despite empty cwd")
+    end)
+
+    it("shellescape: a cwd with embedded single quotes is escaped "
+        .. "as '\\''", function()
+        local sent_text = nil
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_o, _n) end
+        local fake_pane = {
+            send_text = function(_self, t) sent_text = t end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "x",
+            cwd  = "/foo'bar",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(sent_text ~= nil, "send_text not invoked")
+        -- Expect the embedded `'` to be escaped as `'\''` so the
+        -- shell sees it literally inside the outer single quotes.
+        assert_true(sent_text:find("'/foo'\\''bar'", 1, true) ~= nil,
+            "shell escape did not survive single-quote injection: "
+            .. tostring(sent_text))
     end)
 end)
 

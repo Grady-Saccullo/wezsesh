@@ -193,21 +193,50 @@ func (m *Model) renderRow(r WorkspaceRow, budget int, isCursor bool) string {
 	return sb.String()
 }
 
-// renderMarker picks the highest-priority marker glyph for a row and
-// returns it styled with the appropriate colour. Priority: pinned >
-// active > live > unsaved > none.
+// renderMarker returns a two-cell marker for the row. Layout:
+//
+//	cell 1 — focus glyph: ▶ (active), or blank.
+//	cell 2 — origin glyph: ● (live), · (saved), * (external), or blank.
+//
+// The two-cell layout means the user always sees `state` as a colour-
+// coded dot even when the focus arrow is on the row, so "this workspace
+// is also live" is no longer hidden behind the active marker. The
+// previous single-cell scheme had Active take priority over Live, which
+// made every live workspace except the active one look like the only
+// live one — the symptom Grady reported as "live workspaces aren't
+// correctly showing."
+//
+// Pinned rows replace the focus column with the pinned glyph (typically
+// the multi-character `[pinned]` token); the origin column still
+// renders so a pinned-and-live row reads as `[pinned] ●`.
 func (m *Model) renderMarker(r WorkspaceRow) string {
+	var focus, origin string
+
 	switch {
 	case r.Pinned && m.cfg.Markers.Pinned != "":
-		return m.styles.markerPinned.Render(m.cfg.Markers.Pinned)
+		focus = m.styles.markerPinned.Render(m.cfg.Markers.Pinned)
 	case r.Active && m.cfg.Markers.Active != "":
-		return m.styles.markerActive.Render(m.cfg.Markers.Active)
-	case r.Live && m.cfg.Markers.Live != "":
-		return m.styles.markerLive.Render(m.cfg.Markers.Live)
-	case !r.Saved && m.cfg.Markers.Unsaved != "":
-		return m.styles.markerUnsaved.Render(m.cfg.Markers.Unsaved)
+		focus = m.styles.markerActive.Render(m.cfg.Markers.Active)
+	default:
+		focus = " "
 	}
-	return " "
+
+	switch {
+	case r.Source == SourceLive && m.cfg.Markers.Live != "":
+		origin = m.styles.markerLive.Render(m.cfg.Markers.Live)
+	case r.Source == SourceSaved:
+		origin = m.styles.markerSaved.Render("·")
+	case r.Source == SourceExternal:
+		glyph := m.cfg.Markers.External
+		if glyph == "" {
+			glyph = "*"
+		}
+		origin = m.styles.markerUnsaved.Render(glyph)
+	default:
+		origin = " "
+	}
+
+	return focus + origin
 }
 
 // renderFooter is the bottom hint line. Three variants: filter mode,

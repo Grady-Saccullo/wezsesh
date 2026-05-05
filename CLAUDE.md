@@ -15,11 +15,19 @@ plugin, sitting between `smart_workspace_switcher.wezterm` and
 | `internal/trust/`, hook execution, `wezsesh trust` CLI | `trust-and-hooks-engineer` |
 | `internal/tui/`, `internal/pathpicker/`, modal flows, key bindings | `bubbletea-tui-engineer` |
 | `plugin/wezsesh/*.lua`, `plugin/init.lua` | `lua-plugin-engineer` |
+| Validating "does the platform already do this?" before touching `wezterm.mux.*` / `wezterm.action.*` / MuxWindow / Pane / GUI window / resurrect APIs | `wezterm-platform-research` (read-only; gates impl) |
 
 When work spans more than one surface, prefer to split it into multiple tasks
 each owned by a single agent. The wire-protocol path is intentionally split:
 Go side is `wire-protocol-guardian`'s, Lua side is too — same agent, both
 sides — because byte-equality requires one mind on both encoders.
+
+`wezterm-platform-research` is a read-only research agent — it never writes
+code. It exists because we have a recurring failure mode where implementation
+agents see a user complaint, design clever Lua/Go code, and ship it without
+checking whether wezterm already handles the case natively. The
+`platform-path-first` invariant below makes consulting it a hard
+prerequisite for any change that touches the wezterm/resurrect Lua API.
 
 ## Plugin layers
 
@@ -76,6 +84,19 @@ the user-facing checklist if you're ever working on a task without an agent.
   `uservar.WriteOSC`.
 - **Concrete `Dispatcher`** lives only in `internal/ipcdispatcher/`. CI lint
   catches direct `ipcsock.StartListener` callsites elsewhere.
+- **Platform path first.** Before introducing custom logic against
+  `wezterm.mux.*`, `wezterm.action.*`, MuxWindow / MuxTab / Pane methods,
+  GUI window methods, workspace identity, pane visibility, scrollback
+  restoration, or anything resurrect.wezterm exposes, route a prompt
+  through the `wezterm-platform-research` agent first. Its verdict gates
+  the implementation. If the verdict is `platform-handles-this`, the
+  implementation MUST use the platform path even if a local custom fix
+  is shorter — wezterm hides non-active-workspace MuxWindows
+  automatically, and we keep relearning the cost of fighting that. The
+  bypass mode is "verdict says `custom-justified` with cited evidence."
+  Same rule applies when delegating to `lua-plugin-engineer`,
+  `resurrect-interop-engineer`, or `wezterm-interop-engineer`: they
+  consult the research agent before designing, not after shipping.
 
 ## Build & test commands
 

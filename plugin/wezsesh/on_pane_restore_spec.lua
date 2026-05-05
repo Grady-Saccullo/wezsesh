@@ -129,12 +129,19 @@ local function make_pane()
 end
 
 -- Fake resurrect with an invocation counter on default_on_pane_restore.
+-- The real resurrect plugin nests this under `tab_state` (NOT at the
+-- top level); keeping the mock shape honest is the only thing that
+-- catches the kind of typo where on_pane_restore.lua used to read
+-- `resurrect.default_on_pane_restore` directly and silently no-op'd
+-- because the type-check guard masked it.
 local function make_resurrect()
     local calls = {}
     return {
-        default_on_pane_restore = function(pane_tree)
-            calls[#calls + 1] = pane_tree
-        end,
+        tab_state = {
+            default_on_pane_restore = function(pane_tree)
+                calls[#calls + 1] = pane_tree
+            end,
+        },
     }, calls
 end
 
