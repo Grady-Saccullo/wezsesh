@@ -264,7 +264,6 @@ local ipc            = require("wezsesh.ipc")
 local state          = require("wezsesh.state")
 local canonical_json = require("wezsesh.canonical_json")
 local hmac           = require("wezsesh.hmac")
-local b64            = require("wezsesh.b64")
 
 -- ────────────────────────────────────────────────────────────────────
 -- minimal busted-shaped harness
@@ -395,9 +394,11 @@ local function build_payload(overrides)
     return payload
 end
 
--- Build a §3.1 pointer envelope. Returns `(b64_pointer_value, payload_json)`.
--- The handler calls `b64.decode(value)` then parses the resulting JSON;
--- the spec's stat/read seams hand back `payload_json` when the handler
+-- Build a §3.1 pointer envelope. Returns `(pointer_value, payload_json)`.
+-- wezterm pre-decodes the base64 form of the OSC value before firing
+-- `user-var-changed`, so the handler receives the raw pointer JSON
+-- directly; the spec mirrors that contract by handing JSON in. The
+-- spec's stat/read seams hand back `payload_json` when the handler
 -- "opens" the pointer's path.
 local function build_pointer(payload, overrides)
     overrides = overrides or {}
@@ -412,7 +413,7 @@ local function build_pointer(payload, overrides)
 
     local pointer_json = json_encode_shim(pointer)
     local payload_json = json_encode_shim(payload)
-    return b64.encode(pointer_json), payload_json, pointer
+    return pointer_json, payload_json, pointer
 end
 
 -- Install a stat seam + a read seam in ipc._deps so the handler walks
@@ -499,7 +500,7 @@ local function drive_handler(payload, pointer_overrides, opts_overrides)
     pointer_overrides = pointer_overrides or {}
     opts_overrides = opts_overrides or {}
 
-    local b64_value, payload_json, pointer =
+    local pointer_value, payload_json, pointer =
         build_pointer(payload, pointer_overrides)
 
     local entries = {
@@ -539,7 +540,7 @@ local function drive_handler(payload, pointer_overrides, opts_overrides)
         opts_overrides.window or fake_window(),
         opts_overrides.pane or fake_pane(),
         ipc.USER_VAR_NAME,
-        b64_value,
+        pointer_value,
         frozen)
 
     restore()
@@ -713,7 +714,7 @@ end)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("Pointer-shape validation (spike-#3)", function()
-    it("malformed base64 → REQ_POINTER_REJECTED, no dispatch", function()
+    it("non-JSON value → REQ_POINTER_REJECTED, no dispatch", function()
         seed_session()
         ipc._set_deps{
             now = function() return 1700000000 end,
@@ -721,7 +722,7 @@ describe("Pointer-shape validation (spike-#3)", function()
         }
         ipc.handle_user_var(fake_window(), fake_pane(),
             ipc.USER_VAR_NAME,
-            "!!!not-valid-base64!!!",
+            "not valid json at all",
             { req_dir_prefix = DEFAULT_REQ_PREFIX,
               target_window_id = DEFAULT_WINDOW_ID })
         assert_true(log_contains("REQ_POINTER_REJECTED"),
@@ -733,13 +734,26 @@ describe("Pointer-shape validation (spike-#3)", function()
         ipc._set_deps{ dispatch = function()
             error("dispatch should not run", 0)
         end }
-        -- valid base64 of "not json"
         ipc.handle_user_var(fake_window(), fake_pane(),
-            ipc.USER_VAR_NAME, b64.encode("not json"),
+            ipc.USER_VAR_NAME, "{not-json",
             { req_dir_prefix = DEFAULT_REQ_PREFIX,
               target_window_id = DEFAULT_WINDOW_ID })
         assert_true(log_contains("REQ_POINTER_REJECTED"),
             "expected REQ_POINTER_REJECTED on JSON parse fail")
+    end)
+
+    it("empty value → REQ_POINTER_REJECTED, no dispatch", function()
+        seed_session()
+        ipc._set_deps{
+            now = function() return 1700000000 end,
+            dispatch = function() error("dispatch should not run", 0) end,
+        }
+        ipc.handle_user_var(fake_window(), fake_pane(),
+            ipc.USER_VAR_NAME, "",
+            { req_dir_prefix = DEFAULT_REQ_PREFIX,
+              target_window_id = DEFAULT_WINDOW_ID })
+        assert_true(log_contains("REQ_POINTER_REJECTED"),
+            "expected REQ_POINTER_REJECTED on empty value")
     end)
 
     it("path outside <runtime_dir>/req/ → REQ_POINTER_REJECTED", function()
@@ -1144,7 +1158,7 @@ describe("happy path", function()
         seed_session()
         local payload = build_payload()
 
-        local b64v, payload_json, pointer = build_pointer(payload)
+        local pointer_value, payload_json, pointer = build_pointer(payload)
         local entries = {
             [pointer.path] = { stat = ok_stat(), body = payload_json },
         }
@@ -1159,7 +1173,7 @@ describe("happy path", function()
         }
 
         local ok = pcall(ipc.handle_user_var,
-            fake_window(), fake_pane(), ipc.USER_VAR_NAME, b64v,
+            fake_window(), fake_pane(), ipc.USER_VAR_NAME, pointer_value,
             { req_dir_prefix = DEFAULT_REQ_PREFIX,
               target_window_id = DEFAULT_WINDOW_ID })
         restore()
@@ -1217,9 +1231,8 @@ describe("M.register (§9.3 / §13.9)", function()
         -- A foreign user_var name is the cheapest path; the body's
         -- early-return shouldn't raise. But if a programmer error
         -- inside handle_user_var raised, the OUTER pcall in register's
-        -- closure must swallow it. We exercise by passing a value that
-        -- exercises the b64 decode path with a non-string (handler
-        -- returns early on b64 nil; no raise).
+        -- closure must swallow it. We exercise by passing a non-string
+        -- value (handler returns early on the type check; no raise).
         local ok = pcall(registered_fn, fake_window(), fake_pane(),
                          "wezsesh_op", 12345)
         assert_true(ok, "register's outer pcall didn't catch raise")

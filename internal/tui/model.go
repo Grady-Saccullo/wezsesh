@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
@@ -256,10 +257,16 @@ type Model struct {
 	// next non-y key dismisses it and lets the model continue.
 	confirmQuit bool
 
-	// modal is the active overlay (rename, tag-edit, confirm-delete).
-	// modalNone in v0.1; the dispatch is wired so T-702 lands the
-	// per-modal handlers without touching the Update spine.
+	// modal is the active overlay (rename, tag-edit, confirm-delete,
+	// new-workspace). modalNone when there's no overlay. Update routes
+	// keys to the modal first when present.
 	modal modalKind
+
+	// textInput backs the active textinput-style modal (currently only
+	// modalNewWorkspace). Nil when no input modal is open. The
+	// constructor lazily allocates so non-modal renders don't pay any
+	// allocation cost.
+	textInput *textinput.Model
 
 	// Dispatch tracking.
 	opInFlight    bool
@@ -299,6 +306,10 @@ type Model struct {
 	// shutdownOnce guards the cancellation that runs at tea.Quit time
 	// so the test goroutines do not panic on a double-cancel.
 	shutdownOnce sync.Once
+
+	// styles is the cached lipgloss style set, built once from
+	// Config.Colors at construction time.
+	styles styles
 }
 
 // New constructs the §8.16 Model. The returned tea.Model is *Model
@@ -334,6 +345,7 @@ func newModel(cfg Config, initial Data, d ipc.Dispatcher) *Model {
 		nowFn:           time.Now,
 		retransmitDelay: 2 * time.Second,
 		timeoutDelay:    5 * time.Second,
+		styles:          buildStyles(cfg.Colors),
 	}
 	return m
 }

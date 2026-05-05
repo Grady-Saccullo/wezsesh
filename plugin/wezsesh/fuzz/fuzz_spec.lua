@@ -384,14 +384,17 @@ local function build_signed_payload(overrides)
     return payload
 end
 
--- Build a §3.1 base64 pointer envelope referring to `path` with `id`.
+-- Build a §3.1 pointer envelope referring to `path` with `id`. wezterm
+-- pre-decodes the base64 form of the SetUserVar OSC value before
+-- firing `user-var-changed`, so the handler receives the raw pointer
+-- JSON directly; the harness mirrors that contract.
 local function build_pointer_envelope(id, path)
     local pointer = {
         v    = 1,
         id   = id,
         path = path,
     }
-    return b64.encode(json_encode_shim(pointer))
+    return json_encode_shim(pointer)
 end
 
 -- Install fs seams + a recording dispatch shim. Returns

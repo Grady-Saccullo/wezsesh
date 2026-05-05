@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Grady-Saccullo/wezsesh/internal/canonicaljson"
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
 	"github.com/Grady-Saccullo/wezsesh/internal/nameval"
 )
@@ -18,6 +19,18 @@ import (
 // dispatchSeq snapshot so an in-flight op's Tick is ignored once the
 // model has moved on (terminal reply, timeout, or manual cancellation).
 var dispatchSeqCounter uint64
+
+// verbExitsOnSuccess returns true for verbs whose successful terminal
+// reply ends the picker's purpose: the user has navigated away and the
+// TUI tab is now in the way. The remaining verbs (`save`, `delete`,
+// `rename`, etc.) keep the picker open so the user can do more work.
+func verbExitsOnSuccess(verb string) bool {
+	switch verb {
+	case "switch", "load", "new":
+		return true
+	}
+	return false
+}
 
 // Init satisfies tea.Model. The picker has no startup side effects;
 // every dispatch is keyed off a user action.
@@ -95,7 +108,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			status = nameval.SanitizeForDisplay(
 				fmt.Sprintf("%s: %s", m.currentVerb, msg.reply.Status))
 		}
+		autoQuit := msg.reply.OK && verbExitsOnSuccess(m.currentVerb)
 		m.finishOp(status)
+		if autoQuit {
+			m.quitting = true
+			m.shutdown()
+			return m, tea.Quit
+		}
 		// Continue reading until the channel closes so we observe the
 		// drain goroutine's clean-up; the dispatcher closes the channel
 		// after a terminal reply.
@@ -145,11 +164,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // modes (nav, filter) plus the inline quit-confirm overlay are the only
 // state machines that touch user input.
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// Future modal overlays (rename, tag-edit, confirm-delete) will
-	// claim the key stream first. v0.1 always reports modalNone.
-	if m.activeModal() != modalNone {
-		// Placeholder routing seam — T-702 lands real modal handlers.
-		return m, nil
+	// Modal overlays claim the key stream first. Currently only
+	// modalNewWorkspace ships a real handler; the others (rename,
+	// tag_edit, confirm_delete) are reserved enums.
+	if m.activeModal() == modalNewWorkspace {
+		return m.handleNewWorkspaceKey(msg)
 	}
 
 	// Quit-mid-op inline confirm overlay. Per §13.8: y → quit; any
@@ -201,7 +220,36 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if action == actLoad {
 			verb = "load"
 		}
-		return m, m.startDispatch(verb, row.Name)
+		return m, m.startDispatch(verb, row.Name, nil)
+	case actSave:
+		// §6.3 save: name = the active workspace (the one whose state
+		// we'd be persisting). Cursor row is irrelevant — wezterm.mux
+		// only exposes the live workspace's state. expected_hash=null
+		// disables the §13.4 race gate; overwrite=true keeps the v0.1
+		// UX simple. The confirm-overwrite modal is v0.2 work.
+		name := m.data.ActiveWorkspace
+		if name == "" {
+			if row, ok := m.rowAt(m.cursor); ok && row.Live {
+				name = row.Name
+			}
+		}
+		if name == "" {
+			m.status = nameval.SanitizeForDisplay(
+				"save: no active workspace to save")
+			return m, nil
+		}
+		return m, m.startDispatch("save", name, map[string]any{
+			"name":          name,
+			"overwrite":     true,
+			"expected_hash": canonicaljson.Null,
+		})
+	case actNew:
+		// §6.4 new: prompts for the workspace name. cwd defaults to
+		// empty so wezterm picks a sensible default (typically the
+		// spawning pane's cwd). A future revision may add a second
+		// input line for cwd selection.
+		m.openNewWorkspaceModal()
+		return m, m.textInput.Focus()
 	case actFilterEnter:
 		m.mode = modeFilter
 		m.filterBuf = ""
@@ -254,7 +302,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // what satisfies the §14.2 / §17.3 gate ("StartListener called from
 // Update synchronously"): the dispatcher's StartListener runs inside
 // Dispatch before the OSC is emitted.
-func (m *Model) startDispatch(verb, target string) tea.Cmd {
+//
+// args is the verb-specific argument map (per `verb_args_shape` on the
+// Lua side). When nil, defaults to `{"name": target}` — the shape that
+// switch and load expect. Save and new pass their own maps.
+func (m *Model) startDispatch(verb, target string, args map[string]any) tea.Cmd {
 	if m.disp == nil {
 		m.status = nameval.SanitizeForDisplay("dispatch unavailable")
 		return nil
@@ -270,8 +322,12 @@ func (m *Model) startDispatch(verb, target string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.dispatchCtx = ctx
 	m.dispatchCancel = cancel
+	m.currentVerb = verb
+	m.currentTarget = target
 	disp := m.disp
-	args := map[string]any{"name": target}
+	if args == nil {
+		args = map[string]any{"name": target}
+	}
 	return func() (resultMsg tea.Msg) {
 		// §16.5 / §17.4: every goroutine in internal/tui (tea.Cmd bodies
 		// run as goroutines per tea.go handleCommands) MUST top-level

@@ -18,6 +18,8 @@ const (
 	actBottom
 	actSwitch
 	actLoad
+	actSave
+	actNew
 	actFilterEnter // entering filter mode (`/`)
 	actFilterExit  // leaving filter mode (Esc)
 	actFilterClear // Ctrl-U
@@ -62,6 +64,10 @@ func matchNavKey(km KeyMap, msg tea.KeyPressMsg) keyAction {
 		return actSwitch
 	case km.Load:
 		return actLoad
+	case km.Save:
+		return actSave
+	case km.New:
+		return actNew
 	case km.Filter:
 		return actFilterEnter
 	case km.Help:

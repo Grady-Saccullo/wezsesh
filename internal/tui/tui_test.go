@@ -17,6 +17,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"go.uber.org/goleak"
 
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
@@ -124,8 +125,10 @@ func specialKey(name string) tea.KeyPressMsg {
 
 // TestRenderSanitization is the §17.3 gate "Render-time sanitization":
 // a snapshot named \x1b[2J must NOT cause the terminal to clear. The
-// view must not contain the raw ESC byte; sanitization replaces it
-// with U+FFFD (3 bytes in UTF-8).
+// view must not contain raw ESC bytes coming from disk-sourced strings;
+// sanitization replaces them with U+FFFD (3 bytes in UTF-8). lipgloss
+// styling injects its own SGR escape sequences, so the test strips
+// ANSI before checking — the gate is on user-input bytes only.
 func TestRenderSanitization(t *testing.T) {
 	rows := []WorkspaceRow{
 		{Name: "\x1b[2J", Saved: true},
@@ -135,18 +138,18 @@ func TestRenderSanitization(t *testing.T) {
 	m := newTestModel(t, rows, nil)
 
 	view := m.View()
-	out := view.Content
-	if strings.ContainsRune(out, 0x1B) {
-		t.Fatalf("rendered view contains raw ESC (0x1B); sanitization failed:\n%q", out)
+	stripped := ansi.Strip(view.Content)
+	if strings.ContainsRune(stripped, 0x1B) {
+		t.Fatalf("rendered view contains raw ESC (0x1B) after stripping ANSI styling; sanitization failed:\n%q", stripped)
 	}
-	if strings.ContainsRune(out, 0x07) {
-		t.Fatalf("rendered view contains raw BEL (0x07); sanitization failed:\n%q", out)
+	if strings.ContainsRune(stripped, 0x07) {
+		t.Fatalf("rendered view contains raw BEL (0x07); sanitization failed:\n%q", stripped)
 	}
-	if !strings.Contains(out, "�") {
-		t.Fatalf("rendered view missing U+FFFD replacement char; expected sanitized output:\n%q", out)
+	if !strings.Contains(stripped, "�") {
+		t.Fatalf("rendered view missing U+FFFD replacement char; expected sanitized output:\n%q", stripped)
 	}
-	if !strings.Contains(out, "normal") {
-		t.Fatalf("rendered view missing benign row; sanitization over-aggressive:\n%q", out)
+	if !strings.Contains(stripped, "normal") {
+		t.Fatalf("rendered view missing benign row; sanitization over-aggressive:\n%q", stripped)
 	}
 }
 
@@ -157,9 +160,9 @@ func TestRenderSanitization_ActiveAndStatus(t *testing.T) {
 	m.data.ActiveWorkspace = "\x1b[2J"
 	m.status = "\x1b[31merror\x07"
 	view := m.View()
-	out := view.Content
-	if strings.ContainsRune(out, 0x1B) || strings.ContainsRune(out, 0x07) {
-		t.Fatalf("header/status leaked control bytes: %q", out)
+	stripped := ansi.Strip(view.Content)
+	if strings.ContainsRune(stripped, 0x1B) || strings.ContainsRune(stripped, 0x07) {
+		t.Fatalf("header/status leaked control bytes after stripping styling: %q", stripped)
 	}
 }
 

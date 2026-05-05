@@ -62,14 +62,51 @@ local function key_str(k)
     return tostring(k)
 end
 
--- Read a top-level GLOBAL bucket as a plain Lua table. mlua returns
--- a fresh deserialised copy on every read; we treat it as plain data
--- and rely on the caller to write the mutated copy back via the bucket
--- write helper below.
+-- Read a top-level GLOBAL bucket as a plain Lua table. mlua's GLOBAL
+-- userdata may return either a deserialised Lua table OR a userdata
+-- proxy depending on the wezterm build; both forms support `pairs(...)`
+-- and direct `b[k]` indexing, but only Lua tables can be mutated and
+-- written back via `wezterm.GLOBAL[name] = bucket` and have the
+-- mutations land. We always rebuild a fresh Lua table by iterating
+-- so subsequent `bucket[k] = v` writes are local-only and the
+-- write_bucket helper persists them atomically.
+-- Direct single-key lookup on a GLOBAL bucket. wezterm's userdata
+-- proxy responds correctly to `b[k]` indexing even though `pairs(b)`
+-- can return a different keyspace than the one the writer used (we
+-- write `b["18"]` but pairs may yield numeric `18` whose value is a
+-- different / nil entry in the proxy). Bypassing pairs for reads
+-- avoids that asymmetry entirely. Returns nil when the bucket is
+-- absent or the key is missing.
+local function lookup_bucket(name, key)
+    local b = wezterm.GLOBAL[name]
+    local bt = type(b)
+    if bt ~= "table" and bt ~= "userdata" then return nil end
+    local ok, v = pcall(function() return b[key] end)
+    if not ok then return nil end
+    return v
+end
+
+-- Read a top-level GLOBAL bucket as a fresh Lua table for the
+-- mutate-then-write-back path. mlua's GLOBAL may return either a
+-- deserialised Lua table OR a userdata proxy depending on the wezterm
+-- build; only Lua tables can be mutated and written back. We rebuild
+-- a fresh Lua table by iterating so subsequent `bucket[k] = v` writes
+-- are local-only and the write_bucket helper persists them atomically.
+-- Keys are coerced to strings: numeric-looking string keys can come
+-- back as integers from pairs() on the userdata proxy.
 local function read_bucket(name)
     local b = wezterm.GLOBAL[name]
-    if type(b) ~= "table" then return {} end
-    return b
+    local bt = type(b)
+    if bt ~= "table" and bt ~= "userdata" then return {} end
+    local out = {}
+    local ok = pcall(function()
+        for k, v in pairs(b) do
+            local sk = (type(k) == "string") and k or tostring(k)
+            out[sk] = v
+        end
+    end)
+    if not ok then return {} end
+    return out
 end
 
 -- Write a bucket back to GLOBAL. The whole table is replaced — the
@@ -116,8 +153,7 @@ end
 
 function M.get_state(pane_id)
     local k = key_str(pane_id)
-    local bucket = read_bucket(KEY_STATE)
-    return decode_struct(bucket[k])
+    return decode_struct(lookup_bucket(KEY_STATE, k))
 end
 
 function M.delete_state(pane_id)
@@ -144,8 +180,7 @@ end
 
 function M.get_request(id)
     local k = key_str(id)
-    local bucket = read_bucket(KEY_REQUESTS)
-    return decode_struct(bucket[k])
+    return decode_struct(lookup_bucket(KEY_REQUESTS, k))
 end
 
 function M.delete_request(id)
@@ -174,8 +209,7 @@ end
 
 function M.is_writing(path)
     local k = key_str(path)
-    local bucket = read_bucket(KEY_WRITING)
-    return bucket[k] == true
+    return lookup_bucket(KEY_WRITING, k) == true
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -190,8 +224,7 @@ end
 
 function M.seen(id)
     local k = key_str(id)
-    local bucket = read_bucket(KEY_SEEN_IDS)
-    return bucket[k] ~= nil
+    return lookup_bucket(KEY_SEEN_IDS, k) ~= nil
 end
 
 function M.mark_seen(id)

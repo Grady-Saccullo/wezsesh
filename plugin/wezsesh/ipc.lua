@@ -10,7 +10,10 @@
 -- target-window scope check, dedup write-back + state record, dispatch.
 --
 -- ┌─ Pre-steps (spike-#3 §3.1 / §C.5) ─────────────────────────────────┐
--- │ (1) b64.decode + wezterm.json_parse → pointer  (pcall)             │
+-- │ (1) wezterm.json_parse → pointer  (pcall). wezterm pre-decodes the │
+-- │     base64 OSC value before firing `user-var-changed`, so `value`  │
+-- │     is already the raw pointer JSON bytes; a second b64 decode     │
+-- │     would always fail.                                             │
 -- │ (2) Pointer field-shape (§9.3.1.A): v == 1, id 26 chars, path with │
 -- │     <runtime_dir>/req/ prefix.                                     │
 -- │ (3) io.open + stat: regular file, mode 0600, owner-self, NOT a     │
@@ -48,7 +51,6 @@
 -- this file.
 
 local wezterm        = require("wezterm")
-local b64            = require("wezsesh.b64")
 local canonical_json = require("wezsesh.canonical_json")
 local ct_eq          = require("wezsesh.ct_eq")
 local hmac           = require("wezsesh.hmac")
@@ -305,14 +307,17 @@ function M.handle_user_var(window, pane, name, value, opts)
     local req_dir_prefix   = opts.req_dir_prefix
     local target_window_id = opts.target_window_id
 
-    -- ── Pre-step (1): b64-decode + JSON-parse → pointer ──────────────
-    local raw = b64.decode(value)
-    if raw == nil then
-        log_warn("REQ_POINTER_REJECTED: base64 decode failed")
+    -- ── Pre-step (1): JSON-parse → pointer ───────────────────────────
+    -- wezterm's SetUserVar parser base64-decodes the OSC value before
+    -- firing `user-var-changed`, so `value` here is already the raw
+    -- pointer JSON bytes. A separate b64.decode would (and historically
+    -- did) double-decode and reject every live pointer.
+    if type(value) ~= "string" or #value == 0 then
+        log_warn("REQ_POINTER_REJECTED: empty or non-string value")
         return
     end
 
-    local ok_p, pointer = pcall(wezterm.json_parse, raw)
+    local ok_p, pointer = pcall(wezterm.json_parse, value)
     if not ok_p or type(pointer) ~= "table" then
         log_warn("REQ_POINTER_REJECTED: pointer JSON parse failed")
         return

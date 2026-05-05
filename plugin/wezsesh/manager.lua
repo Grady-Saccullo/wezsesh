@@ -434,13 +434,37 @@ function M.spawn(window, opts)
     local args = { bin }
     local mode = opts.spawn_mode or "tab"
 
+    -- Record the spawn so the §9.3 ipc handler's step (a) recognises the
+    -- binary's pane and accepts its OSCs. Without this, every fresh OSC
+    -- silently drops at `state.get_state(pane_id) == nil` and the binary
+    -- observes IPC_TIMEOUT.
+    local function record_spawn(spawned_pane, spawned_window)
+        if spawned_pane == nil then return end
+        local ok_pid, pid = pcall(function() return spawned_pane:pane_id() end)
+        if not ok_pid or type(pid) ~= "number" then return end
+        local wid = -1
+        if spawned_window ~= nil then
+            local ok_w, w = pcall(function()
+                return spawned_window:window_id()
+            end)
+            if ok_w and type(w) == "number" then wid = w end
+        end
+        local state = require("wezsesh.state")
+        state.set_state(pid, {
+            target_window_id = wid,
+            spawned_at       = os.time(),
+        })
+    end
+
     if mode == "window" then
-        return wezterm.mux.spawn_window {
+        local tab, pane, mux_win = wezterm.mux.spawn_window {
             args = args,
             set_environment_variables = env,
             cwd = opts.cwd,
             workspace = opts.workspace,
         }
+        record_spawn(pane, mux_win)
+        return tab, pane, mux_win
     end
 
     -- "tab" (default). Per Appendix A: `current_window:spawn_tab {...}`,
@@ -451,11 +475,13 @@ function M.spawn(window, opts)
         return nil, "WEZSESH_SPAWN_NO_WINDOW"
     end
     local mux_window = window:mux_window()
-    return mux_window:spawn_tab {
+    local tab, pane, mux_win = mux_window:spawn_tab {
         args = args,
         set_environment_variables = env,
         cwd = opts.cwd,
     }
+    record_spawn(pane, mux_win or mux_window)
+    return tab, pane, mux_win
 end
 
 -- ────────────────────────────────────────────────────────────────────

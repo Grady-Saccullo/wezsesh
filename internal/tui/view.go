@@ -28,14 +28,9 @@ func (m *Model) View() tea.View {
 	sb.WriteString("\n")
 
 	// Body: split between picker and (optional) preview pane.
-	left := m.renderPicker()
+	left := m.renderPickerPanel()
 	if m.previewShown {
-		preview := m.renderPreview()
-		// JoinHorizontal handles cell-aware width; the picker takes
-		// (1 - PreviewWidth) of the terminal width, preview takes the
-		// remainder. lipgloss is the only consumer of styled output;
-		// the disk-sourced strings have already been sanitised in
-		// sanitiseRows so we can hand them straight in.
+		preview := m.renderPreviewPanel()
 		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", preview))
 	} else {
 		sb.WriteString(left)
@@ -45,16 +40,76 @@ func (m *Model) View() tea.View {
 	sb.WriteString("\n")
 	sb.WriteString(m.renderFooter())
 
+	// Modal overlay (rendered after the footer so it sits at the bottom
+	// of the visible frame; v0.1's modal is a single-line input and
+	// fits in the footer row).
+	if m.activeModal() != modalNone {
+		sb.WriteString("\n")
+		sb.WriteString(m.renderModal())
+	}
+
 	return tea.NewView(sb.String())
 }
 
-// renderHeader is the one-line picker title + active workspace marker.
+// renderHeader is the top status bar: program name, active workspace
+// name (emphasised), and a muted total count.
 func (m *Model) renderHeader() string {
 	active := nameval.SanitizeForDisplay(m.data.ActiveWorkspace)
 	if active == "" {
 		active = "—"
 	}
-	return fmt.Sprintf("wezsesh · active=%s · %d workspaces", active, len(m.rows))
+	prefix := m.styles.header.Render("wezsesh · active=")
+	name := m.styles.headerActive.Render(active)
+	count := m.styles.headerCount.Render(
+		fmt.Sprintf(" · %d workspaces", len(m.rows)))
+	return prefix + name + count
+}
+
+// renderPickerPanel wraps the picker rows in a rounded panel border with
+// a "Workspaces" title.
+func (m *Model) renderPickerPanel() string {
+	body := m.renderPicker()
+	width := m.pickerWidth()
+	// Reserve 2 cells for the border. Padding is part of the style.
+	inner := width - 2
+	if inner < 10 {
+		inner = 10
+	}
+	style := m.styles.picker.Width(inner)
+	title := m.styles.pickerTitle.Render("Workspaces")
+	return panelWithTitle(style, title, body)
+}
+
+// renderPreviewPanel wraps the preview content in a panel titled with
+// the cursor row's name.
+func (m *Model) renderPreviewPanel() string {
+	body := m.renderPreview()
+	width := m.previewBudget()
+	inner := width - 2
+	if inner < 10 {
+		inner = 10
+	}
+	style := m.styles.preview.Width(inner)
+
+	title := "preview"
+	if row, ok := m.rowAt(m.cursor); ok && row.Name != "" {
+		title = nameval.SanitizeForDisplay(row.Name)
+	}
+	titleStyled := m.styles.previewTitle.Render(title)
+	return panelWithTitle(style, titleStyled, body)
+}
+
+// panelWithTitle renders `body` inside a bordered `style` panel and
+// stitches `title` into the top border. lipgloss exposes BorderTop in
+// v2 but no direct "embed text in border" helper, so we render the
+// border first then overlay the title at column 2.
+//
+// The title is rendered above the body inside the bordered region for
+// simplicity; the lipgloss-native top-border-text approach lands when
+// the V1 Phase 13 bubbles.list / lipgloss.Border integration is in.
+func panelWithTitle(style lipgloss.Style, title, body string) string {
+	combined := title + "\n" + body
+	return style.Render(combined)
 }
 
 // renderPicker renders the workspace list. The cursor row is prefixed
@@ -62,18 +117,29 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderPicker() string {
 	visible := m.visibleRows()
 	if len(visible) == 0 {
-		return "(no workspaces)"
+		return m.styles.rowMeta.Render("(no workspaces)")
 	}
 	var sb strings.Builder
-	width := m.pickerWidth()
+	width := m.pickerWidth() - 4 // reserve panel border + padding
+	if width < 10 {
+		width = 10
+	}
 	for vi, ri := range visible {
 		row := m.rows[ri]
+		isCursor := vi == m.cursor
 		caret := "  "
-		if vi == m.cursor {
+		if isCursor {
 			caret = "› "
 		}
-		sb.WriteString(caret)
-		sb.WriteString(m.renderRow(row, width-runewidth.StringWidth(caret)))
+		line := caret + m.renderRow(row, width-runewidth.StringWidth(caret), isCursor)
+		if isCursor {
+			// Pad the line to the panel width so the background
+			// highlight covers the row edge-to-edge. lipgloss
+			// styles measure cell-aware width.
+			line = padToWidth(line, width)
+			line = m.styles.rowCursor.Render(line)
+		}
+		sb.WriteString(line)
 		if vi+1 < len(visible) {
 			sb.WriteString("\n")
 		}
@@ -81,56 +147,67 @@ func (m *Model) renderPicker() string {
 	return sb.String()
 }
 
-// renderRow lays out one picker row. Markers + name + age + tags. The
-// name is middle-truncated to the available width budget; markers are
-// fixed-width single cells. Disk-sourced strings have already been
-// sanitised at construction; this function does no sanitisation.
-func (m *Model) renderRow(r WorkspaceRow, budget int) string {
+// renderRow lays out one picker row: marker + name + age + tags. The
+// name is middle-truncated; markers are colour-styled per role.
+// `isCursor` toggles bold / focus styling on the parts that should
+// emphasise when the cursor is on this row.
+func (m *Model) renderRow(r WorkspaceRow, budget int, isCursor bool) string {
 	if budget < 8 {
 		budget = 8
 	}
 	var sb strings.Builder
-	// Markers. Each marker contributes its own configured width so the
-	// renderer remains stable across configurations.
-	if r.Pinned && m.cfg.Markers.Pinned != "" {
-		sb.WriteString(m.cfg.Markers.Pinned)
-	} else if r.Active && m.cfg.Markers.Active != "" {
-		sb.WriteString(m.cfg.Markers.Active)
-	} else if r.Live && m.cfg.Markers.Live != "" {
-		sb.WriteString(m.cfg.Markers.Live)
-	} else if !r.Saved && m.cfg.Markers.Unsaved != "" {
-		sb.WriteString(m.cfg.Markers.Unsaved)
-	} else {
-		sb.WriteByte(' ')
-	}
+	// Markers — coloured per role.
+	sb.WriteString(m.renderMarker(r))
 	sb.WriteByte(' ')
 
-	// Name (middle-truncated to budget − markers − age − tags reserve).
-	// reserve covers " · 99d" age (≤8 cells) plus a short trailing tag
-	// string (~10 cells); see §15.5 row layout. Tags are not clamped
-	// here in v0.1, so a row carrying many long tags can overrun the
-	// budget — the picker still renders cleanly because the terminal
-	// wraps; tag-clamping is a v0.2 candidate.
+	// Name (middle-truncated to budget − markers − reserve for age + tags).
 	const reserve = 18
 	nameBudget := budget - reserve
 	if nameBudget < 4 {
 		nameBudget = 4
 	}
-	sb.WriteString(nameval.TruncateMiddle(r.Name, nameBudget))
-
-	// Age. m.now() is the test seam; production routes through time.Now
-	// and preview/picker share the clock so snapshot-render tests can
-	// pin a fixed instant.
-	if !r.Mtime.IsZero() {
-		sb.WriteString(" · ")
-		sb.WriteString(humanAge(m.now().Sub(r.Mtime)))
+	name := nameval.TruncateMiddle(r.Name, nameBudget)
+	if isCursor {
+		sb.WriteString(m.styles.rowNameCursor.Render(name))
+	} else {
+		sb.WriteString(m.styles.rowName.Render(name))
 	}
-	// Tags.
+
+	// Age and tags rendered as muted metadata.
+	var meta strings.Builder
+	if !r.Mtime.IsZero() {
+		meta.WriteString(" · ")
+		meta.WriteString(humanAge(m.now().Sub(r.Mtime)))
+	}
 	if len(r.Tags) > 0 {
-		sb.WriteString(" #")
-		sb.WriteString(strings.Join(r.Tags, " #"))
+		meta.WriteString(" #")
+		meta.WriteString(strings.Join(r.Tags, " #"))
+	}
+	if meta.Len() > 0 {
+		if isCursor {
+			sb.WriteString(m.styles.rowMetaCursor.Render(meta.String()))
+		} else {
+			sb.WriteString(m.styles.rowMeta.Render(meta.String()))
+		}
 	}
 	return sb.String()
+}
+
+// renderMarker picks the highest-priority marker glyph for a row and
+// returns it styled with the appropriate colour. Priority: pinned >
+// active > live > unsaved > none.
+func (m *Model) renderMarker(r WorkspaceRow) string {
+	switch {
+	case r.Pinned && m.cfg.Markers.Pinned != "":
+		return m.styles.markerPinned.Render(m.cfg.Markers.Pinned)
+	case r.Active && m.cfg.Markers.Active != "":
+		return m.styles.markerActive.Render(m.cfg.Markers.Active)
+	case r.Live && m.cfg.Markers.Live != "":
+		return m.styles.markerLive.Render(m.cfg.Markers.Live)
+	case !r.Saved && m.cfg.Markers.Unsaved != "":
+		return m.styles.markerUnsaved.Render(m.cfg.Markers.Unsaved)
+	}
+	return " "
 }
 
 // renderFooter is the bottom hint line. Three variants: filter mode,
@@ -138,20 +215,73 @@ func (m *Model) renderRow(r WorkspaceRow, budget int) string {
 // (NOT a modal).
 func (m *Model) renderFooter() string {
 	if m.confirmQuit {
-		return nameval.SanitizeForDisplay(m.status)
+		return m.styles.statusError.Render(
+			nameval.SanitizeForDisplay(m.status))
 	}
 	if m.mode == modeFilter {
-		// "/<buf>_" makes the filter visible without a separate widget.
-		return fmt.Sprintf("/%s_   [esc=cancel  enter=switch  ctrl-u=clear]",
-			nameval.SanitizeForDisplay(m.filterBuf))
+		buf := nameval.SanitizeForDisplay(m.filterBuf)
+		left := m.styles.footerKey.Render("/") +
+			m.styles.footerLabel.Render(buf+"_")
+		hints := m.renderKeyHint("esc", "cancel") + "  " +
+			m.renderKeyHint("enter", "switch") + "  " +
+			m.renderKeyHint("ctrl-u", "clear")
+		return left + "   " + hints
 	}
 	keys := m.cfg.Keys
-	hint := fmt.Sprintf("[%s=switch  %s=load  %s=filter  %s=quit]",
-		keys.Switch, keys.Load, keys.Filter, keys.Quit)
+	hint := m.renderKeyHint(keys.Switch, "switch") + "  " +
+		m.renderKeyHint(keys.Load, "load") + "  " +
+		m.renderKeyHint(keys.Save, "save") + "  " +
+		m.renderKeyHint(keys.New, "new") + "  " +
+		m.renderKeyHint(keys.Filter, "filter") + "  " +
+		m.renderKeyHint(keys.Quit, "quit")
 	if m.status != "" {
-		return nameval.SanitizeForDisplay(m.status) + "  " + hint
+		statusStyle := m.styles.status
+		if strings.Contains(m.status, "IPC_TIMEOUT") ||
+			strings.Contains(m.status, "failed") {
+			statusStyle = m.styles.statusError
+		}
+		statusLine := statusStyle.Render(
+			nameval.SanitizeForDisplay(m.status))
+		return statusLine + "  " + hint
 	}
 	return hint
+}
+
+// renderKeyHint formats a single "[<key>=<label>]"-style hint where the
+// key glyph is in the accent colour and the label is muted.
+func (m *Model) renderKeyHint(key, label string) string {
+	if key == "" {
+		return ""
+	}
+	return m.styles.footerSep.Render("[") +
+		m.styles.footerKey.Render(key) +
+		m.styles.footerSep.Render("=") +
+		m.styles.footerLabel.Render(label) +
+		m.styles.footerSep.Render("]")
+}
+
+// renderModal is the overlay block for the active modal (currently
+// only modalNewWorkspace). The modal sits below the footer and shows
+// a one-line text input plus a hint row.
+func (m *Model) renderModal() string {
+	if m.activeModal() != modalNewWorkspace || m.textInput == nil {
+		return ""
+	}
+	width := m.pickerWidth()
+	if m.previewShown {
+		// Prefer a centred modal over the full row when both panes
+		// are visible.
+		width = m.pickerWidth() + m.previewBudget() + 1
+	}
+	inner := width - 4
+	if inner < 24 {
+		inner = 24
+	}
+	title := m.styles.modalTitle.Render("New workspace")
+	body := m.textInput.View()
+	hint := m.styles.modalHint.Render("enter=create  esc=cancel")
+	stack := lipgloss.JoinVertical(lipgloss.Left, title, body, hint)
+	return m.styles.modalBox.Width(inner).Render(stack)
 }
 
 // pickerWidth is the column budget the picker should consume. Honours
@@ -171,6 +301,17 @@ func (m *Model) pickerWidth() int {
 		pw = 20
 	}
 	return pw
+}
+
+// padToWidth right-pads `s` with spaces so its visible cell-width
+// equals `w`. Cell-aware via runewidth so wide CJK glyphs are accounted
+// for. If `s` already exceeds `w`, the original string is returned.
+func padToWidth(s string, w int) string {
+	cur := runewidth.StringWidth(s)
+	if cur >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-cur)
 }
 
 // humanAge renders a duration in compact form (e.g. "5m", "3h", "2d").

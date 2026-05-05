@@ -1,5 +1,12 @@
 package tui
 
+import (
+	"strings"
+
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+)
+
 // modal.go is the seat for any future overlay modals (rename, tag-edit,
 // confirm-delete, etc.). T-701 ships the picker frame plus the inline
 // quit-confirm; the dedicated modals land with the verbs in T-702+.
@@ -31,6 +38,7 @@ const (
 	modalRename
 	modalTagEdit
 	modalConfirmDelete
+	modalNewWorkspace
 )
 
 // String makes modalKind play nicely with fmt and any future logging.
@@ -42,6 +50,8 @@ func (m modalKind) String() string {
 		return "tag_edit"
 	case modalConfirmDelete:
 		return "confirm_delete"
+	case modalNewWorkspace:
+		return "new_workspace"
 	default:
 		return "none"
 	}
@@ -50,3 +60,65 @@ func (m modalKind) String() string {
 // activeModal returns the model's active modal kind. T-702 will route
 // keys here; the v0.1 picker always returns modalNone.
 func (m *Model) activeModal() modalKind { return m.modal }
+
+// openNewWorkspaceModal lazy-allocates a textinput.Model and switches
+// the picker into the new-workspace modal. Filter mode is dismissed
+// per the modal-discipline rule (filter and modals are mutually
+// exclusive).
+func (m *Model) openNewWorkspaceModal() {
+	if m.mode == modeFilter {
+		m.mode = modeNav
+		m.filterBuf = ""
+		m.refreshFilter()
+	}
+	if m.textInput == nil {
+		ti := textinput.New()
+		m.textInput = &ti
+	}
+	m.textInput.Reset()
+	m.textInput.Placeholder = "workspace name"
+	m.textInput.Prompt = "› "
+	m.textInput.CharLimit = 64
+	m.modal = modalNewWorkspace
+	m.status = ""
+}
+
+// closeModal clears the active modal and (if a textinput is open)
+// blurs it. Safe to call when no modal is open.
+func (m *Model) closeModal() {
+	m.modal = modalNone
+	if m.textInput != nil {
+		m.textInput.Blur()
+	}
+}
+
+// handleNewWorkspaceKey routes a key press while the new-workspace
+// modal is open. Esc cancels; Enter submits (must be non-empty);
+// every other key is forwarded to the textinput's Update.
+func (m *Model) handleNewWorkspaceKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeModal()
+		return m, nil
+	case "enter":
+		name := strings.TrimSpace(m.textInput.Value())
+		if name == "" {
+			// No-op: keep the modal open until the user types or
+			// cancels.
+			return m, nil
+		}
+		m.closeModal()
+		// §6.4 new args shape: { name: string, cwd: string }. Empty
+		// cwd lets wezterm fall back to the spawning pane's cwd.
+		return m, m.startDispatch("new", name, map[string]any{
+			"name": name,
+			"cwd":  "",
+		})
+	}
+	if m.textInput == nil {
+		return m, nil
+	}
+	ti, cmd := m.textInput.Update(msg)
+	m.textInput = &ti
+	return m, cmd
+}

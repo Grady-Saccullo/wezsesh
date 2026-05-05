@@ -231,6 +231,7 @@ function M.apply_to_config(config, opts)
         -- Step 6 — Resolve the binary's absolute path and ensure the
         -- §5.2 session key is populated in `wezterm.GLOBAL`.
         local bin = manager.resolve_binary(opts)
+        wezterm.GLOBAL.wezsesh_bin_path = bin
         local key, key_err = manager.ensure_session_key(bin)
         if key == nil then
             error(key_err

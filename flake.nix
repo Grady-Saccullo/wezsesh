@@ -233,7 +233,7 @@
           # When go.mod / go.sum first land, `nix build` will fail with the
           # expected hash — copy it in here. Subsequent dep changes require
           # re-pinning. Leave as `lib.fakeHash` to force re-derivation.
-          vendorHash = "sha256-p499YMPiYssjoCzgILh7sUQ0e8QPQsI2nC85h95gWUg=";
+          vendorHash = "sha256-C9eYOouZ2mCw6lJ8WtV5z/hDJZU3K4g2C9XuOmKm21Y=";
 
           subPackages = ["cmd/wezsesh"];
 
