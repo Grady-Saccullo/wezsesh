@@ -28,9 +28,8 @@ Before pushing a tag, confirm each of the following:
 ## Bumping the plugin version
 
 The plugin carries its own version string, surfaced as
-`WEZSESH_PLUGIN_VERSION` over the wire (Appendix A of `docs/design.md`)
-and used by §10.7. It is duplicated in two files for layering reasons,
-and the duplication is asserted at runtime:
+`WEZSESH_PLUGIN_VERSION` over the wire. It is duplicated in two files
+for layering reasons, and the duplication is asserted at runtime:
 
 - `plugin/init.lua` → `M.VERSION = "X.Y.Z"`
 - `plugin/wezsesh/manager.lua` → `M.VERSION = "X.Y.Z"`

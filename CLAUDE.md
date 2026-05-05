@@ -4,32 +4,6 @@ Project: **wezsesh** — wezterm session manager TUI. Go bubbletea binary + Lua
 plugin, sitting between `smart_workspace_switcher.wezterm` and
 `resurrect.wezterm`. Single-user host threat model.
 
-## Build state
-
-Pre-code. Iteration backlog lives in [`PROJECT.md`](PROJECT.md). Advance the
-build with `/next-task` (see `.claude/skills/next-task/SKILL.md`); do NOT
-hand-roll tasks unless the user explicitly asks. The skill keeps state in
-`PROJECT.md` so any fresh session can resume.
-
-## Spec sources
-
-- `docs/design.md` — normative technical spec (contracts, APIs, schemas, state
-  machines). § refs in `PROJECT.md` and tasks point here. § numbers may drift;
-  prefer matching by heading text.
-- `docs/prd.md` — rationale + UX. Cite as `(P §x.y)`.
-- `docs/issues/{1,2,3}.md` — spike findings that drove the most non-obvious
-  parts of the design. Read these whenever a task names "(spike-#N)":
-  - **#1** — IPC integration spike. mlua sandbox constraints, `wezterm.GLOBAL`
-    value-shape rule, `apply_to_config` cache-bust, PTY-multiplexer caveat,
-    HMAC fixture correction.
-  - **#2** — `resurrect.error` capture. Why `pcall(state_manager.save_state)`
-    is empirically broken; the dual-path detection scheme (pcall + capture).
-  - **#3** — Sidecar forward path. Why the OSC carries only a ≤256 B pointer
-    and the canonical-JSON request lives on disk; the renderer-OSC interleave
-    race that motivated it.
-- The 8 specialist agents under `.claude/agents/` own per-area invariants — see
-  the routing table below.
-
 ## Agent routing table
 
 | Surface | Owner agent |
@@ -41,7 +15,6 @@ hand-roll tasks unless the user explicitly asks. The skill keeps state in
 | `internal/trust/`, hook execution, `wezsesh trust` CLI | `trust-and-hooks-engineer` |
 | `internal/tui/`, `internal/pathpicker/`, modal flows, key bindings | `bubbletea-tui-engineer` |
 | `plugin/wezsesh/*.lua`, `plugin/init.lua` | `lua-plugin-engineer` |
-| Read-only post-implementation audit | `design-conformance-reviewer` |
 
 When work spans more than one surface, prefer to split it into multiple tasks
 each owned by a single agent. The wire-protocol path is intentionally split:
@@ -54,8 +27,8 @@ These do not change. Implementation agents already encode them; this list is
 the user-facing checklist if you're ever working on a task without an agent.
 
 - **Wire protocol byte-equality.** Go and Lua canonical-JSON encoders must
-  produce identical bytes for every shape in the §17.1 corpus. HMAC field-removal
-  sequence intact (§4.3); no `hmac=""` set-then-encode.
+  produce identical bytes for every shape in the canonical-JSON corpus. HMAC
+  field-removal sequence intact; no `hmac=""` set-then-encode.
 - **Filesystem.** Every disk write under wezsesh-managed dirs (state, data,
   snapshot, runtime) goes through `safefs.AtomicWriteFile`. Every path-touch
   goes through `safefs.Enforce(...)`. `unix.F_OFD_SETLK` only inside
@@ -76,16 +49,16 @@ the user-facing checklist if you're ever working on a task without an agent.
   separator is a CVE.
 - **Default fail-CLOSED.** Project + snapshot sidecars; trust missing → no exec.
   Hook crash → `pane:send_text("\r\n")` only; NEVER `default_on_pane_restore`.
-- **OSC ≤ 256 B.** Forward path uses sidecar request file (spike #3). The OSC
-  carries a pointer only; oversized OSCs re-open the renderer race and are
-  rejected by `uservar.WriteOSC`.
+- **OSC ≤ 256 B.** Forward path uses a sidecar request file. The OSC carries a
+  pointer only; oversized OSCs re-open the renderer race and are rejected by
+  `uservar.WriteOSC`.
 - **Concrete `Dispatcher`** lives only in `internal/ipcdispatcher/`. CI lint
   catches direct `ipcsock.StartListener` callsites elsewhere.
 
 ## Build & test commands
 
-These pin the canonical commands. The CI matrix in §16.4 is the source of
-truth; use these for local parity.
+These pin the canonical commands. The CI matrix is the source of truth; use
+these for local parity.
 
 ```bash
 # Verify modules
@@ -103,7 +76,7 @@ LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...
 # Vendored crypto integrity
 sha256sum -c plugin/wezsesh/vendor/SOURCES.lock
 
-# Custom Lua lints (T-005 onward)
+# Custom Lua lints
 go run ./cmd/lualint plugin/
 
 # Reproducible release build
@@ -114,14 +87,8 @@ go build -trimpath -ldflags="-s -w -X main.version=v$(git describe --tags --alwa
 
 - **VCS is jj-colocated.** `.jj/` + `.git/` side by side. Use `jj` for commits,
   diffs, history (`jj log`, `jj diff`, `jj describe`, `jj commit`). Git tools
-  (CI, IDE, `gh pr`) see the colocated `.git/` and work normally. Don't
-  invoke `git commit` / `git add` for build work — `/next-task` uses jj's
-  auto-snapshot model and a diff-allowlist check instead of explicit staging.
-- **One commit per task.** Format: `<type>(<scope>): T-XXX <title>`.
+  (CI, IDE, `gh pr`) see the colocated `.git/` and work normally.
 - **Don't push from agents.** Pushes are user-initiated (`jj git push -b main`).
-- **Don't edit `docs/design.md` or `docs/prd.md` from build tasks.** Spec gaps
-  queue as a `T-DOC-NNN` task in PROJECT.md (auto-handled by `/next-task`'s
-  spec-drift logic; see the skill).
 - **Comments are rare.** Default to none; add only when the WHY is non-obvious
   (a hidden invariant, a workaround for a specific bug). The codebase already
   cites § headings; redundant `// per §X` comments are noise.

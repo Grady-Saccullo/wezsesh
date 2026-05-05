@@ -132,8 +132,7 @@ func TestSubcmdDoctor_ConfigLoadFails(t *testing.T) {
 
 // TestSubcmdDoctor_JSONParseable asserts that --format json produces
 // JSON that parses back into the doctor.Report shape (Checks,
-// Critical, Warnings). The acceptance gate from PROJECT.md is
-// explicitly "--format json is parseable" — this is the gate.
+// Critical, Warnings).
 //
 // The test does NOT force a green run (the cmd-layer cannot reach
 // internal/doctor's package-private seams); instead we run against a

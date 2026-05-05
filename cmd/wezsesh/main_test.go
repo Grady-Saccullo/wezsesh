@@ -1,6 +1,4 @@
 // main_test.go drives the §17.3 acceptance gates owned by T-800.
-// Each gate is named on the test function so the conformance reviewer
-// can grep test ↔ gate without consulting PROJECT.md.
 //
 // The save-flow gates exercise runSave directly. The dispatcher fake
 // (fakeSaveDispatcher) intercepts Dispatch("save", …) calls and lets

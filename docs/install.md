@@ -366,9 +366,8 @@ The minimum-viable opts for a working install are:
   `wezterm.plugin.require("https://github.com/MLFlexer/resurrect.wezterm")`
   call (already in the example above), not a substitute for it: the
   verb-dispatch handlers in the save / load / switch flows resolve
-  resurrect via `_G.resurrect` only (§11.5 verb-dispatch caveat), so
-  the canonical require must run regardless of how `opts.resurrect`
-  is wired.
+  resurrect via `_G.resurrect` only, so the canonical require must run
+  regardless of how `opts.resurrect` is wired.
 
 Every other opt (`keybinding`, `spawn_mode`, `state_dir`,
 `runtime_dir`, `data_dir`, `target_window_id`, `force_close`, `sort`,
@@ -376,8 +375,8 @@ Every other opt (`keybinding`, `spawn_mode`, `state_dir`,
 `confirm_overwrite`, `exclude`, `new_workspace_command`, `preview.*`,
 `markers.*`, `columns`, `name_truncate`, `colors.*`, `hooks.*`,
 `resurrect_argv_allowlist`, `log_level`, `keys.*`, `on_before_op`,
-`on_after_op`, etc.) is documented in [`docs/design.md`](design.md)
-§11 — Configuration schema (`apply_to_config(config, opts)`).
+`on_after_op`, etc.) is accepted by `apply_to_config(config, opts)` —
+see the option-table comments in `plugin/init.lua` for the full schema.
 
 ## Verify install
 
@@ -395,15 +394,14 @@ Two smoke checks confirm a working install. Run them in order.
    ```
 
 2. **`wezsesh doctor --format json | jq`** — comprehensive environment
-   check. Walks every check from `docs/design.md` §8.17 / §8.17.1
-   (state.dir, snapshot.dir, runtime.dir, data.dir, trust.dir, HMAC
-   key, wezterm version + Lua version, terminfo, font hints, etc.) and
-   emits a JSON report with three top-level fields: `Critical` (bool,
-   true iff any check failed), `Warnings` (bool, true iff any check
-   warned), and `Checks` (an array; each entry carries an `ID`, a
-   `Status` of `ok` / `warn` / `fail` / `skip`, a `Message`, and an
-   optional `Details` map). The CLI exits non-zero whenever `Critical`
-   or `Warnings` is true (§8.20). Run it from inside a wezterm pane —
+   check. Walks state.dir, snapshot.dir, runtime.dir, data.dir,
+   trust.dir, HMAC key, wezterm version + Lua version, terminfo, font
+   hints, etc., and emits a JSON report with three top-level fields:
+   `Critical` (bool, true iff any check failed), `Warnings` (bool,
+   true iff any check warned), and `Checks` (an array; each entry
+   carries an `ID`, a `Status` of `ok` / `warn` / `fail` / `skip`, a
+   `Message`, and an optional `Details` map). The CLI exits non-zero
+   whenever `Critical` or `Warnings` is true. Run it from inside a wezterm pane —
    `doctor` reads environment variables set by wezterm itself, and
    the report's accuracy degrades when run from a non-wezterm shell.
    `jq` is for pretty-printing only and is not strictly required.

@@ -28,7 +28,7 @@ keyboard-only.
 ```
 
 The layout above is illustrative; actual columns and marker glyphs follow
-the §11 `columns` defaults plus your `markers.*` overrides.
+the `columns` defaults plus your `markers.*` overrides.
 
 ## Quick start
 
@@ -48,26 +48,16 @@ wezsesh.apply_to_config(config, {
 ```
 
 Then reload wezterm and hit the default keybinding (`LEADER` + `SHIFT+W`) to
-open the TUI. The keybinding is configurable via `opts.keybinding` — see §11.
+open the TUI. The keybinding is configurable via `opts.keybinding`.
 
 ## Documentation
 
 - **Install:** [`docs/install.md`](docs/install.md) — Homebrew tap, curl
   installer, Nix flake, and `go install` paths, plus `wezsesh doctor` smoke
   checks.
-- **Configuration:** the full `apply_to_config(config, opts)` schema lives in
-  [`docs/design.md`](docs/design.md) §11 — every option, default, and
-  validation rule.
-- **Hooks.** Per-workspace `on_create` / `on_restore` shell hooks are gated
-  by a trust file — see [`docs/design.md`](docs/design.md) §13.5 (hook
-  trust check). The `on_before_op` / `on_after_op` callback opts surrounding
-  the dispatch lifecycle are listed in §11; the save-flow state machine
-  itself lives in §13.4 (lock-briefly + in-process serialisation).
-- **Design rationale:** [`docs/prd.md`](docs/prd.md) for the product
-  positioning; [`docs/design.md`](docs/design.md) for the normative technical
-  spec.
+- **Release:** [`docs/release.md`](docs/release.md) — tag-driven release
+  workflow and version-protocol notes.
 
 ## Status
 
-Pre-release. Iteration backlog and progress live in
-[`PROJECT.md`](PROJECT.md).
+Pre-release.

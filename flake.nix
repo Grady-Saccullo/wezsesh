@@ -2,13 +2,8 @@
   description = "wezsesh - WezTerm session manager TUI";
 
   inputs = {
-    # nixpkgs-unstable tracks wezterm closely (currently
-    # 0-unstable-2026-03-31). To test against an older wezterm rev, pin or
-    # override this input:
-    #   nix develop --override-input nixpkgs github:NixOS/nixpkgs/<rev>
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    # darwin/linux × arm64/amd64 — matches PRD_V7 §3 supported targets.
     systems.url = "github:nix-systems/default";
   };
 
@@ -27,7 +22,6 @@
         system,
         ...
       }: let
-        # PRD_V7 §8.1 pins Go 1.26.2.
         go = pkgs.go_1_26;
 
         # Plain Lua 5.4 — wezterm embeds a Lua 5.4 (mlua-rs) runtime, so
@@ -35,16 +29,6 @@
         # should run against the same major.
         lua = pkgs.lua5_4;
 
-        # ── Task scripts (`nix run .#<target>`) ───────────────────────────
-        # Single source of truth for build/test commands. Mirrors the
-        # required CI gates in §16.4. Each script is a self-contained
-        # writeShellApplication: callers do not need to be inside
-        # `nix develop`, since runtimeInputs supplies the toolchain.
-        #
-        # Usage:
-        #   nix run .#ci              — full local-CI suite
-        #   nix run .#test-race       — single target
-        #   nix run .#e2e             — gated end-to-end smoke (§17.6)
         mkScript = name: deps: body:
           pkgs.writeShellApplication {
             inherit name;
@@ -81,11 +65,7 @@
           '';
 
           codegen = mkScript "wezsesh-codegen" [] ''
-            if [ -f plugin/wezsesh/default_allowlist.lua ]; then
-              go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
-            else
-              echo "[placeholder] default_allowlist.lua not yet generated (T-605)"
-            fi
+            go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
           '';
 
           test-canonical = mkScript "wezsesh-test-canonical" [] ''
@@ -101,13 +81,9 @@
           # of truth for the published binary; this target exists for
           # quick local verification of the ldflags shape.
           build = mkScript "wezsesh-build" [] ''
-            if [ -f cmd/wezsesh/main.go ]; then
-              go build -trimpath \
-                -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
-                ./cmd/wezsesh
-            else
-              echo "[placeholder] cmd/wezsesh not yet present (T-800)"
-            fi
+            go build -trimpath \
+              -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
+              ./cmd/wezsesh
           '';
 
           # Full local-CI suite — mirrors the required gates in
@@ -126,13 +102,9 @@
             fi
             LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...
             go test -race ./...
-            if [ -f cmd/wezsesh/main.go ]; then
-              go build -trimpath \
-                -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
-                ./cmd/wezsesh
-            else
-              echo "[placeholder] cmd/wezsesh not yet present (T-800)"
-            fi
+            go build -trimpath \
+              -ldflags="-s -w -X main.version=v$(git describe --tags --always)" \
+              ./cmd/wezsesh
           '';
 
           # End-to-end smoke (§17.6 / T-900). The test compiles
@@ -253,84 +225,6 @@
 
         hasGoMod = builtins.pathExists ./go.mod;
 
-        # ── Build-loop driver ─────────────────────────────────────────────
-        # Runs `claude -p '/next-task'` repeatedly in fresh processes so each
-        # iteration starts with a cold context (no prompt-cache carry-over,
-        # no conversation memory, no PATH bleed). State lives in PROJECT.md;
-        # the loop stops when a /next-task invocation produces no new commit.
-        #
-        # Usage:
-        #   nix run .#build-loop           — one shot (50 iter cap)
-        #   MAX_ITERS=5 nix run .#build-loop
-        #   wezsesh-build-loop             — same, from inside `nix develop`
-        #
-        # `claude` must be on PATH; this driver does NOT install it.
-        buildLoop = pkgs.writeShellApplication {
-          name = "wezsesh-build-loop";
-          runtimeInputs = [pkgs.jujutsu pkgs.git pkgs.coreutils];
-          text = ''
-            # We manage exit codes per-iteration; don't bail on /next-task rc.
-            set +o errexit
-
-            if ! command -v claude >/dev/null 2>&1; then
-              echo "error: 'claude' not on PATH" >&2
-              exit 1
-            fi
-
-            repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-              echo "error: not in a git repository" >&2
-              exit 1
-            }
-            cd "$repo_root"
-
-            if [[ ! -d .jj ]]; then
-              echo "error: not jj-colocated (.jj missing). Run 'jj git init --colocate' first." >&2
-              exit 1
-            fi
-
-            # Precondition: working-copy commit must be empty. jj auto-snapshots
-            # any file changes into @, so a non-empty @ means uncommitted work.
-            wc_dirty=$(jj log -r '@ & ~empty()' --no-graph -T 'change_id ++ "\n"' 2>/dev/null)
-            if [[ -n "$wc_dirty" ]]; then
-              echo "error: working-copy commit is non-empty — uncommitted changes:" >&2
-              jj diff --name-only 2>/dev/null | head -10 >&2
-              echo "  resolve with: /next-task (resume), 'jj abandon', or 'jj op restore <op-id>'" >&2
-              exit 1
-            fi
-
-            max_iters="''${MAX_ITERS:-50}"
-            log_file="''${LOG:-build.log}"
-            extra_args=("$@")  # passed through to `claude` (e.g. --permission-mode auto)
-
-            echo "wezsesh-build-loop: max_iters=$max_iters log=$log_file"
-            echo "stop conditions: main bookmark doesn't advance, iter cap hit, or ctrl-C"
-
-            # Progress signal: commit_id of `main`. /next-task advances main on
-            # every committing operation; if main doesn't move across an
-            # iteration, no work landed and we stop.
-            main_id() {
-              jj log -r main --no-graph -T 'commit_id' 2>/dev/null
-            }
-
-            for ((i=1; i<=max_iters; i++)); do
-              before=$(main_id)
-              printf '\n=== iter %d  %s ===\n' "$i" "$(date -Iseconds)" | tee -a "$log_file"
-
-              claude "''${extra_args[@]}" -p '/next-task' 2>&1 | tee -a "$log_file"
-              rc=''${PIPESTATUS[0]}
-              echo "[loop] claude rc=$rc" | tee -a "$log_file"
-
-              after=$(main_id)
-              if [[ "$before" == "$after" ]]; then
-                echo "[loop] main didn't advance — stopping (all done, blocked, or needs-review)" | tee -a "$log_file"
-                exit 0
-              fi
-            done
-
-            echo "[loop] MAX_ITERS=$max_iters reached — stopping" | tee -a "$log_file"
-          '';
-        };
-
         wezsesh = pkgs.buildGoModule {
           pname = "wezsesh";
           version = "0.0.0-dev";
@@ -339,7 +233,7 @@
           # When go.mod / go.sum first land, `nix build` will fail with the
           # expected hash — copy it in here. Subsequent dep changes require
           # re-pinning. Leave as `lib.fakeHash` to force re-derivation.
-          vendorHash = lib.fakeHash;
+          vendorHash = "sha256-p499YMPiYssjoCzgILh7sUQ0e8QPQsI2nC85h95gWUg=";
 
           subPackages = ["cmd/wezsesh"];
 
@@ -372,24 +266,14 @@
         # ── Packages ───────────────────────────────────────────────────────
         # Until go.mod exists, this evaluates fine but builds will fail at
         # the Go compile step — that's the intended signal.
-        packages =
-          {
-            build-loop = buildLoop;
-          }
-          // lib.optionalAttrs hasGoMod {
-            default = wezsesh;
-            wezsesh = wezsesh;
-          };
+        packages = lib.optionalAttrs hasGoMod {
+          default = wezsesh;
+          wezsesh = wezsesh;
+        };
 
         # `nix run`
         apps =
-          {
-            build-loop = {
-              type = "app";
-              program = lib.getExe buildLoop;
-            };
-          }
-          // lib.mapAttrs (_: drv: {
+          lib.mapAttrs (_: drv: {
             type = "app";
             program = lib.getExe drv;
           })
@@ -434,12 +318,8 @@
             # `coreutils` provides sha256sum on darwin where it isn't system.
             pkgs.coreutils
             pkgs.git
-            pkgs.jujutsu # jj — VCS used by /next-task; repo is jj-colocated
+            pkgs.jujutsu # jj — repo is jj-colocated
             pkgs.jq
-
-            # /next-task loop driver — runs claude -p in fresh processes so
-            # each iteration has cold context. See `wezsesh-build-loop --help`.
-            buildLoop
           ];
 
           shellHook = ''
@@ -472,10 +352,6 @@
             echo "  TAG=v0.1.0 nix run .#release-build       # one host-native build"
             echo "  TAG=v0.1.0 nix run .#release-package     # build + tarball"
             echo "  TAG=v0.1.0 nix run .#release-build-all   # cross-compile all 4 targets + SHA256SUMS"
-            echo ""
-            echo "Drive the build (one /next-task per fresh claude process):"
-            echo "  wezsesh-build-loop --permission-mode auto"
-            echo "  MAX_ITERS=5 wezsesh-build-loop --permission-mode auto"
             echo ""
             echo "VCS: jj-colocated (.jj/ + .git/). Use jj for commits/diffs;"
             echo "git tooling (CI, IDE) sees the colocated .git/ normally."
