@@ -94,36 +94,12 @@ local function reconcile_binary_opts(opts)
     return opts
 end
 
--- GLOBAL schema-version stamp + cross-version wipe (P §7.1, §10.6).
--- Compares `wezterm.GLOBAL.wezsesh_plugin_version` to `M.VERSION`. On
--- mismatch (nil first-load, downgrade, or any inequality) every key
--- whose name starts with `wezsesh_` is set to nil before writing the
--- fresh stamp. Without the wipe, a plugin update that changed the
--- shape of e.g. `wezsesh_state[pid]` would have new code reading old
--- entries and crashing on the indexing path.
---
--- MUST run before any other GLOBAL write or listener registration in
--- apply_to_config — otherwise this very function would clear the
--- writes and leave the plugin half-initialised.
---
--- `pairs(wezterm.GLOBAL)` is iterable in production wezterm (the
--- userdata implements __pairs); the spec harness installs a __pairs
--- metamethod on its proxy so this enumeration works under tests too.
-local function stamp_and_maybe_wipe_globals(version)
-    local stored = wezterm.GLOBAL.wezsesh_plugin_version
-    if stored == version then return end
-    -- Mismatch (or nil): wipe every wezsesh_* key, THEN stamp.
-    local doomed = {}
-    for k, _ in pairs(wezterm.GLOBAL) do
-        if type(k) == "string" and k:sub(1, 8) == "wezsesh_" then
-            doomed[#doomed + 1] = k
-        end
-    end
-    for _, k in ipairs(doomed) do
-        wezterm.GLOBAL[k] = nil
-    end
-    wezterm.GLOBAL.wezsesh_plugin_version = version
-end
+-- The schema-version stamp + cross-version wipe loop lives in
+-- runtime.globals.wipe_on_version_mismatch; init.lua's apply_to_config
+-- calls it as step 2 below. Centralising it there keeps every
+-- `wezterm.GLOBAL.wezsesh_*` access in one of the two authorised
+-- modules (runtime/globals.lua, runtime/state.lua), which the lualint
+-- rule `lua-globals-only` enforces.
 
 -- Surface a sentinel-prefixed error as a 10-second toast. Sentinels are
 -- emitted by the submodules via `error("WEZSESH_*: …", 0)`. We match
@@ -167,17 +143,20 @@ function M.apply_to_config(config, opts)
         if k:sub(1, 8) == "wezsesh." then package.loaded[k] = nil end
     end
 
+    local globals = require("wezsesh.runtime.globals")
+
     local ok, err = pcall(function()
-        -- Reconcile binary/plugin_root precedence (§9.1 contract).
+        -- Reconcile binary/plugin_root precedence.
         opts = reconcile_binary_opts(opts)
 
-        -- Step 2 — GLOBAL schema-version stamp + cross-version wipe
-        -- (P §7.1, §10.6). MUST run BEFORE any other GLOBAL write or
-        -- listener registration; the wipe set is `^wezsesh_` keys, so
-        -- a stamp written after `ensure_session_key` would itself nuke
+        -- Step 2 — GLOBAL schema-version stamp + cross-version wipe.
+        -- MUST run BEFORE any other GLOBAL write or listener
+        -- registration; the wipe set is `^wezsesh_` keys, so a stamp
+        -- written after `ensure_session_key` would itself nuke
         -- `wezsesh_session_key`. Idempotent on same-version reloads
-        -- (early-returns when the stored stamp equals M.VERSION).
-        stamp_and_maybe_wipe_globals(M.VERSION)
+        -- (the wipe loop early-returns when the stored stamp equals
+        -- M.VERSION).
+        globals.wipe_on_version_mismatch(M.VERSION)
 
         -- Step 3 — Install the persistent `resurrect.error` listener.
         -- Idempotent within a single Lua state via the `_G` install gate
@@ -186,43 +165,30 @@ function M.apply_to_config(config, opts)
         local resurrect_error = require("wezsesh.resurrect_error")
         resurrect_error.register()
 
-        -- Step 4 — Lock resurrect's save_state_dir to opts.snapshot_dir.
-        -- `resurrect` is the user-supplied resurrect.wezterm plugin
-        -- module; the §9.1 contract names this call site explicitly.
-        -- We resolve the table off the user's wezterm config: the user
-        -- typically does `local resurrect = wezterm.plugin.require("…")`
-        -- before calling us, then passes the table on opts.resurrect.
-        -- Spec is silent on the resolution path; both `opts.resurrect`
-        -- and a top-level `_G.resurrect` (set by the resurrect plugin's
-        -- own apply path) are accepted. (Accepted finding.)
-        local resurrect_mod = opts.resurrect
-        if resurrect_mod == nil then
-            resurrect_mod = rawget(_G, "resurrect")
-        end
+        -- Step 4 — Resolve the user's resurrect plugin module and lock
+        -- its save_state_dir to opts.snapshot_dir.
+        --
+        -- The user typically does
+        --   `local resurrect = wezterm.plugin.require("…")`
+        -- in their wezterm config and passes the resulting table via
+        -- `opts.resurrect`. `runtime.resurrect_ref` owns both the stash
+        -- and the legacy `_G.resurrect` fallback lookup; calling `set`
+        -- with `opts.resurrect` (which may be nil) and then `get` here
+        -- lets the verb dispatchers later recover whichever module the
+        -- user wired without each consumer re-running the resolution.
+        local resurrect_ref = require("wezsesh.runtime.resurrect_ref")
+        resurrect_ref.set(opts.resurrect)
+        local resurrect_mod = resurrect_ref.get()
 
-        -- Stash the resolved module on a plain Lua global so ops.lua
-        -- can pick it up at dispatch time. wezterm.GLOBAL forbids
-        -- nested-table values (CLAUDE.md mlua-sandbox invariant), so
-        -- we cannot route the reference through there; the §11 cache-
-        -- bust loop only wipes `package.loaded["wezsesh.*"]`, leaving
-        -- `_G` keys intact. Without this stash, ops.lua's load/save
-        -- handlers can't see the user-supplied resurrect plugin and
-        -- every dispatch replies "resurrect plugin unavailable".
-        if resurrect_mod ~= nil then
-            rawset(_G, "wezsesh_resurrect", resurrect_mod)
-        end
-
-        -- When `opts.snapshot_dir` is nil/empty (the §11 default that
-        -- delegates to §12.5 auto-detect), we deliberately do NOT call
-        -- `change_state_save_dir`. The §9.1 "drift impossible by
-        -- construction" guarantee only holds when the user has pinned
-        -- the dir on both sides; otherwise resurrect's own §12.5
-        -- auto-detect path is the canonical resolver, and the
-        -- `snapshot.dir.matches.resurrect` doctor check (§8.17.1) is
-        -- the load-bearing fallback that catches drift at runtime.
-        -- Resolving auto-detect at apply_to_config time would
-        -- re-introduce exactly the drift this guarantee is supposed
-        -- to prevent.
+        -- When `opts.snapshot_dir` is nil/empty we deliberately do NOT
+        -- call `change_state_save_dir`. The "no drift between resurrect
+        -- and wezsesh's snapshot directories" guarantee only holds when
+        -- the user has pinned the dir on both sides; otherwise
+        -- resurrect's own auto-detect path is the canonical resolver,
+        -- and `wezsesh doctor`'s snapshot-dir-matches check is the
+        -- runtime fallback that catches drift. Resolving auto-detect
+        -- at apply_to_config time would re-introduce exactly the drift
+        -- this guarantee is meant to prevent.
         if type(opts.snapshot_dir) == "string" and opts.snapshot_dir ~= "" then
             if type(resurrect_mod) == "table"
                and type(resurrect_mod.state_manager) == "table"
@@ -241,9 +207,10 @@ function M.apply_to_config(config, opts)
         manager.validate_runtime_dir(opts)
 
         -- Step 6 — Resolve the binary's absolute path and ensure the
-        -- §5.2 session key is populated in `wezterm.GLOBAL`.
+        -- HMAC session key is populated in wezterm.GLOBAL via
+        -- runtime/globals.
         local bin = manager.resolve_binary(opts)
-        wezterm.GLOBAL.wezsesh_bin_path = bin
+        globals.set_bin_path(bin)
         local key, key_err = manager.ensure_session_key(bin)
         if key == nil then
             error(key_err

@@ -24,7 +24,12 @@ local function script_dir()
     local src = arg and arg[0] or "plugin/wezsesh/on_pane_restore_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;" .. package.path
+-- Two roots: script_dir() lets `require("on_pane_restore")` resolve to
+-- the file next to this spec, and script_dir()/../ lets the dotted form
+-- `require("wezsesh.runtime.log")` resolve via plugin/wezsesh/runtime/log.lua.
+package.path = script_dir() .. "/?.lua;"
+            .. script_dir() .. "/../?.lua;"
+            .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
 -- wezterm shim — installed BEFORE require("on_pane_restore")

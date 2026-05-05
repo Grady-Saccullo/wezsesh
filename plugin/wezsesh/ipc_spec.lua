@@ -261,7 +261,7 @@ package.preload["wezterm"] = function() return wezterm_shim end
 
 -- Now load the modules under test (production require path).
 local ipc            = require("wezsesh.ipc")
-local state          = require("wezsesh.state")
+local state          = require("wezsesh.runtime.state")
 local canonical_json = require("wezsesh.canonical_json")
 local hmac           = require("wezsesh.hmac")
 

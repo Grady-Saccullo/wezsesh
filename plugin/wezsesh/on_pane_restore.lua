@@ -1,41 +1,44 @@
--- §9.11 — `on_pane_restore.lua`. The wezsesh-installed callback that
--- wraps resurrect's `default_on_pane_restore`. Single-arg shape per
--- P §6.18 / §9.11 (resurrect calls `cb(pane_tree)`; the pane is
--- accessed as `pane_tree.pane`).
+-- on_pane_restore.lua — the wezsesh-installed callback that wraps
+-- resurrect's `default_on_pane_restore`. Resurrect calls `cb(pane_tree)`
+-- with a single argument; the pane is accessed as `pane_tree.pane`.
 --
--- §9.11.1 decision flow:
+-- Decision flow:
 --
 --   1. argv = pane_tree.process and pane_tree.process.argv
 --   2. if not argv or #argv == 0:
 --          resurrect.default_on_pane_restore(pane_tree); return
 --   3. prog = basename(argv[1])
 --   4. if not policy.allows(prog):
---          send_cwd_or_newline(pane_tree); log_warn; return
+--          send_cwd_or_newline(pane_tree); log; return
 --   5. for each elem in argv: if not bytes_clean(elem) → goto step 4
 --   6. if pane_tree.cwd and not bytes_clean(pane_tree.cwd) → goto step 4
 --   7. resurrect.default_on_pane_restore(pane_tree)
 --
--- The entire decision flow body (steps 1–7) is `pcall`-wrapped. On any
--- uncaught error: pane:send_text("\r\n") only; log_warn; MUST NOT call
--- resurrect.default_on_pane_restore. (§13.14 / P §6.18 fail-CLOSED.)
+-- The entire decision-flow body is `pcall`-wrapped. Fail-CLOSED on any
+-- uncaught error: `pane:send_text("\r\n")` only, log the crash, MUST
+-- NOT call `resurrect.default_on_pane_restore` (which would honour the
+-- attacker-controlled argv).
 --
--- argv indexing: 1-based. argv[1] IS the program (NOT the first arg),
--- opposite of C-convention argv[0]. (P §6.18 v2.2.)
+-- argv indexing: 1-based. `argv[1]` IS the program (NOT the first arg),
+-- opposite of C-convention `argv[0]`.
 --
--- Test seam: M.configure({ resurrect = …, policy = …, logger = … })
--- swaps the resolved deps. Production resolution mirrors ops.lua: the
--- resurrect global is read lazily from `_G.wezsesh_resurrect` (init.lua
--- stashes the value of `opts.resurrect` there at apply_to_config time),
--- with a fall-back to `_G.resurrect` for legacy wiring. The policy is
--- built by apply_to_config from `default_allowlist.lua` +
--- `basename($SHELL)` + `opts.resurrect_argv_allowlist` and passed in.
+-- Test seam: `M.configure({ resurrect = …, policy = … })` swaps the
+-- resolved deps. Production resolution defers to `runtime.resurrect_ref`
+-- (which owns the `opts.resurrect` / `_G.resurrect` lookup rule) and
+-- builds `policy` from `default_allowlist.lua` + `basename($SHELL)` +
+-- `opts.resurrect_argv_allowlist` at apply_to_config time.
+--
+-- Logging routes through `runtime.log` so capture in tests goes through
+-- a single seam rather than this module's own `_deps.logger`.
 
-local wezterm = require("wezterm")
+local wezterm       = require("wezterm")
+local log           = require("wezsesh.runtime.log")
+local resurrect_ref = require("wezsesh.runtime.resurrect_ref")
 
 local M = {}
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.11 — bytes_clean
+-- bytes_clean
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Rejects empty, non-string, and any string containing a byte in
@@ -63,56 +66,37 @@ local function basename(p)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.11 — default deps + configure
+-- default deps + configure
 -- ────────────────────────────────────────────────────────────────────
 --
 -- The defaults lazy-resolve at call time. Production wiring populates
 -- `policy` via apply_to_config; until that happens, the default policy
 -- denies everything (fail-CLOSED) — a snapshot restore before
--- configure() runs would land in the cwd-only / newline branch rather
--- than fall through to resurrect's default.
+-- configure() runs lands in the cwd-only / newline branch rather than
+-- falling through to resurrect's default.
 
 local function default_resurrect()
-    -- Mirrors ops.lua's resolution rule. The user's wezterm config
-    -- holds resurrect as a local (`local resurrect = wezterm.plugin
-    -- .require(...)`) and passes it via `opts.resurrect` to
-    -- `wezsesh.apply_to_config`; init.lua stashes the resolved module
-    -- on `_G.wezsesh_resurrect`, a plain Lua global the §11 cache-bust
-    -- loop does NOT clear (it only wipes `package.loaded["wezsesh.*"]`).
-    -- Falls back to `_G.resurrect` for the legacy wiring where the
-    -- resurrect plugin self-installed as a global.
-    local r = rawget(_G, "wezsesh_resurrect")
-    if r ~= nil then return r end
-    return rawget(_G, "resurrect")
+    -- runtime.resurrect_ref owns the lookup rule (opts.resurrect
+    -- stashed by init.lua, fallback to _G.resurrect for legacy
+    -- wiring). Routing through it here keeps the resolution logic in
+    -- exactly one place.
+    return resurrect_ref.get()
 end
 
 local function default_policy()
     return { allows = function(_prog) return false end }
 end
 
-local function default_logger()
-    return {
-        log_warn = function(msg)
-            if type(wezterm.log_warn) == "function" then
-                wezterm.log_warn(msg)
-            end
-        end,
-    }
-end
-
 M._deps = {
     resurrect = default_resurrect,
     policy    = default_policy(),
-    logger    = default_logger(),
 }
 
--- Configure: install the resurrect reference, the policy, and an
--- optional logger. apply_to_config (T-603) builds `policy` from the
--- §9.12 default_allowlist + basename($SHELL) + user additions and
--- passes it in via this function.
+-- Configure: install the resurrect reference and the policy. Called
+-- from `apply_to_config` once `policy` has been built from
+-- `default_allowlist.lua` + `basename($SHELL)` + user additions.
 --
--- `policy` MUST expose an `allows(prog)` predicate. `logger` is
--- optional; falls back to the wezterm.log_warn default.
+-- `policy` MUST expose an `allows(prog)` predicate.
 function M.configure(opts)
     opts = opts or {}
     if opts.resurrect ~= nil then
@@ -120,9 +104,6 @@ function M.configure(opts)
     end
     if opts.policy ~= nil then
         M._deps.policy = opts.policy
-    end
-    if opts.logger ~= nil then
-        M._deps.logger = opts.logger
     end
 end
 
@@ -132,7 +113,6 @@ function M._reset_deps()
     M._deps = {
         resurrect = default_resurrect,
         policy    = default_policy(),
-        logger    = default_logger(),
     }
 end
 
@@ -146,24 +126,14 @@ local function resolve_policy()
     return M._deps.policy
 end
 
-local function log_warn(msg)
-    local lg = M._deps.logger
-    if type(lg) == "table" and type(lg.log_warn) == "function" then
-        pcall(lg.log_warn, msg)
-        return
-    end
-    if type(wezterm.log_warn) == "function" then
-        pcall(wezterm.log_warn, msg)
-    end
-end
-
 -- ────────────────────────────────────────────────────────────────────
 -- send_cwd_or_newline (step 4 action)
 -- ────────────────────────────────────────────────────────────────────
 --
--- Line terminator is `\r\n` per PRD §6.18; quoter is
--- `wezterm.shell_quote_arg` (whose only failure mode — embedded NUL —
--- is precluded by step 6 / the per-elem bytes_clean check above).
+-- Line terminator is `\r\n` (CRLF — what wezterm injects into a real
+-- pane on the user pressing Enter). The quoter is
+-- `wezterm.shell_quote_arg`; its only failure mode (embedded NUL) is
+-- precluded by step 6 / the per-elem bytes_clean check above.
 
 local function send_cwd_or_newline(pane_tree)
     local pane = pane_tree and pane_tree.pane
@@ -180,7 +150,7 @@ local function send_cwd_or_newline(pane_tree)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- impl — the §9.11.1 decision flow body
+-- impl — the decision flow body
 -- ────────────────────────────────────────────────────────────────────
 
 local function impl(pane_tree)
@@ -204,7 +174,7 @@ local function impl(pane_tree)
     -- Step 4 action — extracted so steps 5/6 can re-enter it.
     local function fallback(reason_prog)
         local cwd_state = send_cwd_or_newline(pane_tree)
-        log_warn(string.format(
+        log.warn(string.format(
             "wezsesh: skipped argv restore for %q; cwd %s",
             tostring(reason_prog), cwd_state))
     end
@@ -242,12 +212,12 @@ local function impl(pane_tree)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.11 / §13.14 — public entry point. pcall-wrapped boundary.
+-- public entry point. pcall-wrapped boundary.
 -- ────────────────────────────────────────────────────────────────────
 --
 -- On any uncaught error in impl:
 --   * pane:send_text("\r\n") if pane is available
---   * log_warn the crash
+--   * log the crash
 --   * MUST NOT call resurrect.default_on_pane_restore
 --
 -- The default-call lives only at step 7 inside impl()'s success path.
@@ -261,7 +231,7 @@ function M.callback(pane_tree)
         if type(pane) == "table" or type(pane) == "userdata" then
             pcall(function() pane:send_text("\r\n") end)
         end
-        log_warn("wezsesh: on_pane_restore hook crash; failed CLOSED: "
+        log.warn("wezsesh: on_pane_restore hook crash; failed CLOSED: "
             .. tostring(err))
     end
 end

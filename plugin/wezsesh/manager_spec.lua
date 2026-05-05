@@ -32,7 +32,12 @@ local function script_dir()
     local src = arg and arg[0] or "plugin/wezsesh/manager_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;" .. package.path
+-- script_dir() lets bare `require("manager")` resolve to the file next
+-- to this spec; script_dir()/../ lets dotted requires
+-- (e.g. wezsesh.runtime.globals) resolve via plugin/wezsesh/runtime/...
+package.path = script_dir() .. "/?.lua;"
+            .. script_dir() .. "/../?.lua;"
+            .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
 -- pure-Lua JSON encode/decode for the shim and for the spec body

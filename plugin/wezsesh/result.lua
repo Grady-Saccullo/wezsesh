@@ -48,7 +48,8 @@
 -- shim via `package.preload["wezterm"]` BEFORE requiring this file.
 
 local wezterm = require("wezterm")
-local b64 = require("wezsesh.b64")
+local b64     = require("wezsesh.b64")
+local globals = require("wezsesh.runtime.globals")
 
 local M = {}
 
@@ -167,12 +168,12 @@ json_encode = function(v)
     error("json_encode: unsupported type " .. t, 0)
 end
 
--- Resolve the wezsesh binary path from `wezterm.GLOBAL.wezsesh_bin_path`
--- per §10.6. The plugin's `apply_to_config` writes this at load. If
--- unset (mis-configured), the spawn is a noop — the binary on the
--- other end will hit IPC_TIMEOUT and the TUI will surface that.
+-- Resolve the wezsesh binary path. apply_to_config writes it via
+-- `runtime.globals.set_bin_path` at load time; an unset value (mis-
+-- configured plugin) makes the spawn a noop and the binary on the
+-- other end hits IPC_TIMEOUT, which the TUI surfaces.
 local function bin_path()
-    local p = wezterm.GLOBAL.wezsesh_bin_path
+    local p = globals.bin_path()
     if type(p) == "string" and #p > 0 then return p end
     return nil
 end

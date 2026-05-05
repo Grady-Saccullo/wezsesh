@@ -21,6 +21,7 @@
 -- assertion guarding that property.
 
 local wezterm = require("wezterm")
+local globals = require("wezsesh.runtime.globals")
 
 local M = {}
 
@@ -157,14 +158,14 @@ function M.ensure_session_key(bin)
         if ok then
             local hex = trim(stdout or "")
             if valid_hex_64(hex) then
-                wezterm.GLOBAL.wezsesh_session_key = hex
+                globals.set_session_key(hex)
                 return hex
             end
         end
     end
 
-    -- Step 2: fallback to /dev/urandom (POSIX-only build matrix per
-    -- §5.2). io.open returns nil + errmsg on failure.
+    -- Step 2: fallback to /dev/urandom (POSIX-only build matrix).
+    -- io.open returns nil + errmsg on failure.
     local f = io.open("/dev/urandom", "rb")
     if f ~= nil then
         local raw = f:read(32)
@@ -172,7 +173,7 @@ function M.ensure_session_key(bin)
         if type(raw) == "string" and #raw == 32 then
             local hex = bytes_to_hex(raw)
             if valid_hex_64(hex) then
-                wezterm.GLOBAL.wezsesh_session_key = hex
+                globals.set_session_key(hex)
                 return hex
             end
         end
@@ -397,7 +398,7 @@ end
 function M.spawn(window, opts)
     opts = opts or {}
 
-    local key = wezterm.GLOBAL.wezsesh_session_key
+    local key = globals.session_key()
     if type(key) ~= "string" or #key ~= 64 then
         if type(wezterm.log_error) == "function" then
             wezterm.log_error(
@@ -449,7 +450,7 @@ function M.spawn(window, opts)
             end)
             if ok_w and type(w) == "number" then wid = w end
         end
-        local state = require("wezsesh.state")
+        local state = require("wezsesh.runtime.state")
         state.set_state(pid, {
             target_window_id = wid,
             spawned_at       = os.time(),

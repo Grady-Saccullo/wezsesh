@@ -1,42 +1,44 @@
--- §9.4 — `ops.lua` (verb dispatch table) for the Lua side of the IPC
--- protocol. Sits between `ipc.lua` step (i) (which has just authenticated
--- and validated a request) and the per-verb business logic that calls
--- `resurrect.*` and emits the wire reply via `result.lua`.
+-- ops.lua — verb dispatch table for the Lua side of the IPC protocol.
+-- Sits between `ipc.lua`'s authenticated step (i) and the per-verb
+-- business logic that calls `resurrect.*` and emits the wire reply via
+-- `result.lua`.
 --
--- Verb catalog (§6):
+-- Verb catalog:
 --   * switch — switch to workspace; restore-class when saved-not-live.
 --   * load   — restore `name` snapshot into the current workspace.
---   * save   — snapshot current workspace; dual-path detector (spike #2).
+--   * save   — snapshot current workspace; dual-path detector.
 --   * new    — spawn a new workspace from a cwd.
 --   * noop   — TUI cancellation marker. No-op.
 --
--- §9.4.1 (restore-class split-reply) and §9.4.2 (save dual-path) are
--- implemented verbatim against the design.md pseudocode. Both load and
--- save go through `resurrect_error.with_capture` (§9.13) — the bare
--- `pcall(state_manager.{save,load}_state, …)` form is forbidden by
--- §17.4 lint because `save_state` swallows I/O / encryption failures
--- into a `wezterm.emit("resurrect.error", string)` and a bare pcall
--- never observes them (spike #2).
+-- Why save and load go through `resurrect_error.with_capture` (and not a
+-- bare `pcall(state_manager.{save,load}_state, …)`): resurrect's state
+-- manager swallows I/O and encryption failures into a
+-- `wezterm.emit("resurrect.error", string)`, so a bare pcall observes
+-- only the synchronous Lua raises (e.g. `wezterm.json_encode` failing
+-- on a function-typed workspace value). The `with_capture` wrapper
+-- buffers `resurrect.error` emissions for the duration of the call and
+-- returns them alongside the pcall result so both failure paths are
+-- caught.
 --
--- Unknown verbs: §13.13 mandates wire-silent at `ipc.lua` step (e)
--- (verb-keyed shape lookup misses → log_warn + return). ops.dispatch
--- still carries a defensive UNKNOWN_VERB branch — the §17.4 verb / shape
--- parity lint asserts every dispatch_table key has a verb_args_shape
--- entry, so this branch is unreachable in production. Unit tests
--- exercise it directly.
+-- Unknown verbs: handled wire-silent at `ipc.lua` step (e) (verb-keyed
+-- shape lookup misses → log + return). ops.dispatch carries a
+-- defensive UNKNOWN_VERB branch that's unreachable in production
+-- because every dispatch_table key has a matching verb_args_shape;
+-- unit tests exercise it directly.
 --
--- mlua sandbox: `local wezterm = require("wezterm")` per §9.0.1; every
--- sibling require is namespaced (`wezsesh.*`) so the §11 cache-bust
--- loop in init.lua picks up edits on Ctrl+Shift+R reload. The standalone
--- spec installs a wezterm shim via `package.preload["wezterm"]` BEFORE
--- requiring this file.
+-- mlua sandbox: `local wezterm = require("wezterm")` (never `_G.wezterm`);
+-- every sibling require is namespaced (`wezsesh.*`) so init.lua's cache-
+-- bust loop on Ctrl+Shift+R picks up edits.
 --
 -- `wezterm.background_child_process` is NOT called directly here — the
--- four `result.reply_*` emitters wrap it (§9.5). All `pcall`-wrapping
--- of the spawn lives in result.lua per §16.5 lint expectations.
+-- four `result.reply_*` emitters wrap it. All `pcall`-wrapping of the
+-- spawn lives in result.lua so the lualint `lua-bg-child-pcall` rule
+-- has a single source of truth to enforce.
 
-local wezterm = require("wezterm")
-local result  = require("wezsesh.result")
+local wezterm       = require("wezterm")
+local log           = require("wezsesh.runtime.log")
+local resurrect_ref = require("wezsesh.runtime.resurrect_ref")
+local result        = require("wezsesh.result")
 
 local M = {}
 
@@ -50,24 +52,18 @@ local M = {}
 -- ────────────────────────────────────────────────────────────────────
 
 local function default_resurrect()
-    -- The user's wezterm config holds the resurrect module as a local
-    -- (`local resurrect = wezterm.plugin.require(...)`) and passes it
-    -- via `opts.resurrect` to `wezsesh.apply_to_config`. init.lua
-    -- stashes it on the plain Lua global `_G.wezsesh_resurrect` so
-    -- ops.lua can resolve it across the §11 cache-bust loop (which
-    -- only wipes `package.loaded["wezsesh.*"]`, not `_G`). Falls back
-    -- to `_G.resurrect` for the legacy wiring where the resurrect
-    -- plugin self-installed as a global.
-    local r = rawget(_G, "wezsesh_resurrect")
-    if r ~= nil then return r end
-    return rawget(_G, "resurrect")
+    -- runtime.resurrect_ref owns the lookup rule (opts.resurrect
+    -- stashed by init.lua, fallback to _G.resurrect for legacy
+    -- wiring). Routing through it here keeps the resolution logic in
+    -- exactly one place.
+    return resurrect_ref.get()
 end
 
 -- Default `with_capture` is a thunk that lazy-requires the production
--- module on every call. The lazy require survives the §11 cache-bust
--- loop (a fresh require after `package.loaded["wezsesh.*"] = nil` picks
--- up edits on Ctrl+Shift+R). The spec replaces _deps.with_capture
--- wholesale via _set_deps.
+-- module on every call. The lazy require survives init.lua's cache-bust
+-- loop (a fresh `require` after `package.loaded["wezsesh.*"] = nil` picks
+-- up edits on Ctrl+Shift+R). The spec replaces `_deps.with_capture`
+-- wholesale via `_set_deps`.
 local function default_with_capture(fn)
     local ok, mod = pcall(require, "wezsesh.resurrect_error")
     if not ok or type(mod) ~= "table"
@@ -75,23 +71,17 @@ local function default_with_capture(fn)
     then
         -- Degraded: run fn under bare pcall and return an empty
         -- captured array. The dispatch handlers then take the no-
-        -- capture path; downstream §17.4 lint should have caught a
-        -- missing module at registration time, so this is purely
-        -- defensive.
+        -- capture path. Purely defensive — the standard wiring always
+        -- has resurrect_error available.
         local pok, ret = pcall(fn)
         return pok, ret, {}
     end
     return mod.with_capture(fn)
 end
 
-local function default_log_warn(msg)
-    wezterm.log_warn(msg)
-end
-
 M._deps = {
     resurrect    = default_resurrect,
     with_capture = default_with_capture,
-    log_warn     = default_log_warn,
 }
 
 function M._set_deps(d)
@@ -105,7 +95,6 @@ function M._reset_deps()
     M._deps = {
         resurrect    = default_resurrect,
         with_capture = default_with_capture,
-        log_warn     = default_log_warn,
     }
 end
 
@@ -119,13 +108,6 @@ local function resolve_with_capture()
     local wc = M._deps.with_capture
     if type(wc) == "function" then return wc end
     return nil
-end
-
-local function log_warn(msg)
-    local fn = M._deps.log_warn
-    if type(fn) == "function" then
-        pcall(fn, msg)
-    end
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -435,7 +417,7 @@ function M.dispatch(payload, window, pane)
 
     local ok, err = pcall(handler, payload, window, pane)
     if not ok then
-        log_warn("ops.dispatch: verb '" .. tostring(payload.op)
+        log.warn("ops.dispatch: verb '" .. tostring(payload.op)
             .. "' raised: " .. tostring(err))
         return result.reply_error(payload, "UNKNOWN",
             tostring(err),
