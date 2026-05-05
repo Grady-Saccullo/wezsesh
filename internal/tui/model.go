@@ -286,6 +286,13 @@ type Model struct {
 	// renders an empty frame on the final tick.
 	quitting bool
 
+	// closeOwnPane signals the host (cmd/wezsesh runTUI) to close the
+	// wezterm pane the binary is running in once tea.Run has returned.
+	// The TUI is one-shot — leaving the pane behind as a "Process
+	// completed" placeholder when the user has `exit_behavior = "Hold"`
+	// is poor UX, so every clean tea.Quit path stamps this true.
+	closeOwnPane bool
+
 	// reply mailbox: the channel returned from Dispatcher.Dispatch.
 	// Set by dispatchStartedMsg, cleared on terminal reply or timeout.
 	replyCh <-chan ipc.Reply
@@ -491,4 +498,13 @@ func (m *Model) shutdown() {
 			m.dispatchCancel()
 		}
 	})
+}
+
+// CloseOwnPaneOnExit reports whether the host should close the wezterm
+// pane the binary was spawned into once tea.Run returns. Stamped by
+// every clean tea.Quit path in update.go; the panic-recovery branch
+// leaves it false so the user can read the "Process completed" /
+// stderr message in the lingering pane.
+func (m *Model) CloseOwnPaneOnExit() bool {
+	return m.closeOwnPane
 }

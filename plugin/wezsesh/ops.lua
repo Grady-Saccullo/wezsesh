@@ -50,10 +50,16 @@ local M = {}
 -- ────────────────────────────────────────────────────────────────────
 
 local function default_resurrect()
-    -- `resurrect.wezterm` installs itself as the global `resurrect`
-    -- table at apply_to_config time (its plugin entry point). We do
-    -- NOT require() it from here — it is delivered out-of-band by
-    -- the user's wezterm config and may not be a Lua module.
+    -- The user's wezterm config holds the resurrect module as a local
+    -- (`local resurrect = wezterm.plugin.require(...)`) and passes it
+    -- via `opts.resurrect` to `wezsesh.apply_to_config`. init.lua
+    -- stashes it on the plain Lua global `_G.wezsesh_resurrect` so
+    -- ops.lua can resolve it across the §11 cache-bust loop (which
+    -- only wipes `package.loaded["wezsesh.*"]`, not `_G`). Falls back
+    -- to `_G.resurrect` for the legacy wiring where the resurrect
+    -- plugin self-installed as a global.
+    local r = rawget(_G, "wezsesh_resurrect")
+    if r ~= nil then return r end
     return rawget(_G, "resurrect")
 end
 

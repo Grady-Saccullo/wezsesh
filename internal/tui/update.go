@@ -23,10 +23,14 @@ var dispatchSeqCounter uint64
 // verbExitsOnSuccess returns true for verbs whose successful terminal
 // reply ends the picker's purpose: the user has navigated away and the
 // TUI tab is now in the way. The remaining verbs (`save`, `delete`,
-// `rename`, etc.) keep the picker open so the user can do more work.
+// `rename`, `new`, etc.) keep the picker open so the user can do more
+// work. `new` deliberately stays open: the binary spawns the workspace
+// without switching the active client into it, and the picker re-
+// surfaces the freshly-created row with the cursor on it so the user
+// can decide whether to switch (`s`) or stay.
 func verbExitsOnSuccess(verb string) bool {
 	switch verb {
-	case "switch", "load", "new":
+	case "switch", "load":
 		return true
 	}
 	return false
@@ -108,12 +112,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			status = nameval.SanitizeForDisplay(
 				fmt.Sprintf("%s: %s", m.currentVerb, msg.reply.Status))
 		}
-		autoQuit := msg.reply.OK && verbExitsOnSuccess(m.currentVerb)
+		// Capture verb before finishOp clears m.currentVerb; the post-
+		// finish handler for `new` needs it to gate the row insert.
+		verb := m.currentVerb
+		var newName string
+		if verb == "new" && msg.reply.OK {
+			if v, ok := msg.reply.Data["name"].(string); ok {
+				newName = v
+			}
+		}
+
+		autoQuit := msg.reply.OK && verbExitsOnSuccess(verb)
 		m.finishOp(status)
 		if autoQuit {
 			m.quitting = true
+			m.closeOwnPane = true
 			m.shutdown()
 			return m, tea.Quit
+		}
+		if newName != "" {
+			m.applyNewWorkspace(newName)
 		}
 		// Continue reading until the channel closes so we observe the
 		// drain goroutine's clean-up; the dispatcher closes the channel
@@ -178,6 +196,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "y", "Y":
 			m.quitting = true
+			m.closeOwnPane = true
 			m.shutdown()
 			return m, tea.Quit
 		}
@@ -280,6 +299,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.quitting = true
+		m.closeOwnPane = true
 		m.shutdown()
 		return m, tea.Quit
 	case actMark, actClearMarks, actPin:
@@ -436,6 +456,44 @@ func (m *Model) finishOp(status string) {
 	m.replyCh = nil
 	m.currentVerb = ""
 	m.currentTarget = ""
+}
+
+// applyNewWorkspace inserts (or marks live) the workspace named `name`
+// after a successful `new` reply, re-runs the configured sort, clears
+// any active filter, and parks the cursor on the new row. The Lua
+// `mux.spawn_window` call creates the workspace but does NOT activate
+// it — the picker stays open so the user can decide to `s`witch into
+// it or move on; positioning the cursor on the row is what makes that
+// decision a single keystroke.
+func (m *Model) applyNewWorkspace(name string) {
+	if name == "" {
+		return
+	}
+	matched := false
+	for i := range m.rows {
+		if m.rows[i].Name == name {
+			m.rows[i].Live = true
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		m.rows = append(m.rows, WorkspaceRow{Name: name, Live: true})
+	}
+	sortRows(m.rows, m.cfg.Sort, m.data.State)
+
+	if m.mode == modeFilter {
+		m.mode = modeNav
+	}
+	m.filterBuf = ""
+	m.filtered = nil
+
+	for i := range m.rows {
+		if m.rows[i].Name == name {
+			m.cursor = i
+			break
+		}
+	}
 }
 
 // refreshFilter applies the current filterBuf to m.rows and resets the

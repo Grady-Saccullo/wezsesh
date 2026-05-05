@@ -266,7 +266,8 @@ func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
 		prog.Quit()
 	}()
 
-	if _, err := prog.Run(); err != nil {
+	finalModel, err := prog.Run()
+	if err != nil {
 		env.log.Error("tea.Run failed", "err", err.Error())
 		signal.Stop(sigCh)
 		close(sigCh)
@@ -283,6 +284,22 @@ func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
 	// dispatcher's WaitGroup; cleanup runs after we've drained.
 	if env.dispWG != nil {
 		env.dispWG()
+	}
+	// The TUI is one-shot: the spawning tab serves no purpose once the
+	// picker has closed. When the user runs wezterm with the default
+	// `exit_behavior = "Hold"`, the tab would otherwise linger as a
+	// "Process completed" placeholder. The model stamps closeOwnPane
+	// on every clean tea.Quit (verb auto-exit, manual q, mid-op y);
+	// the panic-recovery defer above leaves it false so the user can
+	// read the failure message. Fire-and-forget — wezterm's CLI is
+	// asynchronous from our perspective; the SIGHUP that follows the
+	// pane close arrives after env.cleanup() in deferred order.
+	if cm, ok := finalModel.(interface{ CloseOwnPaneOnExit() bool }); ok && cm.CloseOwnPaneOnExit() && env.wezcli != nil && env.paneID > 0 {
+		killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := env.wezcli.KillPane(killCtx, env.paneID); err != nil {
+			env.log.Warn("kill-pane after exit failed", "err", err.Error())
+		}
+		killCancel()
 	}
 	return rc
 }

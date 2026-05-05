@@ -24,10 +24,11 @@
 --
 -- Test seam: M.configure({ resurrect = …, policy = …, logger = … })
 -- swaps the resolved deps. Production resolution mirrors ops.lua: the
--- resurrect global is read lazily from `_G.resurrect` (resurrect.wezterm
--- installs itself there at apply_to_config time). The policy is built
--- by apply_to_config from `default_allowlist.lua` + `basename($SHELL)`
--- + `opts.resurrect_argv_allowlist` and passed in.
+-- resurrect global is read lazily from `_G.wezsesh_resurrect` (init.lua
+-- stashes the value of `opts.resurrect` there at apply_to_config time),
+-- with a fall-back to `_G.resurrect` for legacy wiring. The policy is
+-- built by apply_to_config from `default_allowlist.lua` +
+-- `basename($SHELL)` + `opts.resurrect_argv_allowlist` and passed in.
 
 local wezterm = require("wezterm")
 
@@ -72,10 +73,16 @@ end
 -- than fall through to resurrect's default.
 
 local function default_resurrect()
-    -- `resurrect.wezterm` installs itself as the global `resurrect`
-    -- table at apply_to_config time (its plugin entry point). We do
-    -- NOT require() it from here — it is delivered out-of-band by the
-    -- user's wezterm config and may not be a Lua module.
+    -- Mirrors ops.lua's resolution rule. The user's wezterm config
+    -- holds resurrect as a local (`local resurrect = wezterm.plugin
+    -- .require(...)`) and passes it via `opts.resurrect` to
+    -- `wezsesh.apply_to_config`; init.lua stashes the resolved module
+    -- on `_G.wezsesh_resurrect`, a plain Lua global the §11 cache-bust
+    -- loop does NOT clear (it only wipes `package.loaded["wezsesh.*"]`).
+    -- Falls back to `_G.resurrect` for the legacy wiring where the
+    -- resurrect plugin self-installed as a global.
+    local r = rawget(_G, "wezsesh_resurrect")
+    if r ~= nil then return r end
     return rawget(_G, "resurrect")
 end
 

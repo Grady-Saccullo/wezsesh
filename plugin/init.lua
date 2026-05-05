@@ -195,7 +195,23 @@ function M.apply_to_config(config, opts)
         -- Spec is silent on the resolution path; both `opts.resurrect`
         -- and a top-level `_G.resurrect` (set by the resurrect plugin's
         -- own apply path) are accepted. (Accepted finding.)
-        --
+        local resurrect_mod = opts.resurrect
+        if resurrect_mod == nil then
+            resurrect_mod = rawget(_G, "resurrect")
+        end
+
+        -- Stash the resolved module on a plain Lua global so ops.lua
+        -- can pick it up at dispatch time. wezterm.GLOBAL forbids
+        -- nested-table values (CLAUDE.md mlua-sandbox invariant), so
+        -- we cannot route the reference through there; the §11 cache-
+        -- bust loop only wipes `package.loaded["wezsesh.*"]`, leaving
+        -- `_G` keys intact. Without this stash, ops.lua's load/save
+        -- handlers can't see the user-supplied resurrect plugin and
+        -- every dispatch replies "resurrect plugin unavailable".
+        if resurrect_mod ~= nil then
+            rawset(_G, "wezsesh_resurrect", resurrect_mod)
+        end
+
         -- When `opts.snapshot_dir` is nil/empty (the §11 default that
         -- delegates to §12.5 auto-detect), we deliberately do NOT call
         -- `change_state_save_dir`. The §9.1 "drift impossible by
@@ -208,10 +224,6 @@ function M.apply_to_config(config, opts)
         -- re-introduce exactly the drift this guarantee is supposed
         -- to prevent.
         if type(opts.snapshot_dir) == "string" and opts.snapshot_dir ~= "" then
-            local resurrect_mod = opts.resurrect
-            if resurrect_mod == nil then
-                resurrect_mod = rawget(_G, "resurrect")
-            end
             if type(resurrect_mod) == "table"
                and type(resurrect_mod.state_manager) == "table"
                and type(resurrect_mod.state_manager.change_state_save_dir)

@@ -203,6 +203,20 @@ func (c *Client) ActivateTab(ctx context.Context, tabID int) error {
 	)
 }
 
+// KillPane runs `cli kill-pane --pane-id N`. The TUI calls this after a
+// normal exit so the spawning wezsesh tab does not linger as a "Process
+// completed" placeholder when the user has `exit_behavior = "Hold"` set
+// globally (the wezsesh TUI is one-shot — its tab serves no purpose
+// once the picker has closed). A failure surfaces as ErrMuxUnreachable;
+// the caller logs and moves on (the worst-case is the same lingering
+// pane the user already lives with).
+func (c *Client) KillPane(ctx context.Context, paneID int) error {
+	if _, err := c.run(ctx, "cli", "kill-pane", "--pane-id", strconv.Itoa(paneID)); err != nil {
+		return fmt.Errorf("%w: %v", ErrMuxUnreachable, err)
+	}
+	return nil
+}
+
 // activateRetry is the shared retry-on-failure helper for ActivatePane /
 // ActivateTab. On the first failure, it re-lists the mux and consults the
 // presenceCheck closure: if the target is no longer present, the failure
