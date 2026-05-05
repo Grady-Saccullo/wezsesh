@@ -369,7 +369,13 @@ func TestOCloexecInheritance(t *testing.T) {
 	var script string
 	switch goos() {
 	case "linux":
-		script = `for f in /proc/self/fd/*; do readlink "$f"; done`
+		// readlink can legitimately fail on entries the runtime opens
+		// as anonymous inodes (eventpoll, eventfd, etc.) — those are
+		// not files we care about for the CLOEXEC assertion. The `||
+		// true` keeps the loop going so the script's exit code is the
+		// shell's, not a stray readlink's. (CI runners with newer
+		// glibc + Go runtimes surface anon_inode entries here.)
+		script = `for f in /proc/self/fd/*; do readlink "$f" 2>/dev/null || true; done`
 	case "darwin":
 		// lsof prints NAME column for each open file. Use awk to grab.
 		script = fmt.Sprintf(`/usr/sbin/lsof -p $$ 2>/dev/null | awk 'NR>1 {print $NF}' | grep -F %q || true`, path)

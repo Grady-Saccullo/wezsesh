@@ -113,6 +113,18 @@ func isIpcdispatcherPackage(path string) bool {
 	return isUnderPath(path, "internal/ipcdispatcher")
 }
 
+// isE2EHarness reports whether path lives under the //go:build e2e
+// test harness. The harness composes the dispatcher's primitives
+// directly (request file + reply socket) rather than going through
+// ipcdispatcher.New because the production dispatcher's
+// uservar.Writer constructor insists on /dev/tty (not available in
+// CI). The §16.5 boundary still binds production code; we exempt
+// the harness so the wire-protocol round-trip can be exercised end-
+// to-end against the live wezterm + plugin stack.
+func isE2EHarness(path string) bool {
+	return isUnderPath(path, "e2e")
+}
+
 // isUservarWriter reports whether path is the OSC writer's
 // implementation file. It opens /dev/tty directly via os.OpenFile to
 // satisfy the §3.1 single-syscall invariant; this is the only place

@@ -42,3 +42,28 @@ func wire() {
 		t.Errorf("want 0 findings inside ipcdispatcher, got %d: %v", len(out), out)
 	}
 }
+
+// TestStartListenerRule_Negative_E2EHarness: the //go:build e2e
+// harness composes dispatcher primitives directly (request file +
+// reply socket) because the production dispatcher's uservar.Writer
+// constructor insists on /dev/tty (not available in CI). The harness
+// is exempted so the wire round-trip can be exercised end-to-end
+// against the live wezterm + plugin stack.
+func TestStartListenerRule_Negative_E2EHarness(t *testing.T) {
+	src := []byte(`//go:build e2e
+
+package e2e
+
+import "github.com/Grady-Saccullo/wezsesh/internal/ipcsock"
+
+func wire() {
+	_, _, _ = ipcsock.StartListener("/tmp/x.sock", nil)
+}
+`)
+	rule := StartListenerRule()
+	fset, f := mustParseGo(t, src)
+	out := rule.Check("e2e/smoke_test.go", src, fset, f)
+	if len(out) != 0 {
+		t.Errorf("want 0 findings inside e2e harness, got %d: %v", len(out), out)
+	}
+}

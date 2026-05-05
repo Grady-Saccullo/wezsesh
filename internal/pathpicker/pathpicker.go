@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -68,6 +69,19 @@ func Resolve(ctx context.Context, userCmd string) ([]string, error) {
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = filterEnv(os.Environ())
+	// Group SIGKILL on timeout (§8.15). The default Cancel sends SIGKILL
+	// to the leader only; if the shell forked a child (rather than exec-
+	// ing it tail-position), the child stays alive and keeps the stdout
+	// pipe's write end open, blocking scanLines until the child exits
+	// naturally. Killing the whole process group ensures every fd-holder
+	// dies so the pipe EOFs promptly.
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// Belt-and-braces: if the pgroup kill is racy (e.g. the leader hasn't
+	// installed its pgid yet), force the I/O pipes closed after this
+	// grace window so cmd.Wait + scanLines unblock regardless.
+	cmd.WaitDelay = 100 * time.Millisecond
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -77,15 +91,6 @@ func Resolve(ctx context.Context, userCmd string) ([]string, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPathPickerCmdFailed, err)
 	}
-
-	// Group SIGKILL on timeout (§8.15). exec.CommandContext SIGKILLs the
-	// leader on ctx.Done; the deferred kill ensures any orphaned children
-	// in the new process group are reaped too.
-	defer func() {
-		if ctx.Err() != nil && cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-	}()
 
 	limited := &io.LimitedReader{R: stdout, N: maxStdoutBytes}
 	out := scanLines(limited)

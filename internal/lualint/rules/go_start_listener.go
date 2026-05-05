@@ -19,12 +19,16 @@ func StartListenerRule() GoRule {
 			if isIpcdispatcherPackage(path) {
 				return nil
 			}
-			// Test files outside ipcdispatcher would still be a
-			// boundary violation: §16.5 makes no exemption for tests
-			// here, and a test that wires its own listener leaks the
-			// concrete socket lifecycle into a non-dispatcher caller.
-			// Production code in ipcsock itself names the function in
-			// docstrings only; goSpans strips comments before matching.
+			if isE2EHarness(path) {
+				return nil
+			}
+			// Test files outside ipcdispatcher / e2e would still be a
+			// boundary violation: §16.5 makes no exemption for unit
+			// tests here, and a unit test that wires its own listener
+			// leaks the concrete socket lifecycle into a non-dispatcher
+			// caller. Production code in ipcsock itself names the
+			// function in docstrings only; goSpans strips comments
+			// before matching.
 			var out []lualint.Finding
 			for _, off := range indexAllInCode(src, "ipcsock.StartListener") {
 				line, col := posLineCol(src, off)

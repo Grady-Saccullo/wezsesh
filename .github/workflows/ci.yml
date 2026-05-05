@@ -126,8 +126,6 @@ jobs:
             # so `go test -race` runs (the race detector cannot execute under
             # cross-compilation).
             runner: ubuntu-24.04-arm
-          - target: darwin-amd64
-            runner: macos-13
           - target: darwin-arm64
             runner: macos-14
     steps:

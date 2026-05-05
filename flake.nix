@@ -221,7 +221,7 @@
             tag="''${TAG:-v$(git describe --tags --always)}"
             echo "release-build-all: tag=$tag (cross-compiled local pre-flight; see docs/release.md)"
 
-            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            for target in linux-amd64 linux-arm64 darwin-arm64; do
               goos="''${target%-*}"
               goarch="''${target#*-}"
               TAG="$tag" GOOS="$goos" GOARCH="$goarch" wezsesh-release-package

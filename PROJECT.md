@@ -137,8 +137,9 @@ this file. See `.claude/skills/next-task/SKILL.md`.
   reproducible build, `LC_ALL=C` canonical-JSON tests (placeholder until T-102),
   Lua version assertion (deferred until plugin lands), verb/shape parity
   (placeholder until T-601).
-- Build matrix: `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`,
-  with macOS runners pinned to `macos-13` and `macos-14`.
+- Build matrix: `linux-amd64`, `linux-arm64`, `darwin-arm64`, with the macOS
+  runner pinned to `macos-14`. (`darwin-amd64` / `macos-13` was dropped from
+  CI + release; spec drift queued as T-DOC-058 against §16.4.)
 - CI passes on a fresh PR.
 **Done when:** a no-op PR shows green across the matrix.
 **Accepted findings:**
@@ -1436,6 +1437,19 @@ Drift between `docs/design.md` / `docs/prd.md` and reality, discovered during
 build tasks and auto-queued by `/next-task`. T-DOC tasks are the only exception
 to the "no spec edits from build tasks" rule — their `Files` list names docs
 explicitly. `Owner` is always `general-purpose` (prose work). No `Depends-on`.
+
+### T-DOC-058 · `docs/design.md` §16.4 drop `darwin-amd64` / `macos-13` from the build matrix
+**Status:** ready
+**Owner:** general-purpose
+**Depends-on:** —
+**Spec:** `docs/design.md` §16.4 currently lists the build matrix as `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64` with macOS runners pinned to `macos-13` and `macos-14`. CI + release were narrowed to drop `darwin-amd64` / `macos-13`; only `darwin-arm64` / `macos-14` remains for macOS.
+**Files:** `docs/design.md`
+**Discovered in:** first green CI run on `main` after the squashed initial-implementation commit. The `darwin-amd64` job was never wired to a hosted runner that exists in GH's current free-tier roster (`macos-13` is being phased out), and the project decided macOS coverage on arm64 is sufficient.
+**Acceptance gates:**
+- §16.4 build-matrix line lists `linux-amd64`, `linux-arm64`, `darwin-arm64` only.
+- macOS runner pin in §16.4 is `macos-14` only (no `macos-13`).
+- `rg -nF 'darwin-amd64' docs/design.md` finds zero matches outside clearly-labelled historical / "future work" prose.
+**Done when:** the §16.4 build-matrix wording matches `.github/workflows/{ci,release}.yml` and `flake.nix`'s `release-build-all` target loop.
 
 ### T-DOC-057 · `docs/prd.md` §about-version drop the `runtime/debug.ReadBuildInfo` fallback claim
 **Status:** done
