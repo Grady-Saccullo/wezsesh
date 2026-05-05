@@ -48,7 +48,7 @@
 -- shim via `package.preload["wezterm"]` BEFORE requiring this file.
 
 local wezterm = require("wezterm")
-local b64     = require("wezsesh.b64")
+local b64     = require("wezsesh.crypto.b64")
 local globals = require("wezsesh.runtime.globals")
 
 local M = {}

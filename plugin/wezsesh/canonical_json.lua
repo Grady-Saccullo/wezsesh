@@ -21,17 +21,21 @@ M.NULL      = setmetatable({}, { __wezsesh_canonical = "null" })
 function M.array(t)  return setmetatable(t or {}, M.array_mt)  end
 function M.object(t) return setmetatable(t or {}, M.object_mt) end
 
--- Verb args shape declarations (§4.2). Mirrored on the dispatcher; CI
--- lint enforces parity between dispatch_table keys and these keys.
-M.verb_args_shape = {
-    switch = { _shape = "object", name = "string" },
-    load   = { _shape = "object", name = "string" },
-    save   = { _shape = "object",
-               name = "string", overwrite = "bool",
-               expected_hash = "string_or_null" },
-    new    = { _shape = "object", name = "string", cwd = "string" },
-    noop   = { _shape = "object" },
-}
+-- Verb args shape declarations. Source of truth for each shape is the
+-- per-verb module (plugin/wezsesh/verbs/X.lua); we populate this field
+-- at module load time by asking the verbs registry. Wrapped in pcall
+-- so spec environments that don't have the verbs module on
+-- package.path degrade to an empty shape table — those specs that
+-- need shape data add the parent dir to package.path so the require
+-- resolves.
+do
+    local ok, verbs = pcall(require, "wezsesh.verbs")
+    if ok and type(verbs) == "table" and type(verbs.shapes) == "function" then
+        M.verb_args_shape = verbs.shapes()
+    else
+        M.verb_args_shape = {}
+    end
+end
 
 -- Root payload envelope (§3.3). Used by ipc.lua step (e):
 --   tag_in_place(payload, ROOT_PAYLOAD_SHAPE, verb_args_shape[op]).

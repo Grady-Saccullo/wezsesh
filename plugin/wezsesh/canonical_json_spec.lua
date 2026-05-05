@@ -15,7 +15,28 @@ local function script_dir()
     local src = arg and arg[0] or "plugin/wezsesh/canonical_json_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;" .. package.path
+local function parent_dir(p) return p:match("^(.*)/[^/]+$") or "." end
+-- Three roots: script_dir for bare requires (canonical_json), parent
+-- for dotted requires (wezsesh.verbs, wezsesh.runtime.*), and the
+-- /?/init.lua suffix for verbs/init.lua.
+package.path = script_dir() .. "/?.lua;"
+            .. parent_dir(script_dir()) .. "/?.lua;"
+            .. parent_dir(script_dir()) .. "/?/init.lua;"
+            .. package.path
+
+-- canonical_json's verb_args_shape now sources from wezsesh.verbs at
+-- module load. Loading verbs pulls in result.lua and runtime/globals.lua,
+-- which both `require("wezterm")` at the top. The encoder itself is
+-- pure-Lua and never calls a wezterm function, so a minimal table-with-
+-- empty-GLOBAL shim is enough to satisfy the indirect requires.
+package.preload["wezterm"] = function()
+    return {
+        GLOBAL = setmetatable({}, {
+            __index    = function() return nil end,
+            __newindex = function() end,
+        }),
+    }
+end
 
 local cj = require("canonical_json")
 

@@ -16,8 +16,8 @@
 -- init.lua (which only wipes `package.loaded["wezsesh.*"]`), so a
 -- Ctrl+Shift+R reload preserves the reference until init.lua re-stamps it.
 --
--- Consumers (`wezsesh.ops`, `wezsesh.on_pane_restore`) call `get()` —
--- they never touch `_G` directly. The lualint rule
+-- Consumers (`wezsesh.verbs._deps`, `wezsesh.on_pane_restore`) call
+-- `get()` — they never touch `_G` directly. The lualint rule
 -- `lua-resurrect-ref-only` enforces that.
 --
 -- Fallback: `_G.resurrect` is checked when `_G.wezsesh_resurrect` is

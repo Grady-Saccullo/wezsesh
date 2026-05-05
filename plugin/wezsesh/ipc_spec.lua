@@ -263,7 +263,7 @@ package.preload["wezterm"] = function() return wezterm_shim end
 local ipc            = require("wezsesh.ipc")
 local state          = require("wezsesh.runtime.state")
 local canonical_json = require("wezsesh.canonical_json")
-local hmac           = require("wezsesh.hmac")
+local hmac           = require("wezsesh.crypto.hmac")
 
 -- ────────────────────────────────────────────────────────────────────
 -- minimal busted-shaped harness

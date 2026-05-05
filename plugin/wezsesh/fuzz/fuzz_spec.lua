@@ -286,8 +286,8 @@ package.preload["wezterm"] = function() return wezterm_shim end
 local ipc            = require("wezsesh.ipc")
 local state          = require("wezsesh.runtime.state")
 local canonical_json = require("wezsesh.canonical_json")
-local hmac           = require("wezsesh.hmac")
-local b64            = require("wezsesh.b64")
+local hmac           = require("wezsesh.crypto.hmac")
+local b64            = require("wezsesh.crypto.b64")
 
 -- ────────────────────────────────────────────────────────────────────
 -- per-iteration constants + shared fixtures

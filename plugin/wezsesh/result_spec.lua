@@ -281,7 +281,7 @@ end
 -- Decode the b64 payload of the most-recent spawn call into a Lua
 -- table for shape assertions. Mirrors what `wezsesh reply` does on
 -- the binary side.
-local b64 = require("b64")
+local b64 = require("wezsesh.crypto.b64")
 local function last_envelope()
     assert_true(#bg_calls > 0,
         "expected at least one wezterm.background_child_process call")
@@ -797,28 +797,25 @@ function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- LOW fix — production result.lua requires `wezsesh.b64` (the §11 /
--- §16.5 cache-bust loop keys on the `wezsesh.` prefix). The bare
--- `require("b64")` form would survive Ctrl+Shift+R reloads. Confirm
--- the namespaced require resolves and produces the same module
--- identity as the bare-require side-channel used by this harness.
+-- Production result.lua requires `wezsesh.crypto.b64` (the cache-bust
+-- loop in init.lua keys on the `wezsesh.` prefix). Confirm the
+-- namespaced require resolves and produces a working module instance.
 -- ────────────────────────────────────────────────────────────────────
 
-describe("LOW fix: namespaced require('wezsesh.b64') resolves (§11/§16.5)",
-function()
-    it("require('wezsesh.b64') resolves to the same module as 'b64'",
+describe("namespaced require('wezsesh.crypto.b64') resolves", function()
+    it("require('wezsesh.crypto.b64') exposes encode + decode",
     function()
-        local namespaced = require("wezsesh.b64")
+        local namespaced = require("wezsesh.crypto.b64")
         assert_true(type(namespaced) == "table",
-            "wezsesh.b64 did not load")
+            "wezsesh.crypto.b64 did not load")
         assert_true(type(namespaced.encode) == "function",
-            "wezsesh.b64.encode missing")
+            "wezsesh.crypto.b64.encode missing")
         assert_true(type(namespaced.decode) == "function",
-            "wezsesh.b64.decode missing")
+            "wezsesh.crypto.b64.decode missing")
         -- Round-trip parity sanity check.
         local s = "hello, world"
         assert_eq(namespaced.decode(namespaced.encode(s)), s,
-            "wezsesh.b64 round-trip failed")
+            "wezsesh.crypto.b64 round-trip failed")
     end)
 end)
 

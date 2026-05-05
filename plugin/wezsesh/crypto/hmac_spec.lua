@@ -13,27 +13,47 @@
 -- regardless of CWD: derive this spec's directory from arg[0] and
 -- prepend it.
 local function script_dir()
-    local src = arg and arg[0] or "plugin/wezsesh/hmac_spec.lua"
+    local src = arg and arg[0] or "plugin/wezsesh/crypto/hmac_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
--- T-907: hmac.lua now uses `require("wezsesh.vendor.sha2")`. wezterm's
--- `wezterm.plugin.require` adds `<plugin_root>/plugin/?.lua` to
--- package.path, under which that name resolves. Locally the spec runs
--- without that machinery, so we add the parent of script_dir() (i.e.
--- `plugin/`) to package.path so the wezsesh-prefixed lookup matches
--- `plugin/wezsesh/vendor/sha2.lua`. The original script_dir() entries
--- stay so `require("hmac")` and `require("canonical_json")` below still
--- resolve.
+-- Three roots so this spec runs both bare and under wezterm's
+-- `wezterm.plugin.require` (which adds `<plugin_root>/plugin/?.lua`):
+--
+--   * SPEC_DIR     — `plugin/wezsesh/crypto/?.lua`. Lets bare
+--                    `require("hmac")` find this directory's hmac.lua.
+--   * SPEC_DIR/..  — `plugin/wezsesh/?.lua`. Lets bare
+--                    `require("canonical_json")` find the sibling
+--                    plugin/wezsesh/canonical_json.lua.
+--   * SPEC_DIR/../.. — `plugin/?.lua`. Lets the dotted form
+--                    `require("wezsesh.vendor.sha2")` (used inside
+--                    hmac.lua) resolve to plugin/wezsesh/vendor/sha2.lua.
 local function parent_dir(p)
     return p:match("^(.*)/[^/]+$") or "."
 end
 local SPEC_DIR = script_dir()
 local PARENT_DIR = parent_dir(SPEC_DIR)
-package.path = PARENT_DIR .. "/?.lua;"
-            .. PARENT_DIR .. "/?/init.lua;"
-            .. SPEC_DIR .. "/?.lua;"
+local GRANDPARENT_DIR = parent_dir(PARENT_DIR)
+package.path = SPEC_DIR .. "/?.lua;"
             .. SPEC_DIR .. "/?/init.lua;"
+            .. PARENT_DIR .. "/?.lua;"
+            .. PARENT_DIR .. "/?/init.lua;"
+            .. GRANDPARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?/init.lua;"
             .. package.path
+
+-- canonical_json's verb_args_shape sources from wezsesh.verbs at module
+-- load. The verb modules indirectly require wezterm (via result.lua and
+-- runtime/globals.lua); a minimal table-with-empty-GLOBAL shim is enough
+-- to satisfy the load — none of those module bodies actually call into
+-- wezterm at load time.
+package.preload["wezterm"] = function()
+    return {
+        GLOBAL = setmetatable({}, {
+            __index    = function() return nil end,
+            __newindex = function() end,
+        }),
+    }
+end
 
 local hm = require("hmac")
 local cj = require("canonical_json")
@@ -329,20 +349,18 @@ end)
 
 describe("§16.3 require-name resolves under wezterm.plugin.require "
     .. "search root", function()
-    -- T-907 regression pin. wezterm.plugin.require adds
+    -- Regression pin. wezterm.plugin.require adds
     -- `<plugin_root>/plugin/?.lua` to package.path. With that single
     -- entry, `require("wezsesh.vendor.sha2")` MUST resolve to
     -- `<plugin_root>/plugin/wezsesh/vendor/sha2.lua`. If a future change
     -- reverts hmac.lua to `require("vendor.sha2")`, the spec would
-    -- still pass under the SPEC_DIR fallback (because SPEC_DIR points
-    -- at `plugin/wezsesh` and `vendor/sha2.lua` lives directly under
-    -- it), but the production wezterm plugin load would BREAK with
-    -- "module 'vendor.sha2' not found". This test exercises ONLY the
-    -- production-equivalent search root, isolating the require-name
-    -- contract.
+    -- still pass under one of the local fallbacks, but the production
+    -- wezterm plugin load would BREAK with "module 'vendor.sha2' not
+    -- found". This test exercises ONLY the production-equivalent
+    -- search root, isolating the require-name contract.
     it("package.searchpath('wezsesh.vendor.sha2', '<plugin>/?.lua') "
         .. "resolves to plugin/wezsesh/vendor/sha2.lua", function()
-        local production_search = PARENT_DIR .. "/?.lua"
+        local production_search = GRANDPARENT_DIR .. "/?.lua"
         local found = package.searchpath("wezsesh.vendor.sha2",
             production_search)
         assert_true(found ~= nil,
@@ -364,7 +382,7 @@ describe("§16.3 require-name resolves under wezterm.plugin.require "
         -- `vendor.sha2` name MUST NOT resolve. If it did, reverting
         -- hmac.lua's require would silently still work in production
         -- and the rename would be cosmetic.
-        local production_search = PARENT_DIR .. "/?.lua"
+        local production_search = GRANDPARENT_DIR .. "/?.lua"
         local found = package.searchpath("vendor.sha2",
             production_search)
         assert_true(found == nil,

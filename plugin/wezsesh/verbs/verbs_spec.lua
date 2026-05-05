@@ -24,15 +24,28 @@
 -- exercised end-to-end.
 
 local function script_dir()
-    local src = arg and arg[0] or "plugin/wezsesh/ops_spec.lua"
+    local src = arg and arg[0] or "plugin/wezsesh/verbs/verbs_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;"
-            .. script_dir() .. "/../?.lua;"
+local function parent_dir(p)
+    return p:match("^(.*)/[^/]+$") or "."
+end
+local SPEC_DIR = script_dir()                        -- plugin/wezsesh/verbs
+local PARENT_DIR = parent_dir(SPEC_DIR)              -- plugin/wezsesh
+local GRANDPARENT_DIR = parent_dir(PARENT_DIR)       -- plugin
+-- Three roots: SPEC_DIR for sibling files (verbs/_deps, verbs/_restore),
+-- PARENT_DIR for cousins (canonical_json, resurrect_error, b64),
+-- GRANDPARENT_DIR for dotted requires (wezsesh.runtime.*, wezsesh.crypto.*,
+-- wezsesh.verbs). The `/?/init.lua` suffix lets the dotted form
+-- `require("wezsesh.verbs")` resolve to the verbs/init.lua file.
+package.path = SPEC_DIR .. "/?.lua;"
+            .. PARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?/init.lua;"
             .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
--- wezterm shim — installed BEFORE require("ops")
+-- wezterm shim — installed BEFORE require("wezsesh.verbs")
 -- ────────────────────────────────────────────────────────────────────
 
 local function deepcopy(v)
@@ -232,10 +245,13 @@ end
 package.preload["wezterm"] = function() return wezterm_shim end
 
 -- Now load the modules under test.
-local b64 = require("b64")
+local b64             = require("wezsesh.crypto.b64")
 local resurrect_error = require("resurrect_error")
-local canonical_json = require("canonical_json")
-local ops = require("ops")
+local canonical_json  = require("canonical_json")
+local verbs           = require("wezsesh.verbs")
+-- Tests written against the previous ops module; alias preserves the
+-- assertions verbatim.
+local ops             = verbs
 
 -- Install the persistent resurrect.error listener once (matches the
 -- production `apply_to_config` flow). The _G install gate keeps this
@@ -352,13 +368,13 @@ end)
 -- §17.4 — verb / shape parity (runtime mirror of CI lint)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("verb / shape parity (§17.4)", function()
-    it("verb_args_shape keys equal dispatch_table keys", function()
+describe("verb / shape parity", function()
+    it("verbs.shapes() keys equal dispatch_table keys", function()
         local sk, dk = {}, {}
-        for k in pairs(canonical_json.verb_args_shape) do
+        for k in pairs(verbs.shapes()) do
             sk[#sk + 1] = k
         end
-        for k in pairs(ops.dispatch_table) do
+        for k in pairs(verbs.dispatch_table) do
             dk[#dk + 1] = k
         end
         table.sort(sk); table.sort(dk)

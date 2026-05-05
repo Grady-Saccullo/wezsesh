@@ -33,9 +33,9 @@
 
 local wezterm        = require("wezterm")
 local canonical_json = require("wezsesh.canonical_json")
-local ct_eq          = require("wezsesh.ct_eq")
+local ct_eq          = require("wezsesh.crypto.ct_eq")
 local globals        = require("wezsesh.runtime.globals")
-local hmac           = require("wezsesh.hmac")
+local hmac           = require("wezsesh.crypto.hmac")
 local log            = require("wezsesh.runtime.log")
 local state          = require("wezsesh.runtime.state")
 
@@ -459,18 +459,18 @@ function M.handle_user_var(window, pane, name, value, opts)
     })
 
     -- ── Step (i): dispatch (pcall — fire-and-forget reply spawn lives
-    --             inside ops.dispatch via result.lua) ─────────────────
+    --             inside verbs.dispatch via result.lua) ────────────────
     local dispatch_fn = M._deps.dispatch
     if dispatch_fn == nil then
-        local ok_req, ops = pcall(require, "wezsesh.ops")
-        if ok_req and type(ops) == "table"
-           and type(ops.dispatch) == "function"
+        local ok_req, verbs = pcall(require, "wezsesh.verbs")
+        if ok_req and type(verbs) == "table"
+           and type(verbs.dispatch) == "function"
         then
-            dispatch_fn = ops.dispatch
+            dispatch_fn = verbs.dispatch
         end
     end
     if type(dispatch_fn) ~= "function" then
-        log.warn("ipc: ops.dispatch unavailable")
+        log.warn("ipc: verbs.dispatch unavailable")
         return
     end
 
