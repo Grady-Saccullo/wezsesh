@@ -13,7 +13,7 @@
 -- The spec installs a wezterm-shim via `package.preload["wezterm"]`
 -- BEFORE requiring the module under test. The shim records every
 -- `wezterm.background_child_process` invocation in `bg_calls` so the
--- spec can decode the b64 reply payload and assert on the §3.4
+-- spec can decode the b64 reply payload and assert on the reply
 -- envelope shape. `wezterm.mux` is a stub the per-test setup mutates
 -- to exercise the switch / new dispatch arms.
 --
@@ -201,7 +201,7 @@ end
 -- Module surface (T-601 done-when)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.4)", function()
+describe("module surface", function()
     it("exposes dispatch_table, dispatch, _set_deps, _reset_deps",
     function()
         assert_true(type(ops.dispatch_table) == "table",
@@ -214,7 +214,7 @@ describe("module surface (§9.4)", function()
             "M._reset_deps missing")
     end)
 
-    it("dispatch_table has exactly the five §6 verbs", function()
+    it("dispatch_table has exactly the five wire verbs", function()
         local want = { "load", "new", "noop", "save", "switch" }
         local keys = {}
         for k in pairs(ops.dispatch_table) do keys[#keys + 1] = k end
@@ -225,7 +225,7 @@ describe("module surface (§9.4)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.4 — verb / shape parity (runtime mirror of CI lint)
+-- verb / shape parity (runtime mirror of CI lint)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("verb / shape parity", function()
@@ -245,10 +245,10 @@ describe("verb / shape parity", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §13.13 — Unknown verb (defensive branch unreachable in production)
+-- Unknown verb (defensive branch unreachable in production)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("unknown verb (§13.13 / §9.4 defensive branch)", function()
+describe("unknown verb (defensive branch)", function()
     it("dispatching `op=bogus` replies UNKNOWN_VERB, ok=false, "
         .. "status=completed", function()
         local p = fixture_payload("bogus")
@@ -266,10 +266,10 @@ describe("unknown verb (§13.13 / §9.4 defensive branch)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.5 — noop
+-- noop verb
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.5 — noop", function()
+describe("noop", function()
     it("replies completed + empty data", function()
         local p = fixture_payload("noop")
         ops.dispatch(p, nil, nil)
@@ -284,10 +284,10 @@ describe("§6.5 — noop", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.4.2 — save (dual-path detector)
+-- save (dual-path detector)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§9.4.2 — save", function()
+describe("save", function()
     it("Lua-side I/O failure (capture non-empty) → SAVE_FAILED via "
         .. "with_capture", function()
         ops._set_deps{
@@ -390,15 +390,15 @@ describe("§9.4.2 — save", function()
         assert_eq(env.data.name, "snap-1", "save success: data.name wrong")
         assert_nil(env.data.hash,
             "save success: Lua MUST NOT set `hash`; binary fills it "
-            .. "in Phase C (§13.4)")
+            .. "post-reply once it has hashed the on-disk snapshot")
     end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.4.1 — load (split-reply restore-class)
+-- load (split-reply restore-class)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§9.4.1 — load", function()
+describe("load", function()
     it("torn JSON (pcall raised) → started preamble + "
         .. "SNAPSHOT_LOAD_FAILED; restore_workspace NEVER called",
     function()
@@ -443,7 +443,7 @@ describe("§9.4.1 — load", function()
             .. tostring(err_env.error.details.raw_error))
         assert_true(not restore_called,
             "load torn-JSON: restore_workspace MUST NOT run on a "
-            .. "failed load (§9.4.1 step 2 guard)")
+            .. "failed load")
     end)
 
     it("silent decrypt failure ({} return + capture) → "
@@ -454,7 +454,7 @@ describe("§9.4.1 — load", function()
             resurrect = {
                 state_manager = {
                     load_state = function(_name, _kind)
-                        -- Spike #2 V5: decrypt failure path. resurrect's
+                        -- Decrypt failure path. resurrect's
                         -- state_manager returns `{}` after emitting a
                         -- resurrect.error.
                         emit("resurrect.error",
@@ -491,7 +491,7 @@ describe("§9.4.1 — load", function()
             .. tostring(err_env.error.details.raw_error))
         assert_true(not restore_called,
             "load decrypt: restore_workspace MUST NOT run when the "
-            .. "load has no .window_states (§9.4.1 step 2 guard)")
+            .. "load has no .window_states")
     end)
 
     it("success → started + completed; data: { name, workspace }",
@@ -564,10 +564,10 @@ describe("§9.4.1 — load", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.1 — switch (live target vs saved-not-live)
+-- switch (live target vs saved-not-live)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.1 — switch", function()
+describe("switch", function()
     it("live target → completed + data: { active_workspace }; "
         .. "set_active_workspace called; load/restore NEVER", function()
         local set_called_with = nil
@@ -663,10 +663,10 @@ describe("§6.1 — switch", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.4 — new
+-- new
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.4 — new", function()
+describe("new", function()
     it("success → completed + data: { name, pane_id }", function()
         local fake_pane = { pane_id = function(_self) return 42 end }
         mux_stub.spawn_window = function(_opts)
@@ -704,7 +704,7 @@ end)
 -- Outer dispatch — pcall boundary swallows verb raises
 -- ────────────────────────────────────────────────────────────────────
 
-describe("dispatch outer pcall boundary (§9.4)", function()
+describe("dispatch outer pcall boundary", function()
     it("a verb raise does NOT propagate; replies UNKNOWN error",
     function()
         -- Inject a bogus dispatch arm that raises immediately. We use

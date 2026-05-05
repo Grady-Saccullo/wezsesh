@@ -118,7 +118,7 @@ local function assert_raises(fn, sentinel)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.2 fixture (mirrors internal/hmac/testdata/roundtrip.json)
+-- HMAC round-trip fixture (mirrors internal/hmac/testdata/roundtrip.json)
 -- ────────────────────────────────────────────────────────────────────
 
 local FIXTURE_KEY_HEX =
@@ -132,7 +132,7 @@ local FIXTURE_CANONICAL_SANS_HMAC =
 local FIXTURE_EXPECTED_HMAC =
     "52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5"
 
--- The §17.2 payload as a Lua table, identical in shape to the Go
+-- The fixture payload as a Lua table, identical in shape to the Go
 -- fixture's `payload` map. `args` is the parser-style empty table; the
 -- canonical_json verb tagger upgrades it to an object below.
 local function fixture_payload()
@@ -151,7 +151,7 @@ end
 -- tests
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§17.2 round-trip fixture", function()
+describe("round-trip fixture", function()
     it("compute over the pinned canonical sans-hmac bytes "
         .. "= expected_hmac", function()
         local got = hm.compute(FIXTURE_CANONICAL_SANS_HMAC, FIXTURE_KEY_HEX)
@@ -172,10 +172,10 @@ describe("§17.2 round-trip fixture", function()
         local sans = cj.copy_without(payload, "hmac")
         local sans_bytes = cj.encode(sans)
         assert_eq(sans_bytes, FIXTURE_CANONICAL_SANS_HMAC,
-            "encoded sans-hmac bytes diverge from §17.2 fixture")
+            "encoded sans-hmac bytes diverge from fixture")
         local got = hm.compute(sans_bytes, FIXTURE_KEY_HEX)
         assert_eq(got, FIXTURE_EXPECTED_HMAC,
-            "round-trip digest diverges from §17.2 fixture")
+            "round-trip digest diverges from fixture")
     end)
 
     it("verify accepts the freshly-signed payload (Lua sign → "
@@ -195,7 +195,7 @@ describe("§17.2 round-trip fixture", function()
     end)
 end)
 
-describe("§4.3 field-removal sequence (no hmac=\"\" set-then-encode)",
+describe("field-removal sequence (no hmac=\"\" set-then-encode)",
 function()
     it("the canonical sans-hmac bytes contain no \"hmac\":"
         .. " fragment", function()
@@ -223,9 +223,9 @@ function()
 
         -- Forbidden: payload constructed with hmac = "" and encoded.
         -- Used here as the negative control — its bytes contain
-        -- `"hmac":""` and the digest MUST diverge from the §17.2
-        -- expected. If these matched, the §4.3 invariant would be
-        -- silently violable.
+        -- `"hmac":""` and the digest MUST diverge from the
+        -- fixture expected. If these matched, the field-removal
+        -- invariant would be silently violable.
         local wrong_payload = fixture_payload()
         wrong_payload.hmac = ""
         cj.tag_in_place(wrong_payload, cj.ROOT_PAYLOAD_SHAPE,
@@ -238,7 +238,7 @@ function()
         assert_true(right_digest ~= wrong_digest,
             "removal vs zeroing collided: both produced " .. right_digest)
         assert_eq(right_digest, FIXTURE_EXPECTED_HMAC,
-            "removal-form digest diverges from §17.2 expected")
+            "removal-form digest diverges from fixture expected")
     end)
 end)
 
@@ -287,7 +287,7 @@ describe("verify shape negatives", function()
     end)
 end)
 
-describe("compute key-shape enforcement (§5.1)", function()
+describe("compute key-shape enforcement", function()
     it("rejects non-string key", function()
         assert_raises(function()
             hm.compute(FIXTURE_CANONICAL_SANS_HMAC, nil)
@@ -309,7 +309,7 @@ describe("compute key-shape enforcement (§5.1)", function()
         end, "HMAC_BAD_KEY")
     end)
 
-    it("rejects uppercase hex (lowercase-only per §5.1)", function()
+    it("rejects uppercase hex (lowercase-only)", function()
         assert_raises(function()
             hm.compute(FIXTURE_CANONICAL_SANS_HMAC,
                 FIXTURE_KEY_HEX:upper())
@@ -332,7 +332,7 @@ describe("compute key-shape enforcement (§5.1)", function()
     end)
 end)
 
-describe("hex-decoded key length (§5.1: 32 raw bytes)", function()
+describe("hex-decoded key length (32 raw bytes)", function()
     it("compute produces a 64-char lowercase-hex digest", function()
         local d = hm.compute("", FIXTURE_KEY_HEX)
         assert_eq(#d, 64, "digest length")
@@ -341,7 +341,7 @@ describe("hex-decoded key length (§5.1: 32 raw bytes)", function()
     end)
 end)
 
-describe("§16.3 require-name resolves under wezterm.plugin.require "
+describe("require-name resolves under wezterm.plugin.require "
     .. "search root", function()
     -- Regression pin. wezterm.plugin.require adds
     -- `<plugin_root>/plugin/?.lua` to package.path. With that single

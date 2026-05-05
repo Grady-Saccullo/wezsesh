@@ -15,7 +15,7 @@
 --     `package.loaded["wezsesh.fake"] = "stub"` is nil after
 --     apply_to_config).
 --   * `resurrect_error.register()` is invoked.
---   * Appendix C event set is the EXACT registration set (the spec
+--   * The contract event set is the EXACT registration set (the spec
 --     observes `wezterm.on(name, ...)` calls and asserts the names).
 --   * `change_state_save_dir(opts.snapshot_dir .. "/")` is called with
 --     the trailing slash.
@@ -138,7 +138,7 @@ local ipc_shim = {
     register = function(opts)
         ipc_calls.register[#ipc_calls.register + 1] = deepcopy(opts)
         -- Mirror production: ipc.register installs a user-var-changed
-        -- handler. Required for the Appendix C event-set assertion.
+        -- handler. Required for the contract event-set assertion.
         wezterm_shim.on("user-var-changed", function() end)
     end,
 }
@@ -155,7 +155,7 @@ local resurrect_error_shim = {
 
 -- Resurrect plugin shim (the user-supplied resurrect.wezterm). Shape
 -- mirrors `resurrect.state_manager.change_state_save_dir(string)`. We
--- record every call to assert the §9.1 trailing-slash contract.
+-- record every call to assert the trailing-slash contract.
 local resurrect_calls = { change_state_save_dir = {} }
 local resurrect_shim = {
     state_manager = {
@@ -309,7 +309,7 @@ end
 -- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.1)", function()
+describe("module surface", function()
     it("exposes apply_to_config and a VERSION constant", function()
         assert_eq(type(init.apply_to_config), "function",
             "apply_to_config not function")
@@ -320,10 +320,10 @@ describe("module surface (§9.1)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 — package.loaded["wezsesh.*"] cache-bust loop (spike #1)
+-- package.loaded["wezsesh.*"] cache-bust loop
 -- ────────────────────────────────────────────────────────────────────
 
-describe("cache-bust loop (§9.1 / §17.4)", function()
+describe("cache-bust loop", function()
     it("nils every package.loaded['wezsesh.*'] entry on entry", function()
         package.loaded["wezsesh.fake_sentinel"] = "stub"
         package.loaded["wezsesh.another_one"] = { tag = "stub" }
@@ -346,9 +346,9 @@ describe("cache-bust loop (§9.1 / §17.4)", function()
         package.loaded["wezsesh"] = nil
     end)
 
-    it("the literal §17.4 grep pattern is present in init.lua source",
+    it("the literal grep pattern is present in init.lua source",
     function()
-        -- §17.4 grep gate: the bust loop must literally appear in the
+        -- The lualint rule requires the bust loop to literally appear in the
         -- file source. CI runs a grep; we reproduce it here so the
         -- requirement breaks visibly if the loop is rewritten.
         local f = io.open(script_dir() .. "/init.lua", "rb")
@@ -365,10 +365,10 @@ describe("cache-bust loop (§9.1 / §17.4)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- P §7.1 / §10.6 — GLOBAL schema-version stamp + cross-version wipe
+-- GLOBAL schema-version stamp + cross-version wipe
 -- ────────────────────────────────────────────────────────────────────
 
-describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
+describe("GLOBAL schema-version stamp", function()
     it("stamps wezsesh_plugin_version on first load (no wipe needed)",
     function()
         -- Pre-state empty; the stamp must equal init.VERSION afterwards.
@@ -477,10 +477,10 @@ describe("GLOBAL schema-version stamp (P §7.1, §10.6)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 step (a) — resurrect_error.register() invoked (spike #2)
+-- step (a) — resurrect_error.register() invoked
 -- ────────────────────────────────────────────────────────────────────
 
-describe("resurrect_error.register (§9.1.a / §17.4)", function()
+describe("resurrect_error.register", function()
     it("is invoked exactly once per apply_to_config call", function()
         init.apply_to_config({}, {})
         assert_eq(resurrect_error_calls.register, 1,
@@ -489,10 +489,10 @@ describe("resurrect_error.register (§9.1.a / §17.4)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 step (b) — change_state_save_dir trailing-slash contract
+-- step (b) — change_state_save_dir trailing-slash contract
 -- ────────────────────────────────────────────────────────────────────
 
-describe("change_state_save_dir (§9.1.b)", function()
+describe("change_state_save_dir", function()
     it("calls resurrect.state_manager.change_state_save_dir with " ..
         "snapshot_dir + '/'", function()
         init.apply_to_config({}, {
@@ -529,10 +529,10 @@ describe("change_state_save_dir (§9.1.b)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 / §0.1 row 31 — opts.binary / opts.plugin_root precedence
+-- opts.binary / opts.plugin_root precedence
 -- ────────────────────────────────────────────────────────────────────
 
-describe("binary / plugin_root precedence (§9.1)", function()
+describe("binary / plugin_root precedence", function()
     it("both-set: binary wins (passed unchanged to resolve_binary)",
     function()
         init.apply_to_config({}, {
@@ -542,7 +542,7 @@ describe("binary / plugin_root precedence (§9.1)", function()
         local opts = manager_calls.resolve_binary[1]
         assert_eq(opts.binary, "/abs/wezsesh", "binary not preserved")
         -- plugin_root carried through but binary takes precedence in
-        -- manager.resolve_binary itself (see §9.2).
+        -- manager.resolve_binary itself.
         assert_eq(opts.plugin_root, "/should/not/win",
             "plugin_root mutated despite both-set")
     end)
@@ -607,27 +607,27 @@ describe("binary / plugin_root precedence (§9.1)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- Appendix C — exact event-subscription set
+-- exact event-subscription set
 -- ────────────────────────────────────────────────────────────────────
 --
--- The §17.4 lint rejects `wezterm.on("restore_workspace.finished", …)`,
--- `wezterm.on("smart_workspace_switcher.*", …)`, etc. We assert the
--- POSITIVE shape here: the only event names that appear in `on_calls`
--- after a clean apply_to_config are the Appendix C set.
+-- The `lua-restore-finished-ban` rule rejects
+-- `wezterm.on("restore_workspace.finished", …)` and friends. We
+-- assert the POSITIVE shape here: the only event names that appear in
+-- `on_calls` after a clean apply_to_config are the contract event
+-- set.
 --
--- Note: Appendix C lists three events for this plugin's surface
--- (write_state.start, write_state.finished, resurrect.error). The
--- `user-var-changed` registration also fires (per §9.3). The shims for
--- resurrect_error.register and ipc.register both call wezterm_shim.on
--- to mirror production registration; the resurrect_error wrapper does
--- not also subscribe to the file_io.write_state events here, because
--- those are owned by the resurrect plugin's own apply_to_config — the
--- wezsesh side just routes via state.set_writing as the handler. The
--- spec asserts the exact set of names that wezsesh's own
--- apply_to_config triggers.
+-- The contract events are write_state.start, write_state.finished,
+-- and resurrect.error. The `user-var-changed` registration also
+-- fires. The shims for resurrect_error.register and ipc.register
+-- both call wezterm_shim.on to mirror production registration; the
+-- resurrect_error wrapper does not also subscribe to the
+-- file_io.write_state events here, because those are owned by the
+-- resurrect plugin's own apply_to_config — the wezsesh side just
+-- routes via state.set_writing as the handler. The spec asserts the
+-- exact set of names that wezsesh's own apply_to_config triggers.
 
-describe("Appendix C event subscriptions", function()
-    it("registers EXACTLY the Appendix C event set (transitively)",
+describe("event subscriptions", function()
+    it("registers EXACTLY the contract event set (transitively)",
     function()
         init.apply_to_config({}, {})
         local names = {}
@@ -638,7 +638,7 @@ describe("Appendix C event subscriptions", function()
         local want = { "resurrect.error", "user-var-changed" }
         assert_eq(table.concat(names, ","),
             table.concat(want, ","),
-            "Appendix C drift — registered event set does not match")
+            "event-set drift — registered event set does not match")
     end)
 
     it("never subscribes to restore_workspace.finished", function()
@@ -672,10 +672,10 @@ describe("Appendix C event subscriptions", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- (P §7.1) — outer body pcall-wrapped
+-- outer body pcall-wrapped
 -- ────────────────────────────────────────────────────────────────────
 
-describe("outer pcall boundary (P §7.1)", function()
+describe("outer pcall boundary", function()
     it("a sentinel raise inside is caught and surfaced as a toast",
     function()
         manager_shim.validate_runtime_dir = function(_opts)
@@ -690,7 +690,7 @@ describe("outer pcall boundary (P §7.1)", function()
         assert_match(toast_calls[1].body, "WEZSESH_SUN_PATH_OVERFLOW",
             "toast did not carry sentinel body")
         assert_eq(toast_calls[1].title, "wezsesh", "toast title wrong")
-        -- 10s ttl per the §9.1 contract.
+        -- 10s ttl per the toast contract.
         assert_eq(toast_calls[1].ttl, 10000,
             "toast TTL not 10000ms (~10s)")
     end)
@@ -735,10 +735,10 @@ describe("outer pcall boundary (P §7.1)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 step ordering — observable sequence
+-- step ordering — observable sequence
 -- ────────────────────────────────────────────────────────────────────
 
-describe("step ordering (§9.1)", function()
+describe("step ordering", function()
     it("validate_runtime_dir runs before ensure_session_key", function()
         local sequence = {}
         manager_shim.validate_runtime_dir = function(_opts)
@@ -760,7 +760,7 @@ describe("step ordering (§9.1)", function()
     function()
         -- A refactor that swapped change_state_save_dir below
         -- validate_runtime_dir would not have failed any prior test;
-        -- this assertion locks in the §9.1 step (a)→(b) ordering plus
+        -- this assertion locks in the step (a)→(b) ordering plus
         -- the (b)→(c) ordering from validate_runtime_dir.
         local sequence = {}
         resurrect_error_shim.register = function()
@@ -801,7 +801,7 @@ describe("step ordering (§9.1)", function()
             "change_state_save_dir ran before resurrect_error.register")
         assert_true(csd_idx < vrd_idx,
             "validate_runtime_dir ran before change_state_save_dir " ..
-            "— §9.1 (a)→(b)→(c) ordering broken")
+            "— (a)→(b)→(c) ordering broken")
     end)
 
     it("ipc.register and register_keybinding both run after key gen",
@@ -865,10 +865,10 @@ describe("step ordering (§9.1)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- mlua sandbox (§9.0.1)
+-- mlua sandbox
 -- ────────────────────────────────────────────────────────────────────
 
-describe("mlua sandbox (§9.0.1 / §17.4)", function()
+describe("mlua sandbox", function()
     local function init_source()
         local f = io.open(script_dir() .. "/init.lua", "rb")
         assert_true(f ~= nil, "could not read init.lua for lint")
@@ -882,7 +882,7 @@ describe("mlua sandbox (§9.0.1 / §17.4)", function()
         assert_true(
             src:find('local wezterm = require%("wezterm"%)', 1) ~= nil,
             "init.lua does not require wezterm at file top")
-        -- The §17.4 grep ban: `_G%.wezterm` MUST NOT appear.
+        -- The lua-g-wezterm grep ban: `_G%.wezterm` MUST NOT appear.
         for line in src:gmatch("([^\n]*)\n?") do
             local stripped = line:gsub("^%s+", "")
             if stripped:sub(1, 2) ~= "--" then
@@ -915,11 +915,12 @@ describe("mlua sandbox (§9.0.1 / §17.4)", function()
     end)
 
     it("does NOT subscribe to 'resurrect.error' directly — " ..
-        "resurrect_error.register() is the sole legal subscriber " ..
-        "(§9.13 / §17.4)", function()
-        -- §17.4 grep gate (interim source-grep until cmd/lualint is
-        -- built, T-005). The single-subscriber invariant matters
-        -- because resurrect_error.lua maintains an `_G` install gate
+        "resurrect_error.register() is the sole legal subscriber",
+    function()
+        -- The lualint rule `lua-resurrect-error-owner` enforces this
+        -- statically; this in-spec source-grep is a defense in depth.
+        -- The single-subscriber invariant matters because
+        -- resurrect_error.lua maintains an `_G` install gate
         -- to guarantee idempotency across reload, plus a capture-
         -- channel ring buffer that downstream `with_capture`
         -- consumers depend on. A second `wezterm.on("resurrect.error",

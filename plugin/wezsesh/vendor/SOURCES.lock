@@ -1,5 +1,9 @@
-# wezsesh vendored Lua — supply chain manifest
-# See docs/design.md §16.3.
+# wezsesh vendored Lua — supply chain manifest.
+#
+# Each entry pins one third-party Lua file to its upstream repo,
+# commit, and sha256. The vendor/ tree is checked at build time via
+# `sha256sum -c plugin/wezsesh/vendor/SOURCES.lock`; updating a
+# vendored file requires updating both the URL and the digest below.
 #
 # source: https://github.com/Egor-Skriptunoff/pure_lua_SHA
 # commit: 6adac177c16c3496899f69d220dfb20bc31c03df

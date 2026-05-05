@@ -15,7 +15,7 @@
 -- `require("wezterm")` line resolves to our test double. The shim
 -- captures every `wezterm.background_child_process` invocation in
 -- `bg_calls`, exposes a `bg_should_raise` toggle that lets us
--- exercise the §16.5 pcall-wrap acceptance gate, and routes
+-- exercise the pcall-wrap acceptance gate, and routes
 -- `json_encode` / `GLOBAL` through pure-Lua replacements that are
 -- shape-faithful enough for the four `reply_*` envelopes.
 
@@ -29,7 +29,7 @@ end
 --                                    spec harness only.
 --   <script_dir>/../?.lua         — namespaced `require("wezsesh.b64")`
 --                                    used by production result.lua per
---                                    §11/§16.5 cache-bust prefix rule.
+--                                    cache-bust prefix rule.
 --                                    Lua maps the dot to a slash, so
 --                                    `wezsesh.b64` resolves to
 --                                    `<script_dir>/../wezsesh/b64.lua`,
@@ -47,7 +47,7 @@ local deepcopy = helpers.deepcopy
 
 -- Pure-Lua JSON encode sufficient for the flat envelopes result.lua
 -- builds. We don't need byte-equality with Go here (the reply path is
--- not the canonical-JSON wire — see §4 vs §3.4). Round-trip via the
+-- not the canonical-JSON request wire). Round-trip via the
 -- shim's parser is enough for the assertions below.
 local function json_encode_shim(v)
     local function emit(x)
@@ -192,7 +192,7 @@ local function json_parse_shim(s)
 end
 
 -- The shim's mutable surface. The spec tweaks `bg_should_raise` to
--- exercise the §16.5 pcall-wrap acceptance gate; reads `bg_calls` to
+-- exercise the pcall-wrap acceptance gate; reads `bg_calls` to
 -- assert the spawn argv shape; tweaks `GLOBAL.wezsesh_bin_path` to
 -- exercise the missing-binary degraded path.
 local bg_calls = {}
@@ -294,7 +294,7 @@ end
 
 -- A canonical "valid request payload" stub. Each reply_* takes a
 -- payload and reads `v`, `id`, `reply_sock` from it. The verb-specific
--- tests below mutate `op` and the data shape per §6.
+-- tests below mutate `op` and the data shape per verb.
 local function fixture_payload(op)
     return {
         v          = 1,
@@ -306,11 +306,11 @@ local function fixture_payload(op)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.5 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.5)", function()
-    it("exposes the §9.5 API and nothing more", function()
+describe("module surface", function()
+    it("exposes the public API and nothing more", function()
         local want = {
             "reply_completed", "reply_error", "reply_partial",
             "reply_started", "toast",
@@ -324,10 +324,10 @@ describe("module surface (§9.5)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §0.1 row 5 — every reply carries `v: 1`
+-- every reply carries `v: 1`
 -- ────────────────────────────────────────────────────────────────────
 
-describe("every reply carries `v: 1` (§0.1 row 5)", function()
+describe("every reply carries `v: 1`", function()
     it("reply_started echoes payload.v", function()
         result.reply_started(fixture_payload())
         local env = last_envelope()
@@ -355,10 +355,10 @@ describe("every reply carries `v: 1` (§0.1 row 5)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §3.4 invariants — `started` reply has no data / warnings / error
+-- `started` reply has no data / warnings / error
 -- ────────────────────────────────────────────────────────────────────
 
-describe("started reply: §3.4 / §9.5 acceptance gate", function()
+describe("started reply: invariants", function()
     it("status='started', ok=true, NO data / warnings / error", function()
         result.reply_started(fixture_payload())
         local env = last_envelope()
@@ -382,10 +382,10 @@ describe("started reply: §3.4 / §9.5 acceptance gate", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §3.4 invariants — completed/ok=true ⇒ data present (may be `{}`)
+-- completed/ok=true ⇒ data present (may be `{}`)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("completed reply: §3.4 invariants", function()
+describe("completed reply: invariants", function()
     it("status='completed', ok=true, data present", function()
         result.reply_completed(fixture_payload(), { active_workspace = "x" })
         local env = last_envelope()
@@ -407,10 +407,10 @@ describe("completed reply: §3.4 invariants", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §3.4 invariants — partial: ok=true, data AND warnings present
+-- partial: ok=true, data AND warnings present
 -- ────────────────────────────────────────────────────────────────────
 
-describe("partial reply: §3.4 invariants", function()
+describe("partial reply: invariants", function()
     it("status='partial', ok=true, both data AND warnings present",
     function()
         local warnings = {{
@@ -437,13 +437,13 @@ describe("partial reply: §3.4 invariants", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §3.4 invariants — error: completed+ok=false ⇒ error present
+-- error: completed+ok=false ⇒ error present
 -- ────────────────────────────────────────────────────────────────────
 
-describe("error reply: §3.4 invariants", function()
+describe("error reply: invariants", function()
     it("status='completed', ok=false, error present, NO data", function()
         result.reply_error(fixture_payload(), "UNKNOWN_VERB",
-            "unknown verb: bogus", { hint = "see §6" })
+            "unknown verb: bogus", { hint = "see verbs/" })
         local env = last_envelope()
         assert_eq(env.status, "completed", "status wrong")
         assert_eq(env.ok, false, "ok must be false on error")
@@ -451,7 +451,7 @@ describe("error reply: §3.4 invariants", function()
         assert_eq(env.error.code, "UNKNOWN_VERB", "error.code lost")
         assert_eq(env.error.message, "unknown verb: bogus",
             "error.message lost")
-        assert_eq(env.error.details.hint, "see §6", "error.details lost")
+        assert_eq(env.error.details.hint, "see verbs/", "error.details lost")
         assert_nil(env.data, "error must NOT carry data")
     end)
 
@@ -473,17 +473,17 @@ describe("error reply: §3.4 invariants", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §16.5 — `pcall`-wrap on `wezterm.background_child_process` calls
+-- `pcall`-wrap on `wezterm.background_child_process` calls
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§16.5 pcall-wrap acceptance gate", function()
+describe("pcall-wrap acceptance gate", function()
     it("a synthetic spawn failure does NOT propagate out of reply_*",
     function()
         bg_should_raise = true
         -- All four reply_* fns must swallow the spawn failure. If any
         -- of these raise, the user-var-changed handler that calls
         -- them would wedge the wezterm event loop — CLAUDE.md
-        -- invariant 1 / §16.5 lint catches the static case; this
+        -- the lualint rule catches the static case; this
         -- spec exercises the runtime contract.
         local payload = fixture_payload()
         local ok1 = pcall(result.reply_started, payload)
@@ -525,10 +525,10 @@ describe("§16.5 pcall-wrap acceptance gate", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- spawn argv shape — `wezsesh reply <sock> <b64>` per §3.2 / §8.20
+-- spawn argv shape — `wezsesh reply <sock> <b64>`
 -- ────────────────────────────────────────────────────────────────────
 
-describe("spawn argv: `wezsesh reply <sock> <b64>` (§3.2 / §8.20)",
+describe("spawn argv: `wezsesh reply <sock> <b64>`",
 function()
     it("argv[1] is the bin path; argv[2] is 'reply'; argv[3] is the "
         .. "sock; argv[4] is base64", function()
@@ -544,13 +544,13 @@ function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- Per-verb reply shapes from §6 — the "Done when" line.
--- Each verb's terminal completed-reply data is the verb's shape from
--- §6; restore-class verbs (switch saved-not-live, load) also emit a
--- started preamble.
+-- Per-verb reply shapes — the "Done when" contract.
+-- Each verb's terminal completed-reply data is the verb's published
+-- shape; restore-class verbs (switch saved-not-live, load) also emit
+-- a started preamble.
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.1 — `switch` verb reply shapes", function()
+describe("`switch` verb reply shapes", function()
     it("live target: completed + data: { active_workspace }", function()
         local p = fixture_payload("switch")
         result.reply_completed(p, { active_workspace = "main" })
@@ -561,7 +561,7 @@ describe("§6.1 — `switch` verb reply shapes", function()
             "switch live: data shape wrong")
     end)
 
-    it("saved-not-live target: started preamble (§6.1.1)", function()
+    it("saved-not-live target: started preamble", function()
         local p = fixture_payload("switch")
         result.reply_started(p)
         local env = last_envelope()
@@ -582,7 +582,7 @@ describe("§6.1 — `switch` verb reply shapes", function()
             "switch partial: warnings shape wrong")
     end)
 
-    it("verb-specific error: SNAPSHOT_MISSING (§6.1)", function()
+    it("verb-specific error: SNAPSHOT_MISSING", function()
         local p = fixture_payload("switch")
         result.reply_error(p, "SNAPSHOT_MISSING",
             "snapshot gone for 'main'", {})
@@ -592,8 +592,8 @@ describe("§6.1 — `switch` verb reply shapes", function()
     end)
 end)
 
-describe("§6.2 — `load` verb reply shapes", function()
-    it("started preamble (§6.1.1; load is restore-class)", function()
+describe("`load` verb reply shapes", function()
+    it("started preamble (load is restore-class)", function()
         local p = fixture_payload("load")
         result.reply_started(p)
         local env = last_envelope()
@@ -636,7 +636,7 @@ describe("§6.2 — `load` verb reply shapes", function()
     end)
 end)
 
-describe("§6.3 — `save` verb reply shapes", function()
+describe("`save` verb reply shapes", function()
     it("success: completed + data: { name } (binary fills hash later)",
     function()
         local p = fixture_payload("save")
@@ -666,8 +666,8 @@ describe("§6.3 — `save` verb reply shapes", function()
     function()
         -- This is a structural assertion: the test catalogue here
         -- never calls reply_started for `save`; if a future caller
-        -- did, it would still produce a §3.4-conforming envelope —
-        -- but the §6.1.1 catalogue explicitly excludes save from
+        -- did, it would still produce a conforming envelope —
+        -- but the per-verb catalogue explicitly excludes save from
         -- restore-class. Caught by the dispatcher, not by result.lua.
         local p = fixture_payload("save")
         result.reply_completed(p, { name = "snap-1" })
@@ -676,7 +676,7 @@ describe("§6.3 — `save` verb reply shapes", function()
     end)
 end)
 
-describe("§6.4 — `new` verb reply shapes", function()
+describe("`new` verb reply shapes", function()
     it("success: completed + data: { name, pane_id }", function()
         local p = fixture_payload("new")
         result.reply_completed(p, { name = "~/proj", pane_id = 42 })
@@ -699,10 +699,10 @@ describe("§6.4 — `new` verb reply shapes", function()
     end)
 end)
 
-describe("§6.5 — `noop` verb reply shapes", function()
+describe("`noop` verb reply shapes", function()
     it("success: completed + data: {} (empty)", function()
         local p = fixture_payload("noop")
-        -- Per §6.5 the data is an empty object; result.lua normalises
+        -- For noop, the data is an empty object; result.lua normalises
         -- nil to {} so callers don't have to be careful.
         result.reply_completed(p, nil)
         local env = last_envelope()
@@ -714,14 +714,14 @@ describe("§6.5 — `noop` verb reply shapes", function()
     end)
 end)
 
-describe("§13.13 — unknown verb reply shape", function()
+describe("unknown verb reply shape", function()
     it("UNKNOWN_VERB → terminal completed + ok=false + error.code",
     function()
         local p = fixture_payload("bogus")
         result.reply_error(p, "UNKNOWN_VERB",
             "unknown verb: bogus", {})
         local env = last_envelope()
-        -- Per §13.13: terminal `completed` reply with ok=false; does
+        -- Unknown verb: terminal `completed` reply with ok=false; does
         -- NOT degrade to noop semantics.
         assert_eq(env.status, "completed", "unknown verb: status wrong")
         assert_eq(env.ok, false, "unknown verb: ok must be false")
@@ -742,7 +742,7 @@ end)
 -- distinction we are asserting at the wire level.
 -- ────────────────────────────────────────────────────────────────────
 
-describe("HIGH fix: empty data/details serialise as object {} (§6.5 / §3.4)",
+describe("empty data/details serialise as object {}",
 function()
     it("noop's empty data is '{}', not '[]'", function()
         result.reply_completed(fixture_payload("noop"), nil)
@@ -819,7 +819,7 @@ end)
 -- M.toast — non-wire surface helper. pcall-wrap is the contract.
 -- ────────────────────────────────────────────────────────────────────
 
-describe("M.toast (§9.5)", function()
+describe("M.toast", function()
     it("nil window is a no-op (does not raise)", function()
         local ok = pcall(result.toast, nil, "hi", 1000)
         assert_true(ok, "nil window must not raise")
@@ -831,7 +831,7 @@ describe("M.toast (§9.5)", function()
     end)
 
     it("a window:toast_notification raise does NOT propagate "
-        .. "(pcall-wrapped per §9.5)", function()
+        .. "(pcall-wrapped)", function()
         local fake_window = {
             toast_notification = function()
                 error("synthetic toast failure", 0)

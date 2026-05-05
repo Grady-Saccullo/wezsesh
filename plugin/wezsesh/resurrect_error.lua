@@ -1,12 +1,11 @@
--- §9.13 — `resurrect.error` capture for the dual-path save/load detector.
+-- `resurrect.error` capture for the dual-path save/load detector.
 --
 -- This module owns the persistent `wezterm.on("resurrect.error", …)`
--- listener and the per-call capture buffer that backs §9.4.1 / §9.4.2's
--- dual-path error detection. New in spike #2; full empirical basis lives
--- in `docs/issues/2.md` (TL;DR: `state_manager.save_state` swallows I/O
--- and encryption errors into a `resurrect.error` event, so a bare
+-- listener and the per-call capture buffer that backs the save / load
+-- verbs' dual-path error detection. `state_manager.save_state` swallows
+-- I/O and encryption errors into a `resurrect.error` event, so a bare
 -- `pcall(save_state, …)` is not enough — a side-channel capture buffer
--- has to be inspected before replying success).
+-- has to be inspected before replying success.
 --
 -- Why the listener is module-level and persistent, not per-call:
 -- `wezterm.on` has no de-register API (per the wezterm Lua docs). A
@@ -20,12 +19,12 @@
 -- runtime rebuilds the Lua state on reload — so the listener registered
 -- by the previous reload is gone, while a `wezterm.GLOBAL`-backed gate
 -- would still report "installed" and skip re-installation, leaving the
--- plugin without a listener. `_G` survives the §9.1 cache-bust loop
--- (which only nils `package.loaded["wezsesh.*"]`) but is reset on
--- reload — exactly the scope we need.
+-- plugin without a listener. `_G` survives the cache-bust loop in
+-- init.lua (which only nils `package.loaded["wezsesh.*"]`) but is
+-- reset on reload — exactly the scope we need.
 --
--- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
--- §9.0.1. The standalone spec installs a wezterm shim via
+-- mlua sandbox: acquired via `local wezterm = require("wezterm")`. The
+-- standalone spec installs a wezterm shim via
 -- `package.preload["wezterm"]` BEFORE requiring this file so the
 -- production-shaped require() path is exercised end-to-end.
 --
@@ -54,8 +53,8 @@ local current_capture = nil
 -- no `with_capture` is active (e.g., resurrect's `periodic_save`
 -- background tick errors). Bounded so a noisy background failure mode
 -- doesn't grow unbounded; FIFO-pruned on overflow. Surfaced by
--- `wezsesh doctor` and the recent-errors log check (§8.17.1
--- `log.recent_errors`) via `recent_uncaptured()` / `clear_uncaptured()`.
+-- `wezsesh doctor` and the recent-errors log check via
+-- `recent_uncaptured()` / `clear_uncaptured()`.
 local UNCAPTURED_RING_MAX = 32
 local uncaptured_ring = {}
 
@@ -64,8 +63,8 @@ local uncaptured_ring = {}
 -- diagnostic ring. Returning nothing (NOT `false`) is deliberate:
 -- returning `false` from a `wezterm.on` handler short-circuits the
 -- emission chain, suppressing any user-installed `resurrect.error`
--- handler downstream (e.g., a tabline plugin's toast). See spike #2 V2:
--- multiple handlers fire in registration order.
+-- handler downstream (e.g., a tabline plugin's toast). Multiple
+-- handlers fire in registration order.
 local function on_resurrect_error(msg)
     local s = tostring(msg)
     if current_capture ~= nil then
@@ -81,9 +80,10 @@ local function on_resurrect_error(msg)
     -- DO NOT `return false` — see header comment.
 end
 
--- Install the persistent `resurrect.error` listener. Called from §9.1
--- `apply_to_config` AFTER the `package.loaded["wezsesh.*"]` cache-bust
--- loop. Idempotent within a single Lua state via a `_G` install gate.
+-- Install the persistent `resurrect.error` listener. Called from
+-- init.lua's `apply_to_config` AFTER the
+-- `package.loaded["wezsesh.*"]` cache-bust loop. Idempotent within a
+-- single Lua state via a `_G` install gate.
 --
 -- The gate name is namespaced (`_wezsesh_…_installed`) to make it
 -- obvious in any `_G` dump and to avoid colliding with other plugins
@@ -103,27 +103,28 @@ function M.register()
     _G._wezsesh_resurrect_error_listener_installed = true
 end
 
--- Public API consumed by ops.lua (§9.4.1, §9.4.2).
+-- Public API consumed by the verb modules' save / load handlers.
 --
 -- Wraps `fn` in `pcall` and a fresh capture buffer. Returns three
 -- values:
 --   pcall_ok   bool     — false iff fn raised a Lua error
 --                          (e.g., `wezterm.json_encode` choked on a
---                          function value, per spike #2 V4a)
+--                          function value)
 --   pcall_ret  any      — pcall's second return: the value fn returned
 --                          on success, or the error value on failure
 --   captured   string[] — every `resurrect.error` string emitted
 --                          between fn entry and fn return; empty
 --                          table if none
 --
--- The dual-path detector in §9.4.2 inspects BOTH pcall_ok and
--- #captured; either signal alone misses half of the failure modes
--- (json_encode raises vs. swallowed I/O / encryption errors).
+-- The dual-path detector in the save / load verbs inspects BOTH
+-- pcall_ok and #captured; either signal alone misses half of the
+-- failure modes (json_encode raises vs. swallowed I/O / encryption
+-- errors).
 --
 -- Re-entrancy guard: `with_capture` MUST NOT nest. `wezterm.emit`
--- runs handlers synchronously on the calling thread (spike #2 V1
--- confirmed), so the only way to nest is for a save/load handler to
--- call back into another save/load — currently no path does this. The
+-- runs handlers synchronously on the calling thread, so the only way
+-- to nest is for a save/load handler to call back into another
+-- save/load — currently no path does this. The
 -- assert pins the invariant; the captured buffer of an in-flight
 -- outer call MUST NOT be silently clobbered by an inner one.
 --
@@ -142,8 +143,8 @@ function M.with_capture(fn)
 end
 
 -- Returns a copy of the diagnostic ring (uncaptured `resurrect.error`
--- events). Surfaced by `wezsesh doctor` (§8.17.1 `log.recent_errors`)
--- and the runtime `recent_errors` log check. The copy is intentional:
+-- events). Surfaced by `wezsesh doctor` and the runtime
+-- `recent_errors` log check. The copy is intentional:
 -- callers should not be able to mutate the ring through the returned
 -- handle.
 function M.recent_uncaptured()

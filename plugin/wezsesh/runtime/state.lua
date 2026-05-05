@@ -1,5 +1,5 @@
--- §9.6 / §10.6 / §5.4 / §5.5 — centralised access to `wezterm.GLOBAL.*`
--- on the Lua side of the IPC handler.
+-- Centralised access to `wezterm.GLOBAL.*` on the Lua side of the
+-- IPC handler.
 --
 -- This module is the ONLY place in the plugin that touches the GLOBAL
 -- userdata for the in-flight state buckets. It owns three responsibilities
@@ -18,23 +18,21 @@
 --      snapshot, and writes the snapshot back in one atomic-looking
 --      operation.
 --
---   3. Value-shape normalisation per §0.1 row 30 (the "GLOBAL value-
---      shape rule"). All sub-table values MUST be flat scalars (string,
---      integer, boolean) — NEVER nested Lua tables. mlua's GLOBAL
---      accepts nested-table writes silently but throws "can only index
---      array or object values" on the next read of the inner field.
---      Spike #1 (`docs/issues/1.md`) found this the hard way. The two
---      structured buckets (`wezsesh_state[pid]`, `wezsesh_requests[id]`)
---      pack their fields into a JSON-encoded STRING via
---      `wezterm.json_encode`; the read-side decodes via
---      `wezterm.json_parse`. The flat buckets (`wezsesh_seen_ids[ulid]`
---      → int, `wezsesh_writing[path]` → bool) never see a table value
---      at all.
+--   3. Value-shape normalisation. All sub-table values MUST be flat
+--      scalars (string, integer, boolean) — NEVER nested Lua tables.
+--      mlua's GLOBAL accepts nested-table writes silently but throws
+--      "can only index array or object values" on the next read of
+--      the inner field. The two structured buckets
+--      (`wezsesh_state[pid]`, `wezsesh_requests[id]`) pack their
+--      fields into a JSON-encoded STRING via `wezterm.json_encode`;
+--      the read-side decodes via `wezterm.json_parse`. The flat
+--      buckets (`wezsesh_seen_ids[ulid]` → int, `wezsesh_writing[path]`
+--      → bool) never see a table value at all.
 --
--- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
--- §9.0.1. The standalone spec (`state_spec.lua`) installs a harness
--- double via `package.preload["wezterm"]` BEFORE requiring this file
--- so the production-shaped require() path is exercised end-to-end.
+-- mlua sandbox: acquired via `local wezterm = require("wezterm")`. The
+-- standalone spec (`state_spec.lua`) installs a harness double via
+-- `package.preload["wezterm"]` BEFORE requiring this file so the
+-- production-shaped require() path is exercised end-to-end.
 --
 -- Errors are intentionally NOT raised here. The mutating helpers all
 -- run inside the `user-var-changed` handler and a raise would wedge
@@ -117,8 +115,8 @@ local function write_bucket(name, t)
 end
 
 -- Round-trip a structured value through JSON so the GLOBAL bucket
--- only ever stores a flat string scalar (§0.1 row 30 / §10.6 Storage
--- shape rule). Returns the encoded string or nil on failure.
+-- only ever stores a flat string scalar (the value-shape rule above).
+-- Returns the encoded string or nil on failure.
 local function encode_struct(v)
     if type(v) ~= "table" then return nil end
     local ok, s = pcall(wezterm.json_encode, v)
@@ -138,7 +136,7 @@ local function decode_struct(s)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — wezsesh_state[pane_id_str] : JSON-encoded
+-- wezsesh_state[pane_id_str] : JSON-encoded
 --                                     {target_window_id, spawned_at}
 -- ────────────────────────────────────────────────────────────────────
 
@@ -165,7 +163,7 @@ function M.delete_state(pane_id)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — wezsesh_requests[request_id] : JSON-encoded
+-- wezsesh_requests[request_id] : JSON-encoded
 --                                       {spawned_pane_id, started_at}
 -- ────────────────────────────────────────────────────────────────────
 
@@ -192,7 +190,7 @@ function M.delete_request(id)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — wezsesh_writing[abs_path] : bool (flat scalar)
+-- wezsesh_writing[abs_path] : bool (flat scalar)
 -- ────────────────────────────────────────────────────────────────────
 
 function M.set_writing(path, b)
@@ -213,10 +211,10 @@ function M.is_writing(path)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §5.4 — wezsesh_seen_ids[ulid] : int unix-seconds (session-wide)
+-- wezsesh_seen_ids[ulid] : int unix-seconds (session-wide)
 -- ────────────────────────────────────────────────────────────────────
 --
--- Per §0.1 row 30: storage shape is FLAT INT (unix-seconds), not a
+-- Storage shape is FLAT INT (unix-seconds), not a
 -- nested {ts = N} table. The v2 draft used a nested table; mlua's
 -- GLOBAL silently accepted the write but threw "can only index array
 -- or object values" on the next read of `entry.ts`. Fix is to keep
@@ -235,7 +233,7 @@ function M.mark_seen(id)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §5.5 — TTL prune. Triggered on `window-config-reloaded` and at end
+-- TTL prune. Triggered on `window-config-reloaded` and at end
 -- of every dispatch (after seen_ids write-back, never before).
 -- ────────────────────────────────────────────────────────────────────
 
@@ -287,7 +285,7 @@ function M.prune_requests(now, ttl_seconds)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — wipe_all: reset every bucket this module owns. Used by
+-- wipe_all: reset every bucket this module owns. Used by
 -- `wezsesh reset` callbacks and by config-reload teardown.
 -- ────────────────────────────────────────────────────────────────────
 

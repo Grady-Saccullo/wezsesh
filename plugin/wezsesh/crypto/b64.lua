@@ -1,12 +1,11 @@
--- §9.10 — RFC 4648 §4 standard base64 codec for the IPC wire path.
+-- RFC 4648 standard base64 codec for the IPC wire path.
 --
 -- `encode` is used on the reply path (`wezsesh reply <sock> <b64>`).
--- `decode` is the §0.1 row 34 / spike-#3 hot path: §9.3 pre-step (1)
--- calls it once per inbound `user-var-changed` event to recover the
--- §3.1 pointer JSON before opening the request file. Returning `nil`
--- (malformed base64) MUST short-circuit the handler with
--- `REQ_POINTER_REJECTED` (§7) — callers therefore treat any nil
--- exactly as "drop this OSC, write no reply".
+-- `decode` is the inbound hot path: ipc.lua's `user-var-changed`
+-- handler calls it once per event to recover the pointer JSON before
+-- opening the request file. Returning `nil` (malformed base64) MUST
+-- short-circuit the handler — callers treat any nil exactly as
+-- "drop this OSC, write no reply".
 --
 -- mlua sandbox: pure-string ops. No `wezterm`, no `debug.*`, no
 -- `dofile`. Module surface is `{encode, decode}` only.
@@ -26,7 +25,7 @@
 
 local M = {}
 
--- RFC 4648 §4 standard alphabet. Index 0..63 → ASCII byte. We store
+-- RFC 4648 standard alphabet. Index 0..63 → ASCII byte. We store
 -- the bytes as integers and turn them into a string per output chunk;
 -- this avoids allocating a 64-entry string-of-strings table that
 -- would force per-lookup interning.
@@ -64,7 +63,7 @@ local concat = table.concat
 local sub = string.sub
 local floor = math.floor
 
--- §9.10 — encode. Standard RFC 4648 §4: no line breaks, no URL-safe
+-- Standard RFC 4648 base64: no line breaks, no URL-safe
 -- substitutions, '=' padding to a multiple of 4 output chars. Empty
 -- input encodes to the empty string (matches Go's
 -- base64.StdEncoding.EncodeToString).
@@ -120,10 +119,9 @@ function M.encode(s)
     return concat(out)
 end
 
--- §9.10 — decode. Strict canonical-only acceptor. Returns the decoded
--- byte string on success or `nil` on any malformed input. Never
--- raises (callers — ipc.lua pre-step (1) — must not be wedged by a
--- malformed OSC).
+-- Strict canonical-only acceptor. Returns the decoded byte string on
+-- success or `nil` on any malformed input. Never raises — callers in
+-- the user-var-changed handler must not be wedged by a malformed OSC.
 --
 -- Rejected by construction:
 --   * non-string input;

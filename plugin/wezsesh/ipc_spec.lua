@@ -9,8 +9,8 @@
 -- Exits 0 with `OK N/N` on success, 1 with FAIL lines on stderr
 -- otherwise.
 --
--- This spec exercises every §17.3 acceptance gate listed under T-600:
---   * Pointer-shape validation (spike-#3): malformed JSON, path outside
+-- This spec exercises every IPC acceptance gate:
+--   * Pointer-shape validation: malformed JSON, path outside
 --     `<runtime_dir>/req/`, wrong mode, symlink, `pointer.id ≠
 --     payload.id` → silent-drop + log_warn REQ_POINTER_REJECTED.
 --   * HMAC mismatch silent on wire — corrupted payload → no spawn.
@@ -146,9 +146,9 @@ end
 -- payload + pointer fixture builders
 -- ────────────────────────────────────────────────────────────────────
 --
--- Build a §3.3-shaped canonical-JSON payload, sign it with the same
--- 64-hex key the GLOBAL holds (default `aaa…`), then build a §3.1
--- pointer envelope referring to a synthetic on-disk path. The handler
+-- Build a canonical-JSON payload, sign it with the same 64-hex key
+-- the GLOBAL holds (default `aaa…`), then build a pointer envelope
+-- referring to a synthetic on-disk path. The handler
 -- never actually reads the file from disk in the spec — the stat seam
 -- and the read seam route through fakes — but the pointer's `path`
 -- still has to satisfy the prefix check in pre-step (2).
@@ -161,9 +161,8 @@ local DEFAULT_KEY        = string.rep("a", 64)
 
 local function valid_ulid()
     -- 26-char Crockford-base32 placeholder. The validator only checks
-    -- length (#id == 26) per §9.3.1.A/B; alphabet enforcement lives in
-    -- the binary side (canonical_json acceptor would also reject
-    -- non-string).
+    -- length (#id == 26); alphabet enforcement lives in the binary
+    -- side (canonical_json acceptor would also reject non-string).
     return "01JABCDEFGHJKMNPQRSTVWXYZA"
 end
 
@@ -185,7 +184,7 @@ local function build_payload(overrides)
         args             = args,
     }
 
-    -- §4.2 / §4.3 signer: tag the full (with-hmac) payload, then
+    -- Signer: tag the full (with-hmac) payload, then
     -- copy_without("hmac") + encode + sign. Mirrors the verifier order
     -- in ipc.lua step (e). For the signer we don't yet HAVE an hmac
     -- to drop, so we tag a placeholder, then re-tag the real payload
@@ -214,7 +213,7 @@ local function build_payload(overrides)
     return payload
 end
 
--- Build a §3.1 pointer envelope. Returns `(pointer_value, payload_json)`.
+-- Build a pointer envelope. Returns `(pointer_value, payload_json)`.
 -- wezterm pre-decodes the base64 form of the OSC value before firing
 -- `user-var-changed`, so the handler receives the raw pointer JSON
 -- directly; the spec mirrors that contract by handing JSON in. The
@@ -368,11 +367,11 @@ local function drive_handler(payload, pointer_overrides, opts_overrides)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.3)", function()
-    it("exposes the §9.3 API (validate_pointer, validate_payload, "
+describe("module surface", function()
+    it("exposes the public API (validate_pointer, validate_payload, "
         .. "register, handle_user_var)", function()
         assert_true(type(ipc.validate_pointer) == "function",
             "validate_pointer missing")
@@ -388,10 +387,10 @@ describe("module surface (§9.3)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3.1.A — pointer field-shape validator
+-- pointer field-shape validator
 -- ────────────────────────────────────────────────────────────────────
 
-describe("validate_pointer (§9.3.1.A)", function()
+describe("validate_pointer", function()
     it("accepts a well-formed pointer", function()
         local p = { v = 1, id = valid_ulid(),
                     path = DEFAULT_REQ_PREFIX .. "ab.json" }
@@ -429,10 +428,10 @@ describe("validate_pointer (§9.3.1.A)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3.1.B — payload field-shape validator
+-- payload field-shape validator
 -- ────────────────────────────────────────────────────────────────────
 
-describe("validate_payload (§9.3.1.B)", function()
+describe("validate_payload", function()
     local function base()
         return {
             v = 1, id = valid_ulid(), ts = 1700000000,
@@ -440,7 +439,7 @@ describe("validate_payload (§9.3.1.B)", function()
             op = "noop", args = {}, hmac = string.rep("a", 64),
         }
     end
-    it("accepts the §3.3 envelope shape", function()
+    it("accepts the canonical envelope shape", function()
         assert_true(ipc.validate_payload(base()),
             "well-formed payload rejected")
     end)
@@ -471,10 +470,10 @@ describe("validate_payload (§9.3.1.B)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §13.9 — SUN_PATH validation (Lua side)
+-- SUN_PATH validation (Lua side)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("SUN_PATH validation (§13.9)", function()
+describe("SUN_PATH validation", function()
     it("accepts a sane runtime_dir", function()
         local ok, _ = pcall(ipc.validate_runtime_dir, "/tmp/wezsesh-1000")
         assert_true(ok, "sane runtime_dir rejected")
@@ -649,7 +648,7 @@ end)
 -- HMAC mismatch silent on wire
 -- ────────────────────────────────────────────────────────────────────
 
-describe("HMAC mismatch silent on wire (§17.3)", function()
+describe("HMAC mismatch silent on wire", function()
     it("flipped hex char → no dispatch, no spawn, log_warn 'HMAC mismatch'",
     function()
         seed_session()
@@ -682,7 +681,7 @@ end)
 -- Freshness boundary
 -- ────────────────────────────────────────────────────────────────────
 
-describe("Freshness boundary (§5.3 / §17.3)", function()
+describe("Freshness boundary", function()
     it("ts = now - 30 → accept (boundary inclusive)", function()
         seed_session()
         local payload = build_payload({ ts = 1700000000 - 30 })
@@ -725,7 +724,7 @@ end)
 -- seen_ids TTL prune (session-wide) — entries older than 60s dropped
 -- ────────────────────────────────────────────────────────────────────
 
-describe("seen_ids TTL prune (§5.4 / §5.5 / §17.3)", function()
+describe("seen_ids TTL prune", function()
     it("a stale entry (age > 60s) is pruned at end-of-dispatch", function()
         seed_session()
         -- Pre-seed a stale entry with a fake clock helper. We use
@@ -806,7 +805,7 @@ describe("Multi-window broadcast (#3524)", function()
     end)
 
     it("wire target_window_id == 0 matches session.target_window_id == 0 "
-        .. "(wezterm's first-window id; T-905 / §9.3.1.C)", function()
+        .. "(wezterm's first-window id)", function()
         -- wezterm assigns WINID = 0 to the first window; a keybinding
         -- spawned from that window emits a wire target_window_id of 0.
         -- The handler MUST match it strictly against session = 0 — `0`
@@ -834,7 +833,7 @@ describe("Multi-window broadcast (#3524)", function()
     end)
 
     it("wire target_window_id == -1 (any-window sentinel) → dispatch "
-        .. "regardless of session.target_window_id (§9.3.1.C row 1)",
+        .. "regardless of session.target_window_id",
     function()
         -- Apply-time emissions (init.lua step 7) carry -1 because no
         -- wezterm window is bound at apply_to_config time. The handler
@@ -1007,7 +1006,7 @@ end)
 -- M.register — wezterm.on hookup + SUN_PATH gate at register time
 -- ────────────────────────────────────────────────────────────────────
 
-describe("M.register (§9.3 / §13.9)", function()
+describe("M.register", function()
     it("registers a single user-var-changed handler with a sane "
         .. "runtime_dir", function()
         local registered = {}

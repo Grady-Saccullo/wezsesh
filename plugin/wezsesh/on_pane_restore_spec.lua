@@ -9,7 +9,7 @@
 -- Exits 0 with `OK N/N` on success, 1 with FAIL lines on stderr
 -- otherwise. Mirrors the structure of manager_spec.lua / ops_spec.lua.
 --
--- Acceptance gates exercised (§17.3 / T-604 brief):
+-- Acceptance gates exercised:
 --   * Argv hook fail-CLOSED — forced exception → no
 --     default_on_pane_restore invocation; exactly one `\r\n` send.
 --   * Argv allowlist enforcement (Lua side) — argv[1]="rm" → no exec;
@@ -142,7 +142,7 @@ end
 -- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.11)", function()
+describe("module surface", function()
     it("exposes callback, configure, bytes_clean", function()
         assert_eq(type(on_pane_restore.callback), "function",
             "M.callback missing")
@@ -162,7 +162,7 @@ end)
 -- bytes_clean
 -- ────────────────────────────────────────────────────────────────────
 
-describe("bytes_clean (§9.11)", function()
+describe("bytes_clean", function()
     it("rejects non-string and empty input", function()
         assert_false(on_pane_restore.bytes_clean(nil),
             "nil should be dirty")
@@ -208,7 +208,7 @@ describe("bytes_clean (§9.11)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.11.1 step 2 — empty / missing argv
+-- empty / missing argv
 -- ────────────────────────────────────────────────────────────────────
 
 describe("step 2 — empty/missing argv falls through to default", function()
@@ -250,7 +250,7 @@ describe("step 2 — empty/missing argv falls through to default", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.11.1 step 3 — basename + 1-based indexing
+-- basename + 1-based indexing
 -- ────────────────────────────────────────────────────────────────────
 
 describe("step 3 — argv[1] is the program (1-based)", function()
@@ -294,10 +294,10 @@ describe("step 3 — argv[1] is the program (1-based)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.3 — Argv allowlist enforcement (Lua side)
+-- Argv allowlist enforcement (Lua side)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§17.3 — Argv allowlist enforcement (Lua side)", function()
+describe("Argv allowlist enforcement (Lua side)", function()
     it("argv[1]='rm' → no exec; cd '<cwd>'\\r\\n if cwd clean", function()
         local resurrect, calls = make_resurrect()
         local pane, sent = make_pane()
@@ -362,10 +362,10 @@ describe("§17.3 — Argv allowlist enforcement (Lua side)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.3 — Control-char cwd / argv (the injection-byte gate)
+-- Control-char cwd / argv (the injection-byte gate)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§17.3 — Control-char cwd/argv defense", function()
+describe("Control-char cwd/argv defense", function()
     it("cwd='/tmp/foo\\nrm -rf ~' → no injection; \\r\\n only", function()
         -- argv is allowlisted (vim) but cwd contains LF. Step 6
         -- detects the control byte and routes to step 4. The cwd
@@ -446,10 +446,10 @@ describe("§17.3 — Control-char cwd/argv defense", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.3 — Argv hook fail-CLOSED (the load-bearing gate)
+-- Argv hook fail-CLOSED (the load-bearing gate)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§17.3 — Argv hook fail-CLOSED", function()
+describe("Argv hook fail-CLOSED", function()
     it("policy.allows raises → no default_on_pane_restore call; "
         .. "exactly one '\\r\\n' send", function()
         local resurrect, calls = make_resurrect()
@@ -538,7 +538,7 @@ describe("§17.3 — Argv hook fail-CLOSED", function()
         .. "send_text(shell_join_args(argv))", function()
         -- The argv joined would contain "rm" and "-rf"; assert that
         -- neither appears in any send_text payload after a forced
-        -- raise. This is the literal §17.3 gate.
+        -- raise. This is the load-bearing fail-closed gate.
         local resurrect, calls = make_resurrect()
         local pane, sent = make_pane()
         on_pane_restore.configure({
@@ -566,10 +566,10 @@ describe("§17.3 — Argv hook fail-CLOSED", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- single-arg callback shape — P §6.18 / §9.11
+-- single-arg callback shape
 -- ────────────────────────────────────────────────────────────────────
 
-describe("single-arg callback shape (P §6.18)", function()
+describe("single-arg callback shape", function()
     it("M.callback accepts exactly one argument (pane_tree)", function()
         -- A callable that's invoked with `(pane_tree)` MUST work; one
         -- with `(pane, pane_tree)` would mean argv[1] etc. are looked
@@ -597,10 +597,10 @@ describe("single-arg callback shape (P §6.18)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.12 default_allowlist integration
+-- default_allowlist integration
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§9.12 default_allowlist integration", function()
+describe("default_allowlist integration", function()
     it("default list contains shells (sh/bash/zsh) and editors", function()
         local set = {}
         for _, n in ipairs(default_allowlist) do set[n] = true end

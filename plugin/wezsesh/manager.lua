@@ -1,32 +1,32 @@
--- §9.2 — `manager.lua`. Owns the binary lifecycle on the Lua side:
+-- Owns the wezsesh-binary lifecycle on the Lua side:
 --
 --   * resolve_binary       — pick the wezsesh executable (string).
 --   * detect_version       — exec `<bin> version` and parse semver.
 --   * compatible           — same-major semver gate.
---   * ensure_session_key   — §5.2 generation chain (keygen → /dev/urandom).
---   * validate_runtime_dir — §13.9 SUN_PATH ceiling check.
---   * write_config_file    — §10.7 JSON config to a temp file.
---   * spawn                — Appendix A env vector + mux/tab spawn.
---   * register_keybinding  — §11.1 default keybinding registration.
+--   * ensure_session_key   — generate or load the HMAC session key.
+--   * validate_runtime_dir — SUN_PATH ceiling check.
+--   * write_config_file    — JSON config to a temp file.
+--   * spawn                — env-vector + mux/tab spawn.
+--   * register_keybinding  — default keybinding registration.
 --
--- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
--- §9.0.1. The standalone spec installs a harness double via
+-- mlua sandbox: acquired via `local wezterm = require("wezterm")`. The
+-- standalone spec installs a harness double via
 -- `package.preload["wezterm"]` BEFORE requiring this file.
 --
--- §16.5 lint — every `wezterm.background_child_process` call MUST be
--- `pcall`-wrapped on the same/preceding line. T-602's spawn path uses
--- `wezterm.mux.spawn_window` / `mux_window:spawn_tab` (Appendix A), NOT
--- `background_child_process`, so this file does not contain any
--- background_child_process call. The spec includes a static-text
--- assertion guarding that property.
+-- The spawn path uses `wezterm.mux.spawn_window` and
+-- `mux_window:spawn_tab`, NOT `wezterm.background_child_process`, so
+-- this file does not contain any background_child_process call. The
+-- spec includes a static-text assertion guarding that property
+-- (any future bg-spawn here would also need the
+-- `lua-bg-child-process-pcall` lint to keep enforcing pcall-wrap).
 
 local wezterm = require("wezterm")
 local globals = require("wezsesh.runtime.globals")
 
 local M = {}
 
--- Plugin version. Single source of truth for §10.7 `plugin_version`
--- and Appendix A `WEZSESH_PLUGIN_VERSION`.
+-- Plugin version. Single source of truth for the wire-protocol
+-- `plugin_version` field and the `WEZSESH_PLUGIN_VERSION` env var.
 M.VERSION = "0.1.0"
 
 -- ────────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ local function tmpdir()
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 — resolve_binary
+-- resolve_binary
 -- ────────────────────────────────────────────────────────────────────
 
 function M.resolve_binary(opts)
@@ -84,12 +84,13 @@ function M.resolve_binary(opts)
     if type(opts.plugin_root) == "string" and opts.plugin_root ~= "" then
         return path_join(opts.plugin_root, "wezsesh")
     end
-    -- §11 default: bare `"wezsesh"` and let PATH resolve at exec time.
+    -- Documented default: bare `"wezsesh"` and let PATH resolve at
+    -- exec time.
     return "wezsesh"
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 — detect_version
+-- detect_version
 -- ────────────────────────────────────────────────────────────────────
 
 function M.detect_version(bin)
@@ -107,7 +108,7 @@ function M.detect_version(bin)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 — compatible
+-- compatible
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Spec is silent on the exact rule. Choice (documented): same-major
@@ -122,14 +123,14 @@ function M.compatible(plugin_v, bin_v)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §5.2 — ensure_session_key
+-- ensure_session_key
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Chain:
 --   1. exec `<bin> keygen` → 64 hex on stdout.
 --   2. fallback: read 32 bytes from /dev/urandom, hex-encode.
 --   3. fallback: return nil (caller logs + early-returns; the listener
---      no-ops on a nil session_key per §5.2 step 3).
+--      no-ops on a nil session_key).
 --
 -- Validation: trimmed output MUST match `^%x+$` and have length 64.
 -- Stores in `wezterm.GLOBAL.wezsesh_session_key` on success. Never
@@ -184,15 +185,15 @@ function M.ensure_session_key(bin)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §13.9 — validate_runtime_dir (Lua side SUN_PATH ceiling check)
+-- validate_runtime_dir (Lua side SUN_PATH ceiling check)
 -- ────────────────────────────────────────────────────────────────────
 --
--- Verbatim from §13.9. Sentinel errors are raised via `error(msg, 0)`
--- so the file:line prefix is suppressed and the caller can match the
--- sentinel substring directly.
+-- Sentinel errors are raised via `error(msg, 0)` so the file:line
+-- prefix is suppressed and the caller can match the sentinel
+-- substring directly.
 --
--- When `opts.runtime_dir` is nil the auto-detect path applies (§12.5);
--- there's nothing to validate. Return silently.
+-- When `opts.runtime_dir` is nil the auto-detect path applies; there's
+-- nothing to validate. Return silently.
 
 function M.validate_runtime_dir(opts)
     opts = opts or {}
@@ -220,19 +221,18 @@ function M.validate_runtime_dir(opts)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §10.7 — write_config_file
+-- write_config_file
 -- ────────────────────────────────────────────────────────────────────
 --
--- Builds the §10.7 JSON shape and writes it under
+-- Builds the JSON config shape and writes it under
 -- `<tmp>/wezsesh-<pid>-config.json`. Returns the absolute path.
 --
--- pid sourcing: §10.5 names `<pid>` literally but the wezterm mlua
--- sandbox does not expose `os.getpid` — and the §10.5 mode-0600 row is
--- aspirational from Lua (we cannot guarantee 0600 in pure Lua; the
--- file is written via `io.open` which honours the process umask).
--- We use `wezterm.procinfo.pid` when available, else a process-wide
--- monotonic counter combined with `os.time()` for collision avoidance.
--- Documented choice.
+-- pid sourcing: the wezterm mlua sandbox does not expose `os.getpid`,
+-- and the mode-0600 contract is aspirational from Lua (we cannot
+-- guarantee 0600 in pure Lua; the file is written via `io.open` which
+-- honours the process umask). We use `wezterm.procinfo.pid` when
+-- available, else a process-wide monotonic counter combined with
+-- `os.time()` for collision avoidance.
 
 local _config_seq = 0
 
@@ -252,9 +252,9 @@ local function next_config_filename()
     return string.format("wezsesh-%s-config.json", pid_like)
 end
 
--- Default §11.1 keys table — copied here so write_config_file is a
--- pure function of `opts`. apply_to_config (T-603) merges user
--- overrides into this table before calling us.
+-- Default keys table — copied here so write_config_file is a pure
+-- function of `opts`. apply_to_config merges user overrides into this
+-- table before calling us.
 local DEFAULT_KEYS = {
     switch = "s", load = "l", rename = "r", delete = "d",
     save = "S", new = "n", pin = "p", tag = "t",
@@ -271,7 +271,7 @@ end
 
 -- Tag a Lua table so wezterm.json_encode emits a JSON array. wezterm's
 -- encoder treats an empty Lua table as `{}` (object) by default; the
--- §10.7 schema requires `[]` (array) for `resurrect_argv_allowlist`.
+-- config schema requires `[]` (array) for `resurrect_argv_allowlist`.
 -- The accessor `wezterm.json_array_metatable` is the documented hook.
 -- When it isn't installed (older wezterm builds, the spec shim with
 -- json_array_metatable absent), an explicitly-empty caller table would
@@ -289,7 +289,7 @@ local function as_json_array(t)
     return t
 end
 
--- §10.7 `resurrect_argv_allowlist` resolver. Returns a table that will
+-- `resurrect_argv_allowlist` resolver. Returns a table that will
 -- encode as a JSON array `[]` (never `{}`).
 --
 --   * nil  → default_allowlist (non-empty array; encodes as `[…]`).
@@ -317,7 +317,7 @@ end
 function M.write_config_file(opts)
     opts = opts or {}
 
-    -- Build the §10.7 body. Every top-level key from the spec is
+    -- Build the config body. Every top-level key the binary expects is
     -- emitted unconditionally so the binary's `config.Load` can rely
     -- on a stable shape even when the user hasn't set the field.
     local body = {
@@ -375,19 +375,19 @@ function M.write_config_file(opts)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 — spawn (Appendix A)
+-- spawn
 -- ────────────────────────────────────────────────────────────────────
 --
--- Builds the env vector EXACTLY per Appendix A:
+-- Builds the env vector EXACTLY:
 --   WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_FILE,
 --   WEZSESH_PLUGIN_VERSION
 -- — no more, no less. Dirs travel inside `WEZSESH_CONFIG_FILE`.
 --
 -- spawn_mode dispatch:
 --   "window" → wezterm.mux.spawn_window{ args=…, set_environment_variables=… }
---   "tab"   → window:mux_window():spawn_tab{ … } (default; Appendix A names
---             this as `current_window:spawn_tab` — the GUI Window userdata
---             exposes `:mux_window()` for that resolution)
+--   "tab"   → window:mux_window():spawn_tab{ … } (default; the GUI
+--             Window userdata exposes `:mux_window()` for that
+--             resolution)
 --
 -- The HMAC key is read from `wezterm.GLOBAL.wezsesh_session_key`;
 -- ensure_session_key MUST have populated it before spawn. If absent,
@@ -435,7 +435,7 @@ function M.spawn(window, opts)
     local args = { bin }
     local mode = opts.spawn_mode or "tab"
 
-    -- Record the spawn so the §9.3 ipc handler's step (a) recognises the
+    -- Record the spawn so the ipc handler's first step recognises the
     -- binary's pane and accepts its OSCs. Without this, every fresh OSC
     -- silently drops at `state.get_state(pane_id) == nil` and the binary
     -- observes IPC_TIMEOUT.
@@ -468,10 +468,11 @@ function M.spawn(window, opts)
         return tab, pane, mux_win
     end
 
-    -- "tab" (default). Per Appendix A: `current_window:spawn_tab {...}`,
-    -- where `current_window` is the MUX window. The GUI `Window` userdata
-    -- the keybinding receives exposes `:mux_window()` for that resolution;
-    -- `Pane:spawn_tab` does NOT exist in current wezterm builds.
+    -- "tab" (default). Calls `current_window:spawn_tab{...}` where
+    -- `current_window` is the MUX window. The GUI `Window` userdata
+    -- the keybinding receives exposes `:mux_window()` for that
+    -- resolution; `Pane:spawn_tab` does NOT exist in current wezterm
+    -- builds.
     if window == nil then
         return nil, "WEZSESH_SPAWN_NO_WINDOW"
     end
@@ -486,7 +487,7 @@ function M.spawn(window, opts)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 / §11 — register_keybinding
+-- register_keybinding
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Append a `{key, mods, action}` entry to `config.keys`, initialising

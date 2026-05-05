@@ -60,10 +60,10 @@ local function assert_false(cond, msg)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.0 / §0.1 row 15 — Lua 5.3+ requirement
+-- Lua 5.3+ requirement
 -- ────────────────────────────────────────────────────────────────────
 
-describe("Lua 5.3+ load-time assertion (§9.0, §0.1 row 15)", function()
+describe("Lua 5.3+ load-time assertion", function()
     it("the running interpreter satisfies _VERSION >= \"Lua 5.3\"",
     function()
         -- The module already asserted this at require time; if we got
@@ -86,10 +86,10 @@ describe("Lua 5.3+ load-time assertion (§9.0, §0.1 row 15)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.9 — equality semantics
+-- equality semantics
 -- ────────────────────────────────────────────────────────────────────
 
-describe("eq — equality semantics (§9.9)", function()
+describe("eq — equality semantics", function()
     it("returns true for two empty strings", function()
         assert_true(ct.eq("", ""), "empty == empty")
     end)
@@ -289,7 +289,7 @@ describe("constant-time access pattern (acceptance gate: branchless "
     end
 
     it("differing-length inputs short-circuit BEFORE any byte read "
-        .. "(length leak is acknowledged in §5.6)", function()
+        .. "(length leak is publicly acceptable)", function()
         with_byte_counter(function(mod, reset, get)
             reset()
             assert_false(mod.eq(string.rep("a", 64),

@@ -1,8 +1,8 @@
--- §17.5 — Lua handler fuzz harness for ipc.lua's `user-var-changed`
--- step machine. Drives 15 mutation classes (the §17.5 fixed-width list
--- + the row-#35 amendments `unknown_verb` and `v_field_swap`) into the
--- production `M.handle_user_var(window, pane, name, value, opts)` entry
--- point and asserts the four §17.5 invariants on every iteration:
+-- Lua handler fuzz harness for ipc.lua's `user-var-changed` step
+-- machine. Drives 15 mutation classes (the fixed-width list plus the
+-- `unknown_verb` and `v_field_swap` amendments) into the production
+-- `M.handle_user_var(window, pane, name, value, opts)` entry point
+-- and asserts the four invariants on every iteration:
 --
 --   (1) no Lua error escapes the handler (outer pcall returns true);
 --   (2) `ops.dispatch` invocation count = 0 unless the input by
@@ -30,7 +30,7 @@
 -- touching the real disk.
 --
 -- The harness deliberately does NOT use any wezterm API (foreign to
--- standalone-Lua) and stays outside the §17.4 lualint AST walker (the
+-- standalone-Lua) and stays outside the lualint AST walker (the
 -- file is `*_spec.lua`, which lualint skips wholesale at line 103 of
 -- cmd/lualint/main.go).
 
@@ -50,12 +50,12 @@ package.path = script_dir() .. "/?.lua;"
 -- argv parsing — `--seed=<int>`, `--iters=<int>`, `--no-shim`
 -- ────────────────────────────────────────────────────────────────────
 --
--- `--no-shim` switches `oversized_string` to the §17.5-spec-literal 1
--- MiB id fixture (`string.rep("X", 1<<20)`). Without it the harness
+-- `--no-shim` switches `oversized_string` to the spec-literal 1 MiB
+-- id fixture (`string.rep("X", 1<<20)`). Without it the harness
 -- cycles 256/1024/4096 bytes because the pure-Lua `json_parse_shim`
 -- would dominate the per-iter budget at 1 MiB. Real wezterm ships a C
--- json_parse and the production budget is comfortable at 1<<20 — that
--- environment is exercised by the §17.6 e2e job, where the spec's 1
+-- json_parse and the production budget is comfortable at 1<<20 —
+-- that environment is exercised by the e2e job, where the spec's 1
 -- MiB intent is honoured. CI does NOT pass `--no-shim`; the
 -- division-of-labor is intentional.
 
@@ -160,7 +160,7 @@ local function reset_world()
     ipc._reset_deps()
 end
 
--- Build a properly signed §3.3 payload table. Caller may override any
+-- Build a properly signed canonical payload table. Caller may override any
 -- field; build_payload then re-tags + re-signs with the verb-keyed
 -- shape so tag_in_place succeeds during the verifier path.
 local function build_signed_payload(overrides)
@@ -211,7 +211,7 @@ local function build_signed_payload(overrides)
     return payload
 end
 
--- Build a §3.1 pointer envelope referring to `path` with `id`. wezterm
+-- Build a pointer envelope referring to `path` with `id`. wezterm
 -- pre-decodes the base64 form of the SetUserVar OSC value before
 -- firing `user-var-changed`, so the handler receives the raw pointer
 -- JSON directly; the harness mirrors that contract.
@@ -228,7 +228,7 @@ end
 -- (restore_fn, dispatch_calls, reply_writes). dispatch_calls is the
 -- canonical record (pcall'd from step (i)). reply_writes is a
 -- separate counter the dispatch shim increments to model the
--- §13.13 reply-on-socket contract — neither is incremented unless
+-- Reply-on-socket contract — neither is incremented unless
 -- the handler reaches step (i).
 local function install_seams(file_entries, now)
     local real_io_open  = io.open
@@ -293,7 +293,7 @@ local frozen_opts = {
 }
 
 -- ────────────────────────────────────────────────────────────────────
--- Mutation generators — one per §17.5 class
+-- Mutation generators — one per mutation class
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Each generator returns (value, file_entries, byte_count) where
@@ -371,7 +371,7 @@ local function build_file_class(payload_table, want_id)
 end
 
 local function gen_field_missing(idx)
-    -- 7 required root fields per §3.3 (sans hmac which is 8th):
+    -- 7 required root fields (sans hmac which is 8th):
     -- v, id, ts, target_window_id, reply_sock, op, args, hmac.
     local fields = { "v", "id", "ts", "target_window_id",
                      "reply_sock", "op", "args", "hmac" }
@@ -382,7 +382,7 @@ local function gen_field_missing(idx)
 end
 
 local function gen_type_swapped()
-    -- The §17.5 fixture: ts="string", args=42, target_window_id="x".
+    -- The shape-mismatch fixture: ts="string", args=42, target_window_id="x".
     -- Random selection per iter so we exercise each type-swap branch.
     local payload = build_signed_payload{ op = "noop" }
     local choice = math.random(1, 4)
@@ -421,13 +421,13 @@ local function gen_untagged_table()
 end
 
 local function gen_oversized_string()
-    -- §17.5 fixture: id = string.rep("X", 1<<20). The handler's
+    -- Oversized fixture: id = string.rep("X", 1<<20). The handler's
     -- validate_payload (step (d)) rejects on #id != 26, so the gate
     -- is independent of length; under the pure-Lua json_parse_shim
     -- the harness-side length is capped to keep the per-iter wall-
-    -- clock under the §17.5 50ms budget. Real wezterm uses a C
+    -- clock under the 50ms budget. Real wezterm uses a C
     -- parser; the production budget is comfortable at 1<<20. Pass
-    -- `--no-shim` (e.g. from the §17.6 e2e env) to honour the spec
+    -- `--no-shim` (e.g. from the e2e env) to honour the spec
     -- literally; CI's standalone harness invocation does not.
     local big
     if NO_SHIM then
@@ -510,7 +510,7 @@ local function gen_unknown_verb()
     local op = bogus_verbs[math.random(1, #bogus_verbs)]
     -- We sign with the verb_args_shape table missing → can't sign
     -- correctly. So we sign as `noop` (whose shape exists), then
-    -- swap the op label after signing. The §17.5 spec says HMAC
+    -- swap the op label after signing. The spec says HMAC
     -- verify never runs anyway — step (e) drops first.
     local payload = build_signed_payload{ op = "noop" }
     payload.op = op
@@ -530,7 +530,7 @@ local function gen_v_field_swap(branch)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- Per-iteration driver — drives one mutation, asserts §17.5 gates.
+-- Per-iteration driver — drives one mutation, asserts gates.
 -- ────────────────────────────────────────────────────────────────────
 
 local FRAME_BUDGET_MS = 50
@@ -547,7 +547,7 @@ local function drive(class_name, value, file_entries, must_dispatch, now)
     -- MEDIUM-2 (round 1): os.clock() measures CPU seconds, not wall.
     -- Under the in-memory shim (no real I/O, no network, no disk) the
     -- CPU/wall ratio is ≈1, so this remains a sound lower-bound proxy
-    -- for the §17.5 50 ms wall-clock gate. If the harness ever swaps
+    -- for the 50 ms wall-clock gate. If the harness ever swaps
     -- the in-memory shim for real I/O, re-check this gate under
     -- wall-clock (e.g. socket(2) syscall + poll). Don't switch to
     -- os.date-diff — its 1-second resolution would silently invalidate
@@ -590,7 +590,7 @@ local function drive(class_name, value, file_entries, must_dispatch, now)
         if #reply_writes ~= 0 then
             return false, string.format(
                 "%s: reply written on unauthenticated input (count=%d). "
-                .. "§13.13 silent-drop contract violated.",
+                .. "silent-drop contract violated.",
                 class_name, #reply_writes)
         end
     end
@@ -599,7 +599,7 @@ end
 
 -- ────────────────────────────────────────────────────────────────────
 -- Per-class iteration plan. Total mutated bytes across all classes
--- MUST be ≥ 10 000 (§17.5 acceptance gate).
+-- MUST be ≥ 10 000 (the acceptance gate).
 -- ────────────────────────────────────────────────────────────────────
 --
 -- random_bytes drives the bulk: 60 iters × ~2048 byte avg = ~120k.
@@ -616,7 +616,7 @@ local function plan(name, default_iters)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- Run plan — one entry per §17.5 mutation class
+-- Run plan — one entry per mutation class
 -- ────────────────────────────────────────────────────────────────────
 
 local total_mutations = 0
@@ -754,7 +754,7 @@ run_class("hmac_corrupted", plan("hmac_corrupted", 8), function(_)
 end)
 
 -- 13. ts_boundary — exactly 8 (2 sweeps × 4 branches), each branch
--- asserts the right accept/reject side per §17.3.
+-- asserts the right accept/reject side.
 run_class("ts_boundary", plan("ts_boundary", 8), function(i)
     local v, fe, bytes, accept = gen_ts_boundary(i)
     total_mutations = total_mutations + 1
@@ -817,20 +817,20 @@ if total_classes ~= EXPECTED_CLASSES then
             EXPECTED_CLASSES, total_classes))
 end
 
--- The §17.5 acceptance gate requires ≥ 10 000 mutated bytes per run.
+-- The acceptance gate requires ≥ 10 000 mutated bytes per run.
 -- Skip the gate when the operator has explicitly downscaled with
 -- --iters (cmd/lua-fuzzer --iters=10 smoke).
 --
 -- MEDIUM-3 (round 1): `--iters=<n>` overrides BYTE_FLOOR. The
 -- load-bearing constraint is therefore that the CI invocation MUST
 -- NOT pass `--iters` — see `.github/workflows/ci.yml` step "Lua
--- handler fuzz harness (§17.5)". This is enforced by inspection of
+-- handler fuzz harness". This is enforced by inspection of
 -- ci.yml; we deliberately don't gate on a CI-marker env var here to
 -- keep the harness simple.
 local BYTE_FLOOR = 10000
 if ITERS_OVERRIDE == nil and total_bytes < BYTE_FLOOR then
     record_fail("byte_floor",
-        string.format("total mutated bytes %d < %d (§17.5 gate)",
+        string.format("total mutated bytes %d < %d (acceptance gate)",
             total_bytes, BYTE_FLOOR))
 end
 

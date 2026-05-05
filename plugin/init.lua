@@ -1,15 +1,15 @@
--- §9.1 — `init.lua`. The plugin's entry point. Every wezterm config that
--- pulls in wezsesh calls into `M.apply_to_config(config, opts)` from its
--- top-level Lua module. This file MUST stay tiny and disciplined: every
--- raise inside `apply_to_config` is a config-eval explosion the user
--- sees as wezterm refusing to start. (P §7.1) — surface plugin failure
--- as a 10s toast, never a config-load explosion.
+-- The plugin's entry point. Every wezterm config that pulls in wezsesh
+-- calls into `M.apply_to_config(config, opts)` from its top-level Lua
+-- module. This file MUST stay tiny and disciplined: every raise inside
+-- `apply_to_config` is a config-eval explosion the user sees as
+-- wezterm refusing to start. We surface plugin failure as a 10s toast,
+-- never a config-load explosion.
 --
 -- Responsibilities (in strict order):
 --   1. Bust `package.loaded["wezsesh.*"]` so submodule edits land on
---      `Ctrl+Shift+R` reload (spike #1 — wezterm reloads init.lua via
---      `loadfile` but does NOT re-evaluate cached `require()` results).
---   2. GLOBAL schema-version stamp (P §7.1, design §10.6). Compare
+--      `Ctrl+Shift+R` reload — wezterm reloads init.lua via `loadfile`
+--      but does NOT re-evaluate cached `require()` results.
+--   2. GLOBAL schema-version stamp. Compare
 --      `wezterm.GLOBAL.wezsesh_plugin_version` to `M.VERSION`; on
 --      mismatch (including downgrade and first-load-nil) wipe every
 --      `wezsesh_*` GLOBAL key and re-stamp. MUST run BEFORE any other
@@ -17,15 +17,17 @@
 --      get nuked. Handles `wezterm.plugin.update_all()` cleanly with
 --      no migration logic.
 --   3. Install the persistent `resurrect.error` listener via
---      `resurrect_error.register()` (spike #2 — backs §9.13 with_capture).
+--      `resurrect_error.register()` (backs `with_capture`'s side
+--      channel).
 --   4. Lock resurrect's `save_state_dir` to wezsesh's `snapshot_dir`
---      (impossible-by-construction over the §8.17.1
+--      (impossible-by-construction over the
 --      `snapshot.dir.matches.resurrect` doctor check).
---   5. Validate `opts.runtime_dir` against the §13.9 SUN_PATH ceiling.
---   6. Generate / fetch the §5.2 HMAC session key into
+--   5. Validate `opts.runtime_dir` against the SUN_PATH ceiling.
+--   6. Generate / fetch the HMAC session key into
 --      `wezterm.GLOBAL.wezsesh_session_key`.
 --   7. Register the `user-var-changed` handler via `ipc.register{...}`.
---   8. Register the §11.1 keybinding via `manager.register_keybinding`.
+--   8. Register the default keybinding via
+--      `manager.register_keybinding`.
 --
 -- Steps 5–8 mutate global state. Each one MUST be inside the outer
 -- pcall so a sentinel raise (`WEZSESH_RUNTIME_DIR_TYPE`,
@@ -33,7 +35,7 @@
 -- `WEZSESH_SESSION_KEY_GENERATION_FAILED`) becomes a toast, not a
 -- traceback in `~/.wezterm.lua` eval.
 --
--- mlua sandbox (§9.0.1):
+-- mlua sandbox:
 --   * `local wezterm = require("wezterm")` at file top — never `_G.wezterm`.
 --   * No `debug.*`. No `dofile(`. No nested-table values into
 --     `wezterm.GLOBAL` (the submodules already enforce this; this file
@@ -43,11 +45,11 @@ local wezterm = require("wezterm")
 
 local M = {}
 
--- §17.4 lint pin: bumped per tagged release in lockstep with
+-- Lint pin: bumped per tagged release in lockstep with
 -- `manager.lua`'s `M.VERSION`. The `apply_to_config` body asserts
 -- equality — a divergence between the two surfaces is a release-process
 -- bug that would silently misreport `WEZSESH_PLUGIN_VERSION` over the
--- wire (Appendix A env vector).
+-- wire.
 M.VERSION = "0.1.0"
 
 -- ────────────────────────────────────────────────────────────────────
@@ -64,11 +66,11 @@ local function parent_dir(p)
     return parent
 end
 
--- Mutate `opts` so `binary` and `plugin_root` carry the §9.1 contract
+-- Mutate `opts` so `binary` and `plugin_root` carry the documented
 -- precedence: `binary` non-empty wins; otherwise `plugin_root` carries.
 -- When only `binary` is set, derive `plugin_root` as
--- `parent_dir(binary)/plugin` for §9.2.resolve_binary's downstream
--- consistency. Empty-string `binary` is treated as absent (matches
+-- `parent_dir(binary)/plugin` so manager.resolve_binary's downstream
+-- consistency holds. Empty-string `binary` is treated as absent (matches
 -- `manager.resolve_binary`'s `opts.binary ~= ""` precedence rule).
 local function reconcile_binary_opts(opts)
     if type(opts) ~= "table" then return opts end
@@ -121,24 +123,25 @@ local function maybe_toast(err)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.1 — apply_to_config
+-- apply_to_config
 -- ────────────────────────────────────────────────────────────────────
 --
 -- The outer body runs inside `pcall`. Any sentinel raise inside is
 -- caught and surfaced via `wezterm.toast_notification`; the user's
--- wezterm continues to start. (P §7.1)
+-- wezterm continues to start.
 --
--- The §17.4 grep gate enforces the `package.loaded["wezsesh.*"]` bust
--- loop is present in this function literally. Keep the form below
--- byte-stable.
+-- The `lua-package-loaded-bust-loop` lint enforces the
+-- `package.loaded["wezsesh.*"]` bust loop is present in this function
+-- literally. Keep the form below byte-stable.
 
 function M.apply_to_config(config, opts)
     opts = opts or {}
 
-    -- Cache-bust §9.1 / spike #1. MUST stay literally as below — §17.4
-    -- lint greps for this exact loop body. Sub-8-char prefixes would
-    -- match user modules whose names happen to start with `wezsesh`
-    -- (e.g. `wezsesh_extras.lua`); the `.` is part of the contract.
+    -- Cache-bust on reload. MUST stay literally as below — the
+    -- lualint rule greps for this exact loop body. Sub-8-char prefixes
+    -- would match user modules whose names happen to start with
+    -- `wezsesh` (e.g. `wezsesh_extras.lua`); the `.` is part of the
+    -- contract.
     for k in pairs(package.loaded) do
         if k:sub(1, 8) == "wezsesh." then package.loaded[k] = nil end
     end
@@ -217,27 +220,26 @@ function M.apply_to_config(config, opts)
                   or "WEZSESH_SESSION_KEY_GENERATION_FAILED", 0)
         end
 
-        -- Step 7 — Register the §9.3 user-var-changed handler. Requires
-        -- a target_window_id; the binary's spawn (T-602's
-        -- `manager.spawn`) captures it from the spawning window. At
-        -- apply_to_config time we don't have a live window yet, so the
-        -- handler runs with the §3.3 "any window" sentinel `-1` and
-        -- relies on the per-pane `state.set_state` record to
-        -- discriminate via `session.target_window_id` per
-        -- §9.3.1.C / ipc.lua step (g). `-1` is durable: wezterm has
-        -- never assigned negative window ids, so the sentinel cannot
-        -- collide with a real window id. The earlier `0` placeholder
-        -- was empirically wrong — wezterm's first window is `WINID = 0`,
-        -- so a keybinding spawned from that window emitted a wire
-        -- `target_window_id` of `0` that the §8.6 constructor rejected
-        -- with `TargetWindowID must be positive`. See T-DOC-049 / T-905.
+        -- Step 7 — Register the user-var-changed handler. Requires
+        -- a target_window_id; `manager.spawn` captures it from the
+        -- spawning window. At apply_to_config time we don't have a
+        -- live window yet, so the handler runs with the "any window"
+        -- sentinel `-1` and relies on the per-pane `state.set_state`
+        -- record to discriminate via `session.target_window_id`. `-1`
+        -- is durable: wezterm has never assigned negative window ids,
+        -- so the sentinel cannot collide with a real window id. The
+        -- earlier `0` placeholder was empirically wrong — wezterm's
+        -- first window is `WINID = 0`, so a keybinding spawned from
+        -- that window emitted a wire `target_window_id` of `0` that
+        -- the binary's payload constructor rejected with
+        -- `TargetWindowID must be positive`.
         local ipc = require("wezsesh.ipc")
         ipc.register({
             runtime_dir      = opts.runtime_dir or "/tmp/wezsesh",
             target_window_id = opts.target_window_id or -1,
         })
 
-        -- Step 8 — Append the §11.1 keybinding to config.keys. Wraps
+        -- Step 8 — Append the default keybinding to config.keys. Wraps
         -- M.spawn(window, opts) under pcall internally so a spawn
         -- raise can't wedge the wezterm event loop.
         manager.register_keybinding(config, opts)

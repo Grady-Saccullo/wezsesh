@@ -1,4 +1,4 @@
-# §17.5 fuzz harness regression seeds.
+# Fuzz harness regression seeds.
 #
 # One integer per line. Comments (this header, blank lines, lines
 # starting with `#`) are ignored. cmd/lua-fuzzer reads this file via

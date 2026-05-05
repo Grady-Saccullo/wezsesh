@@ -15,7 +15,7 @@
 --   * wezterm.run_child_process — programmable per-test response.
 --   * wezterm.json_encode — pure-Lua JSON emitter (round-trip only).
 --   * wezterm.target_triple / wezterm.home_dir — string fields used by
---     §13.9 ceiling math.
+--     SUN_PATH ceiling math.
 --   * wezterm.mux.spawn_window — captures invocation for assertions.
 --   * wezterm.action_callback — wraps the callback in a tagged table
 --     that the spec can identify.
@@ -243,10 +243,9 @@ local mux_shim = {
 }
 
 -- Window/pane stubs for spawn_tab path. The mode = "tab" branch goes
--- through window:mux_window():spawn_tab(...) per Appendix A
--- (`current_window:spawn_tab {...}`); the GUI Window userdata exposes
--- `:mux_window()` for that resolution. `Pane:spawn_tab` does NOT exist
--- in current wezterm builds (T-902).
+-- through `window:mux_window():spawn_tab(...)`; the GUI Window
+-- userdata exposes `:mux_window()` for that resolution.
+-- `Pane:spawn_tab` does NOT exist in current wezterm builds.
 local function make_window_stub()
     return setmetatable({}, {
         __index = function(_, k)
@@ -372,11 +371,11 @@ local function assert_match(s, pattern, msg)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.2 surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.2)", function()
-    it("exposes the §9.2 API and a VERSION constant", function()
+describe("module surface", function()
+    it("exposes the public API and a VERSION constant", function()
         local want = {
             "VERSION", "compatible", "detect_version",
             "ensure_session_key", "register_keybinding",
@@ -522,10 +521,10 @@ describe("compatible", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- ensure_session_key (§5.2)
+-- ensure_session_key
 -- ────────────────────────────────────────────────────────────────────
 
-describe("ensure_session_key (§5.2)", function()
+describe("ensure_session_key", function()
     it("calls `<bin> keygen` and stores 64hex in GLOBAL on success",
     function()
         local hex = string.rep("a", 64)
@@ -593,10 +592,10 @@ describe("ensure_session_key (§5.2)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- validate_runtime_dir (§13.9)
+-- validate_runtime_dir
 -- ────────────────────────────────────────────────────────────────────
 
-describe("validate_runtime_dir (§13.9)", function()
+describe("validate_runtime_dir", function()
     it("raises WEZSESH_RUNTIME_DIR_TYPE for non-string input", function()
         local ok, err = pcall(manager.validate_runtime_dir,
             { runtime_dir = 42 })
@@ -663,10 +662,10 @@ describe("validate_runtime_dir (§13.9)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- write_config_file (§10.7)
+-- write_config_file
 -- ────────────────────────────────────────────────────────────────────
 
-describe("write_config_file (§10.7)", function()
+describe("write_config_file", function()
     it("writes JSON containing the dirs and version fields", function()
         local path = manager.write_config_file({
             snapshot_dir = "/sd",
@@ -699,7 +698,7 @@ describe("write_config_file (§10.7)", function()
         os.remove(path)
     end)
 
-    it("emits ALL §10.7 top-level keys", function()
+    it("emits ALL config-schema top-level keys", function()
         local path = manager.write_config_file({})
         local f = io.open(path, "rb"); local body = f:read("*a")
         f:close(); os.remove(path)
@@ -710,14 +709,14 @@ describe("write_config_file (§10.7)", function()
             "default_action_load_no_prompt", "confirm_delete",
             "confirm_overwrite", "exclude",
             -- new_workspace_command is nil-by-default → omitted by
-            -- json_encode (matches §10.7 `null` semantics).
+            -- json_encode (the binary's parser accepts null here).
             "preview", "markers", "columns", "name_truncate",
             "colors", "hooks", "resurrect_argv_allowlist",
             "keys", "plugin_version", "proto_version",
         }
         for _, k in ipairs(want_keys) do
             assert_true(parsed[k] ~= nil,
-                "config file missing §10.7 key: " .. k)
+                "config file missing schema key: " .. k)
         end
     end)
 
@@ -741,7 +740,7 @@ describe("write_config_file (§10.7)", function()
     end)
 
     -- T-903 case 1: nil opts.resurrect_argv_allowlist falls back to the
-    -- default_allowlist module so the §10.7 `[]string` schema receives a
+    -- default_allowlist module so the `[]string` schema receives a
     -- non-empty array (avoiding wezterm's empty-Lua-table → `{}` quirk).
     it("nil resurrect_argv_allowlist falls back to default_allowlist",
     function()
@@ -796,14 +795,14 @@ describe("write_config_file (§10.7)", function()
         f:close(); os.remove(path)
         assert_match(body,
             '"resurrect_argv_allowlist":%[%s*%]',
-            "empty {} not emitted as JSON `[]` (would break §10.7)")
+            "empty {} not emitted as JSON `[]` (would break config schema)")
     end)
 
     -- T-903 fallback: when the wezterm build does NOT expose
     -- `json_array_metatable` (older wezterm; the spec shim with the
     -- accessor stripped), an explicitly-empty `{}` must NOT round-trip
     -- as `{}` — manager.lua substitutes the non-empty default_allowlist
-    -- so the §10.7 schema still receives a JSON array.
+    -- so the config schema still receives a JSON array.
     it("empty {} substitutes default_allowlist when accessor absent",
     function()
         wezterm_shim.json_array_metatable = nil
@@ -814,7 +813,7 @@ describe("write_config_file (§10.7)", function()
         f:close(); os.remove(path)
         assert_true(body:find('"resurrect_argv_allowlist":{}', 1, true)
             == nil,
-            "empty allowlist leaked through as `{}` — §10.7 violation")
+            "empty allowlist leaked through as `{}` — schema violation")
         local parsed = json_parse_shim(body)
         assert_eq(type(parsed.resurrect_argv_allowlist), "table",
             "fallback allowlist not a table")
@@ -824,15 +823,15 @@ describe("write_config_file (§10.7)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- spawn (Appendix A)
+-- spawn
 -- ────────────────────────────────────────────────────────────────────
 --
--- Acceptance gate: env vector contains EXACTLY the four Appendix A
+-- Acceptance gate: env vector contains EXACTLY the four contract
 -- keys (WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_FILE,
 -- WEZSESH_PLUGIN_VERSION) — no extras, no missing. The dirs travel
 -- inside WEZSESH_CONFIG_FILE.
 
-describe("spawn (Appendix A)", function()
+describe("spawn", function()
     local function seed_session_key()
         gctrl.set("wezsesh_session_key", string.rep("b", 64))
     end
@@ -846,7 +845,7 @@ describe("spawn (Appendix A)", function()
         }
     end
 
-    it("constructs the env vector with the Appendix A keys (PATH "
+    it("constructs the env vector with the four contract keys (PATH "
         .. "permitted per T-906 launchd workaround)",
     function()
         seed_session_key()
@@ -854,7 +853,7 @@ describe("spawn (Appendix A)", function()
         manager.spawn(win, { spawn_mode = "tab" })
         assert_eq(#spawn_calls, 1, "expected one spawn call")
         local env = spawn_calls[1].arg.set_environment_variables
-        -- Appendix A exact value checks.
+        -- exact value checks.
         assert_eq(env.WEZSESH_HMAC_KEY, string.rep("b", 64),
             "HMAC key not threaded from GLOBAL")
         assert_eq(env.WEZSESH_PROTO_VERSION, "1",
@@ -864,7 +863,7 @@ describe("spawn (Appendix A)", function()
         assert_true(type(env.WEZSESH_CONFIG_FILE) == "string"
             and env.WEZSESH_CONFIG_FILE ~= "",
             "CONFIG_FILE empty / wrong type")
-        -- The four Appendix A keys MUST be present. T-906 also injects
+        -- The four contract keys MUST be present. We also inject
         -- PATH on macOS launchd children (documented choice in
         -- manager.lua); permit it but reject any other keys.
         local allowed = {
@@ -999,10 +998,10 @@ describe("spawn (Appendix A)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- register_keybinding (§9.2 / §11)
+-- register_keybinding
 -- ────────────────────────────────────────────────────────────────────
 
-describe("register_keybinding (§9.2 / §11.1)", function()
+describe("register_keybinding", function()
     it("appends a {key, mods, action} entry to config.keys", function()
         local config = {}
         manager.register_keybinding(config, {
@@ -1027,16 +1026,16 @@ describe("register_keybinding (§9.2 / §11.1)", function()
         assert_eq(config.keys[1].key, "X", "prior entry mutated")
     end)
 
-    it("uses §11 default keybinding when opts.keybinding nil", function()
+    it("uses default keybinding when opts.keybinding nil", function()
         local config = {}
         manager.register_keybinding(config, {})
-        assert_eq(config.keys[1].key, "W", "§11.1 default key wrong")
+        assert_eq(config.keys[1].key, "W", "default key wrong")
         assert_eq(config.keys[1].mods, "LEADER|SHIFT",
-            "§11.1 default mods wrong")
+            "default mods wrong")
     end)
 
     it("the callback is pcall-wrapped so a spawn raise can't wedge "
-        .. "the wezterm event loop (§14.3)", function()
+        .. "the wezterm event loop", function()
         -- Force spawn to raise inside the callback. The callback's
         -- internal pcall should swallow it without re-raising.
         local config = {}
@@ -1052,16 +1051,16 @@ describe("register_keybinding (§9.2 / §11.1)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §16.5 lint — `wezterm.background_child_process` MUST be pcall-wrapped
+-- pcall-wrap gate (background_child_process)
 -- ────────────────────────────────────────────────────────────────────
 --
--- T-602's spawn path uses mux.spawn_window / mux_window:spawn_tab per
--- Appendix A — `background_child_process` is not invoked. The strongest
--- assertion here is "the file contains no unwrapped
--- background_child_process call". A future change that introduces one
--- without `pcall(...)` on the same line will trip this gate.
+-- The spawn path uses mux.spawn_window / mux_window:spawn_tab —
+-- `background_child_process` is not invoked. The strongest assertion
+-- here is "the file contains no unwrapped background_child_process
+-- call". A future change that introduces one without `pcall(...)` on
+-- the same line will trip this gate.
 
-describe("§16.5 pcall-wrap gate", function()
+describe("background_child_process pcall-wrap gate", function()
     it("contains no unwrapped wezterm.background_child_process call",
     function()
         local f = io.open(script_dir() .. "/manager.lua", "rb")

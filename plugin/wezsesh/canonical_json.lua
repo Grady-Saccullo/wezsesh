@@ -1,12 +1,12 @@
--- §9.7 / §4.1 / §4.2 — canonical-JSON encoder for the Lua side of the
--- IPC wire protocol. Produces byte-identical output to the Go encoder
--- (internal/canonicaljson/encoder.go) for every shape in the §17.1
--- golden corpus. Pure Lua; no wezterm calls, no globals, no I/O.
+-- Canonical-JSON encoder for the Lua side of the IPC wire protocol.
+-- Produces byte-identical output to the Go encoder
+-- (internal/canonicaljson/encoder.go) for every shape in the golden
+-- corpus. Pure Lua; no wezterm calls, no globals, no I/O.
 --
--- Side-effect free. The verb-aware tagger (§4.2) mutates its input in
--- place, but only by setting metatables / replacing tables of size 0
--- with the NULL sentinel where the shape mandates `string_or_null`
--- and the value is the parser's empty table.
+-- Side-effect free except for the verb-aware tagger, which mutates
+-- its input in place — but only by setting metatables / replacing
+-- tables of size 0 with the NULL sentinel where the shape mandates
+-- `string_or_null` and the value is the parser's empty table.
 --
 -- Errors raised via error(msg, 0) so the message has no file:line
 -- prefix; callers (ipc.lua step (e)) substring-match the sentinel
@@ -37,7 +37,7 @@ do
     end
 end
 
--- Root payload envelope (§3.3). Used by ipc.lua step (e):
+-- Root payload envelope. Used by ipc.lua step (e):
 --   tag_in_place(payload, ROOT_PAYLOAD_SHAPE, verb_args_shape[op]).
 -- The args subspec is filled in dynamically by the caller per op.
 M.ROOT_PAYLOAD_SHAPE = {
@@ -92,7 +92,7 @@ local function hex4(cp)
         .. hex_digits:sub(( cp        & 0xf) + 1, ( cp        & 0xf) + 1)
 end
 
--- §4.1.4 string serializer.
+-- string serializer.
 local function append_string(out, s)
     if type(s) ~= "string" then
         fail("ENCODER_UNSUPPORTED", "expected string, got " .. type(s))
@@ -154,7 +154,7 @@ end
 
 local append_value -- forward decl
 
--- §4.1.1 object serializer.
+-- object serializer.
 local function append_object(out, t)
     -- Collect string keys; reject non-string keys.
     local keys = {}
@@ -166,7 +166,7 @@ local function append_object(out, t)
         keys[#keys + 1] = k
     end
     -- Lua < on strings is bytewise; matches Go sort.Strings under
-    -- LC_ALL=C. The explicit comparator mirrors §4.1 rule 1.
+    -- LC_ALL=C. The explicit comparator mirrors that bytewise rule.
     table.sort(keys, function(a, b) return a < b end)
 
     out[#out + 1] = "{"
@@ -187,7 +187,7 @@ local function append_object(out, t)
     out[#out + 1] = "}"
 end
 
--- §4.1.7 array serializer.
+-- array serializer.
 local function append_array(out, t)
     local n = #t
     -- Holes in arrays are illegal: Go has no analogous shape and the
@@ -219,7 +219,7 @@ local function append_array(out, t)
     out[#out + 1] = "]"
 end
 
--- §4.1 dispatch.
+-- type dispatch.
 append_value = function(out, v)
     local tv = type(v)
 
@@ -254,8 +254,7 @@ append_value = function(out, v)
                  .. "use canonical_json.array{...} / .object{...} / .NULL")
         else
             -- Anything other than the three legitimate tags is an
-            -- error (§0.1 row 24 outlaws "untagged", and any other
-            -- string is undefined).
+            -- error: only the three legitimate tags are allowed.
             fail("ENCODER_UNTAGGED_TABLE",
                  "unknown __wezsesh_canonical tag: " .. tostring(tag))
         end
@@ -276,7 +275,7 @@ function M.encode(v)
     return table.concat(out)
 end
 
--- §4.2 verb-aware tagger. Walks t in place applying tags from the
+-- Verb-aware tagger. Walks t in place applying tags from the
 -- shape spec. Container shape mismatches and leaf-type violations
 -- raise CANONICAL_SHAPE_MISMATCH. Returns t.
 --
@@ -417,7 +416,7 @@ function M.tag_in_place(t, root_shape, args_shape)
 end
 
 -- Shallow copy minus key k. Preserves metatable so a tagged container
--- stays tagged after the copy. Used by the §4.3 verifier to drop the
+-- stays tagged after the copy. Used by the HMAC verifier to drop the
 -- `hmac` field before re-encoding for HMAC compute.
 function M.copy_without(t, k)
     if type(t) ~= "table" then

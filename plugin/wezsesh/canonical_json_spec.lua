@@ -105,7 +105,7 @@ local function read_file(path)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.1 golden-corpus inputs (mirrors goldenInputs in encoder_test.go)
+-- golden-corpus inputs (mirrors goldenInputs in encoder_test.go)
 -- ────────────────────────────────────────────────────────────────────
 --
 -- IMPORTANT: empty Lua tables MUST be tagged with cj.array / cj.object;
@@ -114,7 +114,7 @@ end
 -- — Lua 5.4 stores all integer literals as the integer subtype.
 
 local golden_inputs = {
-    -- §17.1 base corpus.
+    -- base corpus.
     empty_object   = cj.object{},
     empty_array    = cj.array{},
     empty_string   = "",
@@ -138,7 +138,7 @@ local golden_inputs = {
     explicit_null  = cj.NULL,
     forward_slash  = "a/b",
 
-    -- Per-verb fixtures (§6).
+    -- Per-verb fixtures.
     verb_switch_args     = cj.object{ name = "work" },
     verb_load_args       = cj.object{ name = "work" },
     verb_save_args       = cj.object{
@@ -194,7 +194,7 @@ end
 -- tests
 -- ────────────────────────────────────────────────────────────────────
 
-describe("golden corpus (§17.1)", function()
+describe("golden corpus", function()
     local fixtures = list_golden_files()
 
     it("can list fixtures", function()
@@ -238,7 +238,7 @@ describe("golden corpus (§17.1)", function()
     end
 end)
 
-describe("verb-aware tagging round-trip (§4.2 / §17.2)", function()
+describe("verb-aware tagging round-trip", function()
     it("noop: parser-style empty {} re-tags to object and encodes correctly",
     function()
         -- Simulate wezterm.json_parse output: plain (untagged) tables.
@@ -253,7 +253,8 @@ describe("verb-aware tagging round-trip (§4.2 / §17.2)", function()
                                             -- before re-encode in real
                                             -- verifier flow, but the
                                             -- canonical-WITH-hmac form
-                                            -- is what §17.2 documents.
+                                            -- is what the round-trip
+                                            -- fixture documents.
             args             = {},
         }
 
@@ -268,7 +269,7 @@ describe("verb-aware tagging round-trip (§4.2 / §17.2)", function()
         assert_eq(got, want_with_hmac,
             "tagged-payload encode (with hmac) wrong")
 
-        -- canonical sans-hmac form (§17.2 normative).
+        -- canonical sans-hmac form (matches the HMAC fixture).
         local sans = cj.copy_without(payload, "hmac")
         local got_sans = cj.encode(sans)
         local want_sans = '{"args":{},'
@@ -276,7 +277,7 @@ describe("verb-aware tagging round-trip (§4.2 / §17.2)", function()
             .. '"reply_sock":"/tmp/x.sock","target_window_id":1,'
             .. '"ts":1700000000,"v":1}'
         assert_eq(got_sans, want_sans,
-            "canonical sans-hmac form mismatch (§17.2)")
+            "canonical sans-hmac form mismatch")
     end)
 
     it("save: full envelope tags correctly with verb args", function()
@@ -351,7 +352,7 @@ describe("verb-aware tagging round-trip (§4.2 / §17.2)", function()
     end)
 end)
 
-describe("untagged table rejection (§4.1 rule 7)", function()
+describe("untagged table rejection", function()
     it("plain {} raises ENCODER_UNTAGGED_TABLE", function()
         assert_raises(function() cj.encode({}) end,
             "ENCODER_UNTAGGED_TABLE")
@@ -363,7 +364,7 @@ describe("untagged table rejection (§4.1 rule 7)", function()
             "ENCODER_UNTAGGED_TABLE")
     end)
 
-    it("__wezsesh_canonical = 'untagged' is outlawed (§0.1 row 24)",
+    it("__wezsesh_canonical = 'untagged' is outlawed",
     function()
         local bad = setmetatable({}, { __wezsesh_canonical = "untagged" })
         assert_raises(function() cj.encode(bad) end,
@@ -377,7 +378,7 @@ describe("untagged table rejection (§4.1 rule 7)", function()
     end)
 end)
 
-describe("number rules (§4.1 rule 3)", function()
+describe("number rules", function()
     it("int_min and int_max round-trip", function()
         assert_eq(cj.encode(math.mininteger), "-9223372036854775808")
         assert_eq(cj.encode(math.maxinteger), "9223372036854775807")
@@ -421,7 +422,7 @@ describe("number rules (§4.1 rule 3)", function()
     end)
 end)
 
-describe("string escape rules (§4.1 rule 4)", function()
+describe("string escape rules", function()
     it("forward slash NEVER escaped", function()
         assert_eq(cj.encode("/"), '"/"')
         assert_eq(cj.encode("a/b/c"), '"a/b/c"')
@@ -477,7 +478,7 @@ describe("string escape rules (§4.1 rule 4)", function()
     end)
 end)
 
-describe("UTF-8 validation (§4.1 rule 4)", function()
+describe("UTF-8 validation", function()
     it("rejects bare invalid bytes", function()
         assert_raises(function() cj.encode("\xff\xfe") end,
             "ENCODER_INVALID_UTF8")
@@ -507,7 +508,7 @@ describe("UTF-8 validation (§4.1 rule 4)", function()
     end)
 end)
 
-describe("key ordering (§4.1 rule 1, byte order)", function()
+describe("key ordering (byte order)", function()
     it("ASCII keys sorted bytewise", function()
         assert_eq(cj.encode(cj.object{ b = 1, a = 2, z = 3 }),
             '{"a":2,"b":1,"z":3}')
@@ -542,7 +543,7 @@ describe("stability", function()
     end)
 end)
 
-describe("copy_without (§9.7)", function()
+describe("copy_without", function()
     it("returns new table without key k, preserving metatable",
     function()
         local t = cj.object{ a = 1, hmac = "deadbeef", b = 2 }
