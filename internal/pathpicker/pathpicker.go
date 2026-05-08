@@ -43,9 +43,9 @@ const (
 // environment. Every other key from os.Environ() (including WEZSESH_LOG,
 // WEZSESH_NO_HOOKS, WEZSESH_NERDFONT) is preserved verbatim.
 var sensitiveEnvKeys = map[string]struct{}{
-	"WEZSESH_HMAC_KEY":      {},
-	"WEZSESH_PROTO_VERSION": {},
-	"WEZSESH_CONFIG_FILE":   {},
+	"WEZSESH_HMAC_KEY":           {},
+	"WEZSESH_PROTO_VERSION":      {},
+	"WEZSESH_CONFIG_JSON_BASE64": {},
 }
 
 // Resolve runs the configured (or auto-detected) path provider and returns

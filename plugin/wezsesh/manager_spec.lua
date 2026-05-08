@@ -298,10 +298,19 @@ package.preload["wezterm"] = function() return wezterm_shim end
 -- Bridge `wezsesh.default_allowlist` (the wezterm plugin loader's
 -- canonical name) to the plain `default_allowlist` module on the
 -- spec-local package.path. Without this, manager.lua's
--- `require("wezsesh.default_allowlist")` fallback in write_config_file
+-- `require("wezsesh.default_allowlist")` fallback in build_config_envvar
 -- raises a module-not-found error.
 package.preload["wezsesh.default_allowlist"] = function()
     return require("default_allowlist")
+end
+
+-- Bridge `wezsesh.crypto.b64` to the plain `crypto.b64` module on the
+-- spec-local package.path. manager.lua requires `wezsesh.crypto.b64`
+-- to base64-encode the config body for the WEZSESH_CONFIG_JSON_BASE64
+-- env var; without this preload, the require would land on a
+-- non-existent `plugin/wezsesh/wezsesh/crypto/b64.lua`.
+package.preload["wezsesh.crypto.b64"] = function()
+    return require("crypto.b64")
 end
 
 -- Now load the module under test.
@@ -377,10 +386,10 @@ end
 describe("module surface", function()
     it("exposes the public API and a VERSION constant", function()
         local want = {
-            "VERSION", "compatible", "detect_version",
-            "ensure_session_key", "register_keybinding",
-            "resolve_binary", "spawn", "validate_runtime_dir",
-            "write_config_file",
+            "VERSION", "build_config_envvar", "compatible",
+            "detect_version", "ensure_session_key",
+            "register_keybinding", "resolve_binary", "spawn",
+            "validate_runtime_dir",
         }
         local keys = {}
         for k in pairs(manager) do keys[#keys + 1] = k end
@@ -662,24 +671,35 @@ describe("validate_runtime_dir", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- write_config_file
+-- build_config_envvar
 -- ────────────────────────────────────────────────────────────────────
+--
+-- The previous `write_config_file` route wrote a tmp file with a
+-- predictable name; that's a CVE-class TOCTOU surface and is gone.
+-- The new contract: build_config_envvar(opts) returns a base64 string
+-- that the binary picks up from WEZSESH_CONFIG_JSON_BASE64. Decode +
+-- parse and assert on the resulting JSON shape, never on a path.
 
-describe("write_config_file", function()
-    it("writes JSON containing the dirs and version fields", function()
-        local path = manager.write_config_file({
+-- Decode a base64 string back to bytes for the spec's assertions. We
+-- use the project's b64 module — same code path that runs in
+-- production — so a regression in either the encoder or decoder
+-- surfaces here.
+local b64_for_spec = require("crypto.b64")
+
+describe("build_config_envvar", function()
+    it("returns a base64 string that decodes to JSON containing the "
+        .. "dirs and version fields", function()
+        local b64s = manager.build_config_envvar({
             snapshot_dir = "/sd",
             state_dir    = "/st",
             runtime_dir  = "/rd",
             data_dir     = "/dd",
         })
-        assert_true(type(path) == "string" and path ~= "",
-            "no path returned")
-        local f = io.open(path, "rb")
-        assert_true(f ~= nil, "config file not created at " .. path)
-        local body = f:read("*a")
-        f:close()
-        os.remove(path)
+        assert_true(type(b64s) == "string" and b64s ~= "",
+            "no base64 string returned")
+        local body = b64_for_spec.decode(b64s)
+        assert_true(body ~= nil and body ~= "",
+            "base64 decode failed for build_config_envvar output")
         local parsed = json_parse_shim(body)
         assert_eq(parsed.version, 1, "version not 1")
         assert_eq(parsed.proto_version, 1, "proto_version not 1")
@@ -691,17 +711,25 @@ describe("write_config_file", function()
         assert_eq(parsed.data_dir, "/dd", "data_dir wrong")
     end)
 
-    it("returns an absolute path", function()
-        local path = manager.write_config_file({})
-        assert_true(path:sub(1, 1) == "/",
-            "config path not absolute: " .. path)
-        os.remove(path)
+    it("returns RFC 4648 standard base64 (alphabet + optional pad)",
+    function()
+        local b64s = manager.build_config_envvar({})
+        assert_true(type(b64s) == "string" and b64s ~= "",
+            "no base64 string returned")
+        -- The base64 alphabet is [A-Za-z0-9+/=]. Reject any other byte
+        -- so a future regression that returns raw JSON or smuggles a
+        -- newline through gets caught here.
+        assert_true(b64s:match("^[A-Za-z0-9+/=]+$") ~= nil,
+            "build_config_envvar output is not pure base64: "
+            .. b64s:sub(1, 64))
+        -- Length MUST be a multiple of 4 (RFC 4648 framing).
+        assert_eq(#b64s % 4, 0,
+            "build_config_envvar output length not multiple of 4")
     end)
 
     it("emits ALL config-schema top-level keys", function()
-        local path = manager.write_config_file({})
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local b64s = manager.build_config_envvar({})
+        local body = b64_for_spec.decode(b64s)
         local parsed = json_parse_shim(body)
         local want_keys = {
             "version", "snapshot_dir", "state_dir", "runtime_dir",
@@ -716,20 +744,19 @@ describe("write_config_file", function()
         }
         for _, k in ipairs(want_keys) do
             assert_true(parsed[k] ~= nil,
-                "config file missing schema key: " .. k)
+                "config body missing schema key: " .. k)
         end
     end)
 
     it("honours user overrides for log_level / sort / hooks", function()
-        local path = manager.write_config_file({
+        local b64s = manager.build_config_envvar({
             log_level = "debug",
             sort      = "alphabetical",
             hooks     = { run_hooks = false,
                           prompt_on_untrusted = true,
                           timeout_seconds = 30 },
         })
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local body = b64_for_spec.decode(b64s)
         local parsed = json_parse_shim(body)
         assert_eq(parsed.log_level, "debug", "log_level not honoured")
         assert_eq(parsed.sort, "alphabetical", "sort not honoured")
@@ -747,9 +774,8 @@ describe("write_config_file", function()
         local default_list = require("default_allowlist")
         assert_true(#default_list > 0,
             "default_allowlist module is empty — fixture broken")
-        local path = manager.write_config_file({})
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local b64s = manager.build_config_envvar({})
+        local body = b64_for_spec.decode(b64s)
         local parsed = json_parse_shim(body)
         assert_eq(type(parsed.resurrect_argv_allowlist), "table",
             "resurrect_argv_allowlist not a table")
@@ -757,18 +783,17 @@ describe("write_config_file", function()
             "resurrect_argv_allowlist empty (would emit {} on wire)")
         -- Sanity: the first element matches the first default entry.
         assert_eq(parsed.resurrect_argv_allowlist[1], default_list[1],
-            "default_allowlist contents not echoed in config file")
+            "default_allowlist contents not echoed in config body")
     end)
 
     -- T-903 case 2: explicit non-empty array round-trips as a JSON array.
-    -- Asserts the file body literally contains `["sh"]` (not `{...}`),
+    -- Asserts the body literally contains `["sh"]` (not `{...}`),
     -- not just that the parsed form is correct.
     it("explicit one-element array emits JSON array form", function()
-        local path = manager.write_config_file({
+        local b64s = manager.build_config_envvar({
             resurrect_argv_allowlist = { "sh" },
         })
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local body = b64_for_spec.decode(b64s)
         assert_match(body,
             '"resurrect_argv_allowlist":%[%s*"sh"%s*%]',
             "explicit { 'sh' } not emitted as JSON array")
@@ -788,11 +813,10 @@ describe("write_config_file", function()
     -- before each test, so this exercise hits the round-2 fix.
     it("explicit empty {} emits JSON `[]` via json_array_metatable",
     function()
-        local path = manager.write_config_file({
+        local b64s = manager.build_config_envvar({
             resurrect_argv_allowlist = {},
         })
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local body = b64_for_spec.decode(b64s)
         assert_match(body,
             '"resurrect_argv_allowlist":%[%s*%]',
             "empty {} not emitted as JSON `[]` (would break config schema)")
@@ -806,11 +830,10 @@ describe("write_config_file", function()
     it("empty {} substitutes default_allowlist when accessor absent",
     function()
         wezterm_shim.json_array_metatable = nil
-        local path = manager.write_config_file({
+        local b64s = manager.build_config_envvar({
             resurrect_argv_allowlist = {},
         })
-        local f = io.open(path, "rb"); local body = f:read("*a")
-        f:close(); os.remove(path)
+        local body = b64_for_spec.decode(b64s)
         assert_true(body:find('"resurrect_argv_allowlist":{}', 1, true)
             == nil,
             "empty allowlist leaked through as `{}` — schema violation")
@@ -820,6 +843,22 @@ describe("write_config_file", function()
         assert_true(#parsed.resurrect_argv_allowlist > 0,
             "fallback allowlist empty (would emit {} on wire)")
     end)
+
+    -- Defensive size cap. The plain JSON output today is a few KB, well
+    -- under the 64 KiB ceiling. To exercise the rejection path we feed
+    -- an oversized payload through the only field that lifts a
+    -- caller-provided string verbatim into the body, so a future
+    -- ARG_MAX-bumping field doesn't silently round-trip.
+    it("raises WEZSESH_CONFIG_TOO_LARGE when the encoded body exceeds "
+        .. "64 KiB", function()
+        local oversize = string.rep("X", 64 * 1024)
+        local ok, err = pcall(manager.build_config_envvar, {
+            new_workspace_command = oversize,
+        })
+        assert_false(ok, "expected raise on oversized config body")
+        assert_match(tostring(err), "WEZSESH_CONFIG_TOO_LARGE",
+            "wrong sentinel for oversized body")
+    end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
@@ -827,22 +866,14 @@ end)
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Acceptance gate: env vector contains EXACTLY the four contract
--- keys (WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_FILE,
--- WEZSESH_PLUGIN_VERSION) — no extras, no missing. The dirs travel
--- inside WEZSESH_CONFIG_FILE.
+-- keys (WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION,
+-- WEZSESH_CONFIG_JSON_BASE64, WEZSESH_PLUGIN_VERSION) — no extras, no
+-- missing. The dirs travel inside WEZSESH_CONFIG_JSON_BASE64 as a
+-- base64-encoded JSON document; no tmp file is involved.
 
 describe("spawn", function()
     local function seed_session_key()
         gctrl.set("wezsesh_session_key", string.rep("b", 64))
-    end
-
-    local function appendix_a_keys()
-        return {
-            WEZSESH_HMAC_KEY       = true,
-            WEZSESH_PROTO_VERSION  = true,
-            WEZSESH_CONFIG_FILE    = true,
-            WEZSESH_PLUGIN_VERSION = true,
-        }
     end
 
     it("constructs the env vector with the four contract keys (PATH "
@@ -860,16 +891,18 @@ describe("spawn", function()
             "PROTO_VERSION not '1'")
         assert_eq(env.WEZSESH_PLUGIN_VERSION, manager.VERSION,
             "PLUGIN_VERSION not M.VERSION")
-        assert_true(type(env.WEZSESH_CONFIG_FILE) == "string"
-            and env.WEZSESH_CONFIG_FILE ~= "",
-            "CONFIG_FILE empty / wrong type")
+        assert_true(type(env.WEZSESH_CONFIG_JSON_BASE64) == "string"
+            and env.WEZSESH_CONFIG_JSON_BASE64 ~= "",
+            "CONFIG_JSON_BASE64 empty / wrong type")
         -- The four contract keys MUST be present. We also inject
         -- PATH on macOS launchd children (documented choice in
         -- manager.lua); permit it but reject any other keys.
+        -- Critically WEZSESH_CONFIG_FILE MUST NOT be present —
+        -- the tmp-file route is gone.
         local allowed = {
             WEZSESH_HMAC_KEY = true,
             WEZSESH_PROTO_VERSION = true,
-            WEZSESH_CONFIG_FILE = true,
+            WEZSESH_CONFIG_JSON_BASE64 = true,
             WEZSESH_PLUGIN_VERSION = true,
             PATH = true,
         }
@@ -877,10 +910,73 @@ describe("spawn", function()
             assert_true(allowed[k] == true,
                 "unexpected env key: " .. tostring(k))
         end
-        -- Cleanup the temp config file.
-        os.remove(env.WEZSESH_CONFIG_FILE)
-        -- Reference appendix_a_keys to silence unused-local warnings.
-        appendix_a_keys()
+        -- The retired WEZSESH_CONFIG_FILE MUST NOT appear in the env
+        -- vector — an attacker with /tmp write access could otherwise
+        -- swap the file between Lua's write and the binary's read.
+        assert_nil(env.WEZSESH_CONFIG_FILE,
+            "WEZSESH_CONFIG_FILE leaked into spawn env (tmp-file "
+            .. "TOCTOU surface should be retired)")
+    end)
+
+    it("WEZSESH_CONFIG_JSON_BASE64 decodes back to the plugin's "
+        .. "config JSON", function()
+        seed_session_key()
+        local win = make_window_stub()
+        manager.spawn(win, { spawn_mode = "tab",
+                             snapshot_dir = "/sd",
+                             state_dir    = "/st",
+                             runtime_dir  = "/rd",
+                             data_dir     = "/dd" })
+        local env = spawn_calls[1].arg.set_environment_variables
+        local decoded = b64_for_spec.decode(env.WEZSESH_CONFIG_JSON_BASE64)
+        assert_true(decoded ~= nil and decoded ~= "",
+            "WEZSESH_CONFIG_JSON_BASE64 did not decode")
+        local parsed = json_parse_shim(decoded)
+        assert_eq(parsed.snapshot_dir, "/sd", "snapshot_dir wrong")
+        assert_eq(parsed.state_dir, "/st", "state_dir wrong")
+        assert_eq(parsed.runtime_dir, "/rd", "runtime_dir wrong")
+        assert_eq(parsed.data_dir, "/dd", "data_dir wrong")
+        assert_eq(parsed.proto_version, 1, "proto_version not 1")
+        assert_eq(parsed.plugin_version, manager.VERSION,
+            "plugin_version mismatch")
+    end)
+
+    it("does NOT write a config tmp file (the tmp-file TOCTOU surface "
+        .. "is retired)", function()
+        -- Snapshot the candidate tmp directories before spawn so we can
+        -- assert no file matching the legacy pattern was created.
+        local tmp_candidates = { os.getenv("TMPDIR"), "/tmp" }
+        local before = {}
+        for _, d in ipairs(tmp_candidates) do
+            if type(d) == "string" and d ~= "" then
+                local f = io.popen("ls -1 " .. d .. " 2>/dev/null")
+                if f ~= nil then
+                    for line in f:lines() do
+                        before[d .. "/" .. line] = true
+                    end
+                    f:close()
+                end
+            end
+        end
+        seed_session_key()
+        local win = make_window_stub()
+        manager.spawn(win, { spawn_mode = "tab" })
+        for _, d in ipairs(tmp_candidates) do
+            if type(d) == "string" and d ~= "" then
+                local f = io.popen("ls -1 " .. d .. " 2>/dev/null")
+                if f ~= nil then
+                    for line in f:lines() do
+                        local full = d .. "/" .. line
+                        if line:match("^wezsesh%-.*%-config%.json$")
+                           and not before[full] then
+                            error("legacy tmp-file shape leaked: "
+                                .. full, 0)
+                        end
+                    end
+                    f:close()
+                end
+            end
+        end
     end)
 
     it("argv is exactly { resolved_binary }", function()
@@ -891,8 +987,6 @@ describe("spawn", function()
         local args = spawn_calls[1].arg.args
         assert_eq(#args, 1, "argv length not 1")
         assert_eq(args[1], "/abs/wezsesh", "argv[1] wrong")
-        os.remove(spawn_calls[1].arg.set_environment_variables
-            .WEZSESH_CONFIG_FILE)
     end)
 
     it("uses wezterm.mux.spawn_window for spawn_mode='window'", function()
@@ -901,8 +995,6 @@ describe("spawn", function()
         assert_eq(#spawn_calls, 1, "expected one spawn call")
         assert_eq(spawn_calls[1].mode, "window",
             "did not route through mux.spawn_window")
-        os.remove(spawn_calls[1].arg.set_environment_variables
-            .WEZSESH_CONFIG_FILE)
     end)
 
     it("uses mux_window:spawn_tab for spawn_mode='tab' (the default)",
@@ -913,8 +1005,6 @@ describe("spawn", function()
         assert_eq(#spawn_calls, 1, "expected one spawn call")
         assert_eq(spawn_calls[1].mode, "tab",
             "did not route through window:mux_window():spawn_tab")
-        os.remove(spawn_calls[1].arg.set_environment_variables
-            .WEZSESH_CONFIG_FILE)
     end)
 
     it("returns nil + sentinel when session_key missing", function()
@@ -949,7 +1039,6 @@ describe("spawn", function()
         local env = spawn_calls[1].arg.set_environment_variables
         assert_eq(env.PATH, "/fake/wezterm/bin:/usr/bin:/bin",
             "PATH not prepended with executable_dir")
-        os.remove(env.WEZSESH_CONFIG_FILE)
     end)
 
     it("PATH inherits parent unmodified when executable_dir absent",
@@ -972,7 +1061,6 @@ describe("spawn", function()
             "PATH not inherited unmodified when executable_dir absent")
         assert_true(env.PATH:find("/fake/wezterm/bin:", 1, true) == nil,
             "stale executable_dir prefix leaked despite accessor absent")
-        os.remove(env.WEZSESH_CONFIG_FILE)
     end)
 
     it("PATH inherits parent unmodified when executable_dir is empty "
@@ -993,7 +1081,6 @@ describe("spawn", function()
         local env = spawn_calls[1].arg.set_environment_variables
         assert_eq(env.PATH, "/usr/bin:/bin",
             "empty-string executable_dir produced a leading ':' in PATH")
-        os.remove(env.WEZSESH_CONFIG_FILE)
     end)
 end)
 

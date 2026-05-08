@@ -4,9 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-
-	"github.com/Grady-Saccullo/wezsesh/internal/logger"
 )
+
+// Warner is the minimal logger surface this package needs. The concrete
+// *logger.Logger satisfies it via its Warn(msg, kv...any) method; the
+// interface lives here (not in the logger package) so logger can import
+// safefs without a cycle. Pass nil to suppress warnings.
+type Warner interface {
+	Warn(msg string, kv ...any)
+}
 
 // SymlinkPolicy is the centralised enum for every site that touches a path
 // that might be a symlink. It replaces ad-hoc per-site reactions: each
@@ -40,7 +46,7 @@ const (
 // A missing path is treated as non-symlink (ok=true, err=nil): the caller
 // can then check os.ErrNotExist on the next operation and decide whether
 // the absence is acceptable. Other Lstat failures are returned as-is.
-func Enforce(path string, policy SymlinkPolicy, log *logger.Logger) (bool, error) {
+func Enforce(path string, policy SymlinkPolicy, log Warner) (bool, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -88,7 +94,7 @@ func SafeRemove(path string) error {
 // symlinks: SkipWarn (left in place). Never delegates to os.RemoveAll on
 // the top-level path because that would silently follow a symlinked
 // directory and delete the target's contents.
-func SafeRemoveTree(path string, log *logger.Logger) error {
+func SafeRemoveTree(path string, log Warner) error {
 	ok, err := Enforce(path, SymlinkRefuse, log)
 	if err != nil {
 		return err
@@ -113,7 +119,7 @@ func SafeRemoveTree(path string, log *logger.Logger) error {
 // SkipWarn (left in place; do not follow); non-symlink entries are removed
 // depth-first. The directory itself is removed last after its contents are
 // cleared.
-func removeTreeWalk(dir string, log *logger.Logger) error {
+func removeTreeWalk(dir string, log Warner) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("safefs: read dir %s: %w", dir, err)

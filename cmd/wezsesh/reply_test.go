@@ -15,8 +15,10 @@ import (
 
 // validReply is a §3.4-compliant reply payload usable as a test fixture
 // where the specific shape doesn't matter. Mirrors the dispatcher's
-// happy-path "completed, ok=true, data={}" terminal reply.
-const validReplyJSON = `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}`
+// happy-path "completed, ok=true, data={}" terminal reply. The hmac
+// field is a sentinel of 64 zeros — the relay validates *shape* not
+// *signature*, so any 64-hex-lowercase value satisfies the gate.
+const validReplyJSON = `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`
 
 // b64 is the StdEncoding base64 helper (matches plugin/wezsesh/b64.lua).
 func b64(s string) string {
@@ -173,28 +175,32 @@ func TestSubcmdReply_RejectionsNoDial(t *testing.T) {
 		body    string
 		wantSub string
 	}{
-		{"missing v", `{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}`, "missing required field: v"},
-		{"missing id", `{"v":1,"status":"completed","ok":true,"data":{}}`, "missing required field: id"},
-		{"missing status", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ok":true,"data":{}}`, "missing required field: status"},
-		{"missing ok", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","data":{}}`, "missing required field: ok"},
-		{"id not string", `{"v":1,"id":12345,"status":"completed","ok":true,"data":{}}`, "id: must be string"},
-		{"id wrong length", `{"v":1,"id":"short","status":"completed","ok":true,"data":{}}`, "id: must be 26 chars"},
-		{"status not in set", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"bogus","ok":true,"data":{}}`, "status: must be one of"},
-		{"v not int", `{"v":"one","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}`, "v: must be int"},
-		{"ok not bool", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":"true","data":{}}`, "ok: must be bool"},
-		{"extra top-level key", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{},"extra":1}`, "unknown top-level key"},
-		{"started with data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true,"data":{}}`, "status=started must not carry data"},
-		{"started with warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true,"warnings":[]}`, "status=started must not carry warnings"},
-		{"completed ok=true no data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true}`, "status=completed,ok=true requires data"},
-		{"completed ok=false no error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false}`, "ok=false but error absent"},
-		{"partial no data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"warnings":[]}`, "status=partial requires data"},
-		{"partial no warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"data":{}}`, "status=partial requires warnings"},
-		{"ok=true with error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{},"error":{"code":"X","message":"y"}}`, "ok=true but error present"},
-		{"ok=false no error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false}`, "ok=false but error absent"},
-		{"data not object", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":[1,2]}`, "data: must be object"},
-		{"warnings not array", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"data":{},"warnings":{}}`, "warnings: must be array"},
-		{"error not object", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"error":"oops"}`, "error: must be object"},
-		{"trailing data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}{}`, "trailing data"},
+		{"missing v", `{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "missing required field: v"},
+		{"missing id", `{"v":1,"status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "missing required field: id"},
+		{"missing status", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "missing required field: status"},
+		{"missing ok", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "missing required field: ok"},
+		{"missing hmac", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}`, "missing required field: hmac"},
+		{"hmac not string", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":12345,"data":{}}`, "hmac: must be string"},
+		{"hmac wrong length", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"abcdef","data":{}}`, "hmac: must be 64 hex chars"},
+		{"hmac uppercase hex", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","data":{}}`, "hmac: must be lowercase hex"},
+		{"id not string", `{"v":1,"id":12345,"status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "id: must be string"},
+		{"id wrong length", `{"v":1,"id":"short","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "id: must be 26 chars"},
+		{"status not in set", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"bogus","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "status: must be one of"},
+		{"v not int", `{"v":"one","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "v: must be int"},
+		{"ok not bool", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":"true","hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "ok: must be bool"},
+		{"extra top-level key", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{},"extra":1}`, "unknown top-level key"},
+		{"started with data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "status=started must not carry data"},
+		{"started with warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","warnings":[]}`, "status=started must not carry warnings"},
+		{"completed ok=true no data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000"}`, "status=completed,ok=true requires data"},
+		{"completed ok=false no error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"hmac":"0000000000000000000000000000000000000000000000000000000000000000"}`, "ok=false but error absent"},
+		{"partial no data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","warnings":[]}`, "status=partial requires data"},
+		{"partial no warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`, "status=partial requires warnings"},
+		{"ok=true with error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{},"error":{"code":"X","message":"y"}}`, "ok=true but error present"},
+		{"ok=false no error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"hmac":"0000000000000000000000000000000000000000000000000000000000000000"}`, "ok=false but error absent"},
+		{"data not object", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":[1,2]}`, "data: must be object"},
+		{"warnings not array", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{},"warnings":{}}`, "warnings: must be array"},
+		{"error not object", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","error":"oops"}`, "error: must be object"},
+		{"trailing data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}{}`, "trailing data"},
 		{"empty payload", ``, "empty payload"},
 	}
 	for _, c := range cases {
@@ -226,11 +232,11 @@ func TestSubcmdReply_StatusVariants(t *testing.T) {
 		name string
 		body string
 	}{
-		{"completed ok=true with data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{}}`},
-		{"completed ok=true with data and warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"data":{"k":"v"},"warnings":[{"code":"X","message":"y"}]}`},
-		{"completed ok=false with error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"error":{"code":"X","message":"y"}}`},
-		{"started", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true}`},
-		{"partial", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"data":{},"warnings":[{"code":"X","message":"y"}]}`},
+		{"completed ok=true with data", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{}}`},
+		{"completed ok=true with data and warnings", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{"k":"v"},"warnings":[{"code":"X","message":"y"}]}`},
+		{"completed ok=false with error", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"completed","ok":false,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","error":{"code":"X","message":"y"}}`},
+		{"started", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"started","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000"}`},
+		{"partial", `{"v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"partial","ok":true,"hmac":"0000000000000000000000000000000000000000000000000000000000000000","data":{},"warnings":[{"code":"X","message":"y"}]}`},
 	}
 	for _, c := range cases {
 		c := c

@@ -14,12 +14,15 @@
 --   1. argv = pane_tree.process and pane_tree.process.argv
 --   2. if not argv or #argv == 0:
 --          resurrect.tab_state.default_on_pane_restore(pane_tree); return
---   3. prog = basename(argv[1])
---   4. if not policy.allows(prog):
+--   3. if argv[1] is empty, starts with "./", or starts with "../":
 --          send_cwd_or_newline(pane_tree); log; return
---   5. for each elem in argv: if not bytes_clean(elem) → goto step 4
---   6. if pane_tree.cwd and not bytes_clean(pane_tree.cwd) → goto step 4
---   7. resurrect.tab_state.default_on_pane_restore(pane_tree)
+--   4. prog = basename(argv[1])
+--   5. if not policy.allows(prog):
+--          send_cwd_or_newline(pane_tree); log; return
+--   6. for each elem in argv: if not bytes_clean(elem) → goto step 5
+--      also enforce argv count / per-element / total byte caps
+--   7. if pane_tree.cwd and not bytes_clean(pane_tree.cwd) → goto step 5
+--   8. resurrect.tab_state.default_on_pane_restore(pane_tree)
 --
 -- The entire decision-flow body is `pcall`-wrapped. Fail-CLOSED on any
 -- uncaught error: `pane:send_text("\r\n")` only, log the crash, MUST
@@ -42,6 +45,10 @@ local wezterm       = require("wezterm")
 local log           = require("wezsesh.runtime.log")
 local resurrect_ref = require("wezsesh.runtime.resurrect_ref")
 
+local MAX_ARGV_ELEMENT_BYTES = 64 * 1024
+local MAX_ARGV_TOTAL_BYTES   = 256 * 1024
+local MAX_ARGV_COUNT         = 256
+
 local M = {}
 
 -- ────────────────────────────────────────────────────────────────────
@@ -57,7 +64,10 @@ local M = {}
 
 function M.bytes_clean(s)
     if type(s) ~= "string" or #s == 0 then return false end
-    return s:find("[%z\1-\31\127]") == nil
+    if s:find("[%z\1-\31\127]") ~= nil then return false end
+    -- U+2028/U+2029 are line-separator codepoints terminals interpret as newlines (CVE-class).
+    if s:find("\xE2\x80[\xA8\xA9]") ~= nil then return false end
+    return true
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -134,13 +144,13 @@ local function resolve_policy()
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- send_cwd_or_newline (step 4 action)
+-- send_cwd_or_newline (the fallback action)
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Line terminator is `\r\n` (CRLF — what wezterm injects into a real
 -- pane on the user pressing Enter). The quoter is
 -- `wezterm.shell_quote_arg`; its only failure mode (embedded NUL) is
--- precluded by step 6 / the per-elem bytes_clean check above.
+-- precluded by step 7 / the per-elem bytes_clean check above.
 
 local function send_cwd_or_newline(pane_tree)
     local pane = pane_tree and pane_tree.pane
@@ -176,10 +186,7 @@ local function impl(pane_tree)
         return
     end
 
-    -- Step 3: basename(argv[1]). 1-based: argv[1] IS the program.
-    local prog = basename(tostring(argv[1] or ""))
-
-    -- Step 4 action — extracted so steps 5/6 can re-enter it.
+    -- Fallback closure — extracted so every reject path can re-enter it.
     local function fallback(reason_prog)
         local cwd_state = send_cwd_or_newline(pane_tree)
         log.warn(string.format(
@@ -187,7 +194,19 @@ local function impl(pane_tree)
             tostring(reason_prog), cwd_state))
     end
 
-    -- Step 4: allowlist check.
+    -- Step 3: reject empty / relative argv[1]. basename("./sh") == "sh"
+    -- would pass the allowlist, but resurrect spawns argv as-is, so
+    -- "./evil" runs an attacker-planted binary in cwd.
+    local argv1 = tostring(argv[1] or "")
+    if argv1 == "" or argv1:sub(1, 2) == "./" or argv1:sub(1, 3) == "../" then
+        fallback(argv1)
+        return
+    end
+
+    -- Step 4: basename(argv[1]). 1-based: argv[1] IS the program.
+    local prog = basename(argv1)
+
+    -- Step 5: allowlist check.
     local policy = resolve_policy()
     if policy == nil or type(policy.allows) ~= "function"
        or not policy.allows(prog)
@@ -196,21 +215,38 @@ local function impl(pane_tree)
         return
     end
 
-    -- Step 5: every argv element must be bytes_clean.
+    -- Step 6: every argv element must be bytes_clean.
+    -- Plus argv count / per-element / total byte caps — DoS defense
+    -- against a snapshot with a 100MB argv element or 100k-element argv.
+    if #argv > MAX_ARGV_COUNT then
+        fallback(prog)
+        return
+    end
+    local argv_total = 0
     for i = 1, #argv do
-        if not M.bytes_clean(tostring(argv[i] or "")) then
+        local elem = tostring(argv[i] or "")
+        if #elem > MAX_ARGV_ELEMENT_BYTES then
+            fallback(prog)
+            return
+        end
+        argv_total = argv_total + #elem
+        if argv_total > MAX_ARGV_TOTAL_BYTES then
+            fallback(prog)
+            return
+        end
+        if not M.bytes_clean(elem) then
             fallback(prog)
             return
         end
     end
 
-    -- Step 6: pane_tree.cwd, if present, must be bytes_clean.
+    -- Step 7: pane_tree.cwd, if present, must be bytes_clean.
     if pane_tree.cwd ~= nil and not M.bytes_clean(pane_tree.cwd) then
         fallback(prog)
         return
     end
 
-    -- Step 7: resurrect's default (the only success-path call site).
+    -- Step 8: resurrect's default (the only success-path call site).
     local resurrect = resolve_resurrect()
     if resurrect ~= nil
        and type(resurrect.tab_state) == "table"
@@ -229,8 +265,8 @@ end
 --   * log the crash
 --   * MUST NOT call resurrect.tab_state.default_on_pane_restore
 --
--- The default-call lives only at step 7 inside impl()'s success path.
--- A raise from inside impl unwinds before step 7 fires, so the recover
+-- The default-call lives only at step 8 inside impl()'s success path.
+-- A raise from inside impl unwinds before step 8 fires, so the recover
 -- arm here never re-invokes it.
 
 function M.callback(pane_tree)

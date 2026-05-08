@@ -165,6 +165,52 @@ local golden_inputs = {
     verb_list_dirs_reply_data_empty = cj.object{
         dirs = cj.array{},
     },
+
+    -- Reply-shape fixtures. The `hmac` field is a stable 64-zero string;
+    -- the corpus tests encoder byte-equality for the reply shapes the
+    -- Lua-side signer emits.
+    reply_started = cj.object{
+        v      = 1,
+        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status = "started",
+        ok     = true,
+        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+    reply_completed_ok = cj.object{
+        v      = 1,
+        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status = "completed",
+        ok     = true,
+        data   = cj.object{ active_workspace = "main" },
+        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+    reply_completed_error = cj.object{
+        v      = 1,
+        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status = "completed",
+        ok     = false,
+        error  = cj.object{
+            code    = "SAVE_FAILED",
+            message = "disk full",
+            details = cj.object{ raw_error = "ENOSPC" },
+        },
+        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+    reply_partial = cj.object{
+        v      = 1,
+        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status = "partial",
+        ok     = true,
+        data   = cj.object{ name = "snap-1" },
+        warnings = cj.array{
+            cj.object{
+                code    = "RESURRECT_PARTIAL",
+                message = "some panes failed",
+                details = cj.object{ raw_error = "spawn failed" },
+            },
+        },
+        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+    },
 }
 
 -- Locate the golden corpus relative to either the repo root (CI/normal

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Grady-Saccullo/wezsesh/internal/safefs"
 )
 
 // Level mirrors slog.Level at the four wezsesh-recognised tiers. The
@@ -72,10 +74,11 @@ type Logger struct {
 }
 
 // New opens (or creates) <stateDir>/wezsesh.log and returns a Logger
-// preconfigured with the slog JSON handler. The state directory itself is
-// created with 0700 if missing. Both the directory and the log file are
-// guarded against symlinks via the inline os.Lstat check (see
-// "Accepted findings" — defers to safefs.Enforce when T-101 lands).
+// preconfigured with the slog JSON handler. The state directory itself
+// is created with 0700 if missing. Both the directory and the log file
+// are guarded against symlinks via safefs (Enforce on the parent,
+// O_NOFOLLOW + dirfd-anchored openat on the leaf — closes the TOCTOU
+// window an inline Lstat-then-OpenFile pair would leave open).
 func New(stateDir string, level Level) (*Logger, error) {
 	if stateDir == "" {
 		return nil, errors.New("logger: stateDir is empty")
@@ -83,7 +86,7 @@ func New(stateDir string, level Level) (*Logger, error) {
 	if err := ensureDir(stateDir); err != nil {
 		return nil, err
 	}
-	w, err := newRotatingWriter(filepath.Join(stateDir, logFilename))
+	w, err := newRotatingWriter(stateDir, logFilename)
 	if err != nil {
 		return nil, err
 	}
@@ -210,24 +213,31 @@ func levelToSlog(l Level) slog.Level {
 	return slog.LevelInfo
 }
 
-// ensureDir mkdir-p's the state directory, refusing to traverse a symlink
-// at the leaf. The fail-CLOSED inline check substitutes for safefs.Enforce
-// until T-101 lands (see "Accepted findings").
+// ensureDir mkdir-p's the state directory, refusing to traverse a
+// symlink at the leaf. MkdirAll is followed by safefs.Enforce so a
+// pre-existing symlink at the dir slot is rejected (MkdirAll happily
+// returns nil when the path is a symlink to a directory).
 func ensureDir(dir string) error {
 	if err := os.MkdirAll(dir, stateDirMode); err != nil {
 		return fmt.Errorf("logger: mkdir state dir: %w", err)
 	}
-	if err := refuseSymlink(dir); err != nil {
-		return err
+	ok, err := safefs.Enforce(dir, safefs.SymlinkRefuse, nil)
+	if err != nil {
+		return fmt.Errorf("logger: enforce state dir: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("logger: refusing symlink at state dir %s", dir)
 	}
 	return nil
 }
 
-// refuseSymlink returns an error if `path` exists and is a symbolic link.
-// Missing paths are treated as ok (the caller will create them next).
-// This is the inline stand-in for safefs.Enforce(SymlinkRefuse) that this
-// task uses to avoid taking a depends-on T-101.
-func refuseSymlink(path string) error {
+// refuseSymlinkAt is the leaf-only inline check used by the rotation
+// path for the numbered targets (.1, .2, .3). Missing paths are treated
+// as ok. The active log path itself is guarded by safefs.OpenAppendOnly
+// (dirfd-anchored, no TOCTOU); rotation uses path-based renames so the
+// inline check remains as a stand-in until rotation is dirfd-anchored
+// too — see TODO(security) on rotateLocked.
+func refuseSymlinkAt(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -249,7 +259,9 @@ func refuseSymlink(path string) error {
 // crash-after-Warn preserve the explanatory line), the rotation counter,
 // and the periodic-flush goroutine.
 type rotatingWriter struct {
-	path string
+	dir      string
+	filename string
+	path     string // filepath.Join(dir, filename), cached for log messages
 
 	mu      sync.Mutex
 	file    *os.File
@@ -261,11 +273,8 @@ type rotatingWriter struct {
 	tickerDone chan struct{}
 }
 
-func newRotatingWriter(path string) (*rotatingWriter, error) {
-	if err := refuseSymlink(path); err != nil {
-		return nil, err
-	}
-	f, err := openLog(path)
+func newRotatingWriter(dir, filename string) (*rotatingWriter, error) {
+	f, err := openLog(dir, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +284,9 @@ func newRotatingWriter(path string) (*rotatingWriter, error) {
 		return nil, fmt.Errorf("logger: stat log: %w", err)
 	}
 	w := &rotatingWriter{
-		path:       path,
+		dir:        dir,
+		filename:   filename,
+		path:       filepath.Join(dir, filename),
 		file:       f,
 		buf:        bufio.NewWriter(f),
 		written:    st.Size(),
@@ -286,10 +297,13 @@ func newRotatingWriter(path string) (*rotatingWriter, error) {
 	return w, nil
 }
 
-// openLog opens the log file in append mode, creating with 0600. The
-// caller MUST have already called refuseSymlink on `path`.
-func openLog(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, logFileMode)
+// openLog opens <dir>/<filename> for append-only writes via
+// safefs.OpenAppendOnly: dirfd-anchored openat with O_NOFOLLOW|O_CLOEXEC,
+// so an attacker who plants a symlink at the leaf path between two
+// invocations cannot redirect log writes (closes the TOCTOU window an
+// inline Lstat would leave open). Creates with 0600.
+func openLog(dir, filename string) (*os.File, error) {
+	f, err := safefs.OpenAppendOnly(dir, filename, logFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("logger: open log: %w", err)
 	}
@@ -351,18 +365,23 @@ func (w *rotatingWriter) tickLoop() {
 	}
 }
 
-// rotateLocked performs the .1→.2→.3 shift then renames the active log to
-// .1, finally re-opening a fresh active log. Caller must hold w.mu.
+// rotateLocked performs the .1→.2→.3 shift then renames the active log
+// to .1, finally re-opening a fresh active log via safefs.OpenAppendOnly
+// (dirfd-anchored, O_NOFOLLOW). Caller must hold w.mu.
 //
-// Symlink defense: each numbered target path is Lstat'd; if any is a
-// symlink, rotation aborts (fail-CLOSED). This is the inline stand-in for
-// safefs.Enforce(SymlinkRefuse).
+// TODO(security): the numbered-target path-based os.Rename / os.Remove
+// calls are not dirfd-anchored, so a leaf-level symlink swap between
+// the inline refuseSymlinkAt check and the rename is still possible
+// against an attacker who can write to the state dir. Per-leaf inline
+// Lstat is the stand-in until safefs grows a SafeRenameAt / SafeRemoveAt
+// pair. The state dir itself is symlink-refused at startup (§8.20.1
+// substep 5), so the post-startup window is the residual exposure.
 func (w *rotatingWriter) rotateLocked() error {
 	// Numbered targets, oldest-first, so we can drop .3 then shift .2→.3,
 	// .1→.2, active→.1 without overwriting a target prematurely.
 	for i := 3; i >= 1; i-- {
 		dst := fmt.Sprintf("%s.%d", w.path, i)
-		if err := refuseSymlink(dst); err != nil {
+		if err := refuseSymlinkAt(dst); err != nil {
 			return err
 		}
 		if i == 3 {
@@ -385,7 +404,7 @@ func (w *rotatingWriter) rotateLocked() error {
 		}
 	}
 	// Move active to .1.
-	if err := refuseSymlink(w.path); err != nil {
+	if err := refuseSymlinkAt(w.path); err != nil {
 		return err
 	}
 	if err := w.buf.Flush(); err != nil {
@@ -402,7 +421,7 @@ func (w *rotatingWriter) rotateLocked() error {
 	if err := os.Rename(w.path, w.path+".1"); err != nil {
 		return fmt.Errorf("logger: rotate active: %w", err)
 	}
-	f, err := openLog(w.path)
+	f, err := openLog(w.dir, w.filename)
 	if err != nil {
 		return err
 	}

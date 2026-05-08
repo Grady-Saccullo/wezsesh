@@ -150,6 +150,11 @@ local function reset_state()
     log_warns = {}
     global_store = {
         wezsesh_bin_path = "/usr/local/bin/wezsesh",
+        -- result.lua now signs reply envelopes; the spec needs a
+        -- session key so spawn_reply does not fall through to the
+        -- silent-noop floor.
+        wezsesh_session_key =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     }
     mux_stub = {}
     -- Drain any leftover diagnostic-ring entries so a previous test's

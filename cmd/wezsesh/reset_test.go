@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,9 +14,9 @@ import (
 
 // resetTestEnv builds a self-contained config tree under t.TempDir().
 // Every dir wezsesh-managed is a subdir of dir so each test starts from
-// a clean slate. The returned config is also written to dir/wezsesh.json
-// and pinned via WEZSESH_CONFIG_FILE so subcmdReset's config.LoadFromEnv
-// path resolves to it.
+// a clean slate. The config body is base64-encoded and pinned via
+// WEZSESH_CONFIG_JSON_BASE64 so subcmdReset's config.LoadFromEnv path
+// resolves to it.
 type resetTestEnv struct {
 	dir         string
 	stateDir    string
@@ -49,7 +50,6 @@ func newResetTestEnv(t *testing.T) *resetTestEnv {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
-	cfgPath := filepath.Join(dir, "wezsesh.json")
 	body := []byte(`{
 "version":1,
 "snapshot_dir":"` + env.snapshotDir + `",
@@ -57,10 +57,7 @@ func newResetTestEnv(t *testing.T) *resetTestEnv {
 "runtime_dir":"` + env.runtimeDir + `",
 "data_dir":"` + env.dataDir + `"
 }`)
-	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv("WEZSESH_CONFIG_FILE", cfgPath)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
 	// WEZTERM_PANE / HMAC key not consulted by reset; keep them empty.
 	t.Setenv("WEZTERM_PANE", "")
 	return env

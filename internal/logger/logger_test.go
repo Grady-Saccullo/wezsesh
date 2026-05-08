@@ -198,8 +198,8 @@ func TestResolveLevel(t *testing.T) {
 	}
 }
 
-// TestNewRefusesSymlinkAtFile verifies the inline symlink defense (the
-// stand-in for safefs.Enforce(SymlinkRefuse) until T-101 lands).
+// TestNewRefusesSymlinkAtFile verifies the safefs.OpenAppendOnly
+// O_NOFOLLOW defense at the log file leaf.
 func TestNewRefusesSymlinkAtFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink semantics differ on Windows")
@@ -214,6 +214,49 @@ func TestNewRefusesSymlinkAtFile(t *testing.T) {
 	}
 	if _, err := logger.New(dir, logger.LevelInfo); err == nil {
 		t.Fatal("logger.New should refuse symlink at log path, got nil error")
+	}
+}
+
+// TestNewRefusesSymlinkAtStateDir verifies the safefs.Enforce defense
+// on the parent dir slot. A symlinked stateDir at startup is the
+// CVE-class primitive an attacker would plant before logger.New runs.
+func TestNewRefusesSymlinkAtStateDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, "real-state")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	sym := filepath.Join(tmp, "state-link")
+	if err := os.Symlink(real, sym); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, err := logger.New(sym, logger.LevelInfo); err == nil {
+		t.Fatal("logger.New should refuse symlink at state dir, got nil error")
+	}
+}
+
+// TestNewLogFileMode0600 — the log file is created with mode 0600 by
+// safefs.OpenAppendOnly. Verifies the §12.1 path-table guarantee for
+// `<state_dir>/wezsesh.log`.
+func TestNewLogFileMode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix mode bits not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	lg, err := logger.New(dir, logger.LevelInfo)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+	st, err := os.Stat(filepath.Join(dir, "wezsesh.log"))
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("log mode: got %v, want 0600", st.Mode().Perm())
 	}
 }
 

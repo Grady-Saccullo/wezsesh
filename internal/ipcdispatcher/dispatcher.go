@@ -30,6 +30,7 @@
 package ipcdispatcher
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -65,6 +66,14 @@ const replyChanCap = 2
 // ErrInvalidConfig is returned by New when Deps is missing a required
 // field. The §6 universal error code IPC_INIT_FAILED maps to this.
 var ErrInvalidConfig = errors.New("ipcdispatcher: invalid config")
+
+// ErrReplyHMACMismatch is returned by parseReply when the reply's
+// HMAC field is missing, malformed, or fails verification against the
+// session key. The drain treats this as a recoverable parse-class
+// error: it logs the mismatch with the request id AND forwards the
+// synthesised REPLY_HMAC_MISMATCH terminal reply on the consumer
+// channel (per user decision: surface, don't silent-drop).
+var ErrReplyHMACMismatch = errors.New("ipcdispatcher: reply hmac mismatch")
 
 // OSCWriter is the unexported test seam: §8.6 names *uservar.Writer
 // concretely on the public Deps surface, so tests substitute a fake by
@@ -176,10 +185,12 @@ func New(deps Deps) (ipc.Dispatcher, func(), error) {
 		startListener:  ipcsock.StartListener,
 		now:            time.Now,
 		newID:          newULID,
-		parseReply:     parseReply,
 		dialReply:      dialReplyUnix,
 		nameMutexes:    make(map[string]*sync.Mutex),
 		outstanding:    make(map[string]outstandingDispatch),
+	}
+	d.parseReply = func(raw []byte) (ipc.Reply, error) {
+		return parseReply(raw, d.signer)
 	}
 	cleanup := func() {}
 	return d, cleanup, nil
@@ -387,7 +398,7 @@ func (d *Dispatcher) EmergencyReply() {
 	d.outstandingMu.Unlock()
 
 	for _, o := range pending {
-		payload, err := buildUnexpectedExitReply(o.id)
+		payload, err := buildUnexpectedExitReply(o.id, d.signer)
 		if err != nil {
 			if d.log != nil {
 				d.log.Warn("ipcdispatcher: emergency reply encode",
@@ -413,8 +424,15 @@ func (d *Dispatcher) EmergencyReply() {
 // non-optional pair); the empty string is the canonical placeholder
 // used when no human-facing detail is available — the recover path
 // has none.
-func buildUnexpectedExitReply(id string) ([]byte, error) {
-	return canonicaljson.Marshal(map[string]any{
+//
+// The sentinel is HMAC-signed via the same field-removal sequence as
+// every other reply (Signer.Sign drops `hmac`, canonical-encodes the
+// rest, returns the digest). The recovering TUI's parseReply rejects
+// any reply whose HMAC does not verify, so an unsigned sentinel would
+// be silently dropped; signing it keeps the panic-path delivery
+// reliable.
+func buildUnexpectedExitReply(id string, signer *whmac.Signer) ([]byte, error) {
+	envelope := map[string]any{
 		"v":      int64(protoVersion),
 		"id":     id,
 		"status": "completed",
@@ -423,7 +441,15 @@ func buildUnexpectedExitReply(id string) ([]byte, error) {
 			"code":    "UNEXPECTED_EXIT",
 			"message": "",
 		},
-	})
+	}
+	if signer != nil {
+		digest, err := signer.Sign(envelope)
+		if err != nil {
+			return nil, err
+		}
+		envelope["hmac"] = digest
+	}
+	return canonicaljson.Marshal(envelope)
 }
 
 // dialReplyUnix is the production wire path: dial the reply socket as a
@@ -482,11 +508,24 @@ func (d *Dispatcher) drain(
 			}
 			reply, err := d.parseReply(raw)
 			if err != nil {
-				if d.log != nil {
-					d.log.Warn("ipcdispatcher: parse reply",
-						"id", requestID, "err", err.Error())
+				if errors.Is(err, ErrReplyHMACMismatch) {
+					// Surface the mismatch as a terminal reply so the
+					// consumer doesn't wait out its IPC budget. The
+					// synth reply has Status="completed", OK=false,
+					// Error.Code="REPLY_HMAC_MISMATCH" — the drain
+					// forwards it like any other terminal reply and
+					// closes the channel below.
+					if d.log != nil {
+						d.log.Warn("ipcdispatcher: reply hmac mismatch",
+							"id", requestID)
+					}
+				} else {
+					if d.log != nil {
+						d.log.Warn("ipcdispatcher: parse reply",
+							"id", requestID, "err", err.Error())
+					}
+					continue
 				}
-				continue
 			}
 			if reply.ID != "" && reply.ID != requestID {
 				if d.log != nil {
@@ -609,25 +648,59 @@ func crockfordEncode(b [16]byte) string {
 }
 
 // parseReply decodes §3.4 reply bytes into an ipc.Reply. Rejects any
-// reply that is missing the required `v` field per §0.1 row 5.
+// reply that is missing the required `v` field per §0.1 row 5, and
+// verifies the reply's HMAC against the session key — both directions
+// of the wire are now authenticated symmetrically.
+//
+// On HMAC mismatch, parseReply returns a synthesised terminal reply
+// shaped as `{Status:"completed", OK:false, Error:{Code:
+// "REPLY_HMAC_MISMATCH"}}` together with ErrReplyHMACMismatch. The
+// drain forwards this synth reply on the consumer channel so the
+// caller sees a clear error instead of waiting on the ipcCtx
+// deadline (per user decision: surface, don't silent-drop).
 //
 // The wire shape is forgiving in §3.4 (`data` / `warnings` / `error` are
 // optional), so the parser permits absence; the §3.4 invariants
 // (e.g. `ok == (error is absent)`) are checked at the call site, not here.
-func parseReply(raw []byte) (ipc.Reply, error) {
+func parseReply(raw []byte, signer *whmac.Signer) (ipc.Reply, error) {
 	if len(raw) == 0 {
 		return ipc.Reply{}, errors.New("ipcdispatcher: empty reply")
 	}
 	// First decode into a map[string]any so we can detect a missing `v`
-	// key before falling through to the typed shape. encoding/json's
-	// default behaviour silently zero-fills missing required fields,
-	// which would defeat the §0.1 row 5 gate.
+	// key before falling through to the typed shape. UseNumber + the
+	// integerizing walker below keeps numeric values as int64 so the
+	// canonical re-encode inside Signer.Verify does not trip
+	// canonicaljson's no-float rule (§4.1 rule 3).
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var raw1 map[string]any
-	if err := json.Unmarshal(raw, &raw1); err != nil {
+	if err := dec.Decode(&raw1); err != nil {
 		return ipc.Reply{}, fmt.Errorf("ipcdispatcher: decode reply: %w", err)
 	}
 	if _, ok := raw1["v"]; !ok {
 		return ipc.Reply{}, errors.New("ipcdispatcher: reply missing v field")
+	}
+	if signer != nil {
+		integerized, err := numbersToInt64(raw1)
+		if err != nil {
+			return ipc.Reply{}, fmt.Errorf("ipcdispatcher: numerics: %w", err)
+		}
+		intMap, _ := integerized.(map[string]any)
+		ok, vErr := signer.Verify(intMap)
+		if vErr != nil || !ok {
+			id, _ := raw1["id"].(string)
+			synth := ipc.Reply{
+				V:      protoVersion,
+				ID:     id,
+				Status: "completed",
+				OK:     false,
+				Error: &ipc.ReplyError{
+					Code:    "REPLY_HMAC_MISMATCH",
+					Message: id,
+				},
+			}
+			return synth, ErrReplyHMACMismatch
+		}
 	}
 	var w wireReply
 	if err := json.Unmarshal(raw, &w); err != nil {
@@ -660,13 +733,60 @@ func parseReply(raw []byte) (ipc.Reply, error) {
 	return out, nil
 }
 
+// numbersToInt64 walks a generic JSON tree (map / slice / scalar) and
+// converts every json.Number to int64. Used in parseReply on the
+// HMAC-verify substrate: encoding/json with UseNumber surfaces numbers
+// as json.Number which canonicaljson.Marshal does not understand;
+// passing the unconverted form into Signer.Verify would fail the
+// canonical re-encode under §4.1 rule 3 (no floats — but also no
+// json.Number). Replies carry only integer numerics (`v` always; `ts`
+// not on replies); a non-integer number rejects with a clear error.
+func numbersToInt64(v any) (any, error) {
+	switch x := v.(type) {
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return nil, fmt.Errorf("non-integer %q: %w", x, err)
+		}
+		return i, nil
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, vv := range x {
+			conv, err := numbersToInt64(vv)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = conv
+		}
+		return out, nil
+	case []any:
+		out := make([]any, len(x))
+		for i, vv := range x {
+			conv, err := numbersToInt64(vv)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = conv
+		}
+		return out, nil
+	default:
+		return v, nil
+	}
+}
+
 // wireReply mirrors §3.4. `omitempty` on optional fields preserves the
-// "data/warnings/error are optional on replies" prose.
+// "data/warnings/error are optional on replies" prose. `Hmac` is the
+// reply-path signature (Lua → Go); the actual verify happens on the
+// first-pass `map[string]any` substrate so Signer.Verify can drive the
+// field-removal sequence without re-marshalling. The typed field is
+// here for documentation and so encoding/json round-trips don't drop
+// the wire field.
 type wireReply struct {
 	V        int             `json:"v"`
 	ID       string          `json:"id"`
 	Status   string          `json:"status"`
 	OK       bool            `json:"ok"`
+	Hmac     string          `json:"hmac"`
 	Data     map[string]any  `json:"data,omitempty"`
 	Warnings []wireWarning   `json:"warnings,omitempty"`
 	Error    *wireReplyError `json:"error,omitempty"`

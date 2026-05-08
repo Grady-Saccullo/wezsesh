@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,19 +54,15 @@ func installFindHooks(t *testing.T, search findSearcher, inside *findInsideConte
 	}
 }
 
-// withMinimalEnv pins WEZSESH_CONFIG_FILE to a writable temp file so
-// config.LoadFromEnv resolves without scanning the user's real home.
-// The file is JSON-empty (defaults across the board) — find itself
-// only consults the search + inside-wezterm seams.
+// withMinimalEnv pins WEZSESH_CONFIG_JSON_BASE64 to a base64-encoded
+// JSON config so config.LoadFromEnv resolves without scanning the
+// user's real home. The body is JSON-empty (defaults across the
+// board) — find itself only consults the search + inside-wezterm
+// seams.
 func withMinimalEnv(t *testing.T) {
 	t.Helper()
-	dir := t.TempDir()
-	cfgPath := dir + "/wezsesh.json"
 	body := []byte(`{"version":1,"snapshot_dir":"/tmp/snap","state_dir":"/tmp/state","runtime_dir":"/tmp/rt","data_dir":"/tmp/data"}`)
-	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv("WEZSESH_CONFIG_FILE", cfgPath)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
 	// WEZTERM_PANE intentionally unset — each test sets it explicitly
 	// when it wants the inside-wezterm branch.
 	t.Setenv("WEZTERM_PANE", "")

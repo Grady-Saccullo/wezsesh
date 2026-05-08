@@ -2,7 +2,9 @@ package config
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -76,7 +78,7 @@ func clearConfigEnv(t *testing.T) {
 		"WEZSESH_DATA_DIR",
 		"WEZSESH_LOG",
 		"WEZSESH_NO_HOOKS",
-		"WEZSESH_CONFIG_FILE",
+		"WEZSESH_CONFIG_JSON_BASE64",
 		"XDG_STATE_HOME",
 		"XDG_DATA_HOME",
 		"XDG_RUNTIME_DIR",
@@ -611,25 +613,75 @@ func TestLoadFromEnv_EnvOverridesAutoDetect_NoHooks(t *testing.T) {
 	}
 }
 
-func TestLoadFromEnv_SetButMissing(t *testing.T) {
+// TestLoadFromEnv_MalformedBase64 confirms LoadFromEnv surfaces a loud
+// error (NOT a silent fall-through to AutoDetect) when the env var is
+// set but contains malformed base64. This is the post-fix-#3
+// equivalent of the legacy "config file missing" error path: the
+// failure has to be loud so a misbehaving plugin doesn't silently
+// drift the binary onto unrelated config defaults.
+func TestLoadFromEnv_MalformedBase64(t *testing.T) {
 	clearConfigEnv(t)
-	t.Setenv("WEZSESH_CONFIG_FILE", filepath.Join(t.TempDir(), "no-such-file.json"))
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
 	if _, err := LoadFromEnv(context.Background()); err == nil {
-		t.Fatal("LoadFromEnv with missing file: want error, got nil")
+		t.Fatal("LoadFromEnv with malformed base64: want error, got nil")
 	}
 }
 
+// TestLoadFromEnv_SetAndPresent walks the new path: a valid
+// base64-encoded JSON config in $WEZSESH_CONFIG_JSON_BASE64 round-trips
+// through LoadFromEnv and surfaces the field values to the caller.
 func TestLoadFromEnv_SetAndPresent(t *testing.T) {
 	clearConfigEnv(t)
-	body := minimalConfigJSON(t, map[string]any{"snapshot_dir": "/from-file"})
-	p := writeConfigFile(t, body)
-	t.Setenv("WEZSESH_CONFIG_FILE", p)
+	body := minimalConfigJSON(t, map[string]any{"snapshot_dir": "/from-env"})
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
 	cfg, err := LoadFromEnv(context.Background())
 	if err != nil {
 		t.Fatalf("LoadFromEnv: %v", err)
 	}
-	if cfg.SnapshotDir != "/from-file" {
-		t.Errorf("SnapshotDir=%q, want /from-file", cfg.SnapshotDir)
+	if cfg.SnapshotDir != "/from-env" {
+		t.Errorf("SnapshotDir=%q, want /from-env", cfg.SnapshotDir)
+	}
+}
+
+// TestLoadFromEnvJSONBase64_NoEnvReturnsErrNoConfigEnv is a sentinel
+// check on the explicit base64 loader: when the env var is unset, the
+// caller (cmd/wezsesh:tuiSetup) must be able to distinguish "no config
+// env present" from "config env present but malformed" via
+// errors.Is(err, ErrNoConfigEnv). The general LoadFromEnv falls back to
+// AutoDetect on this sentinel; the TUI startup path treats it as a
+// hard refuse.
+func TestLoadFromEnvJSONBase64_NoEnvReturnsErrNoConfigEnv(t *testing.T) {
+	clearConfigEnv(t)
+	_, err := LoadFromEnvJSONBase64(context.Background())
+	if !errors.Is(err, ErrNoConfigEnv) {
+		t.Fatalf("got %v, want ErrNoConfigEnv", err)
+	}
+}
+
+// TestLoadFromEnvJSONBase64_GoodConfig walks the explicit loader's
+// happy path: a valid base64-encoded JSON config decodes, parses,
+// and round-trips its fields.
+func TestLoadFromEnvJSONBase64_GoodConfig(t *testing.T) {
+	clearConfigEnv(t)
+	body := minimalConfigJSON(t, map[string]any{"state_dir": "/from-env-state"})
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
+	cfg, err := LoadFromEnvJSONBase64(context.Background())
+	if err != nil {
+		t.Fatalf("LoadFromEnvJSONBase64: %v", err)
+	}
+	if cfg.StateDir != "/from-env-state" {
+		t.Errorf("StateDir=%q, want /from-env-state", cfg.StateDir)
+	}
+}
+
+// TestLoadFromEnvJSONBase64_BadJSON walks the loader's bad-JSON path.
+// Base64 valid + JSON invalid → loud error (no silent fall-through).
+func TestLoadFromEnvJSONBase64_BadJSON(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString([]byte("{not-json")))
+	_, err := LoadFromEnvJSONBase64(context.Background())
+	if err == nil {
+		t.Fatal("LoadFromEnvJSONBase64 with bad JSON: want error, got nil")
 	}
 }
 

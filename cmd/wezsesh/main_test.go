@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -355,22 +356,22 @@ func TestRun_VersionPrints(t *testing.T) {
 }
 
 // TestRun_DoctorRouteReachesSubcmd asserts the `doctor` route in run()
-// dispatches to subcmdDoctor (T-808). With no WEZSESH_CONFIG_FILE pinned
-// the config.LoadFromEnv path either succeeds via AutoDetect or fails
-// cleanly; either way subcmdDoctor's stderr surface carries the
-// "wezsesh doctor:" prefix on the failure branch and stdout carries
-// the report on the success branch — both prove the route is wired.
+// dispatches to subcmdDoctor (T-808). With WEZSESH_CONFIG_JSON_BASE64
+// set to malformed base64, subcmdDoctor's config.LoadFromEnv path
+// returns a deterministic error; the stderr surface carries the
+// "wezsesh doctor:" prefix on the failure branch which proves the
+// route is wired.
 //
 // T-801..T-807 implement keygen / reply / list / find / trust / reset
 // (with the deprecated `nuke` alias); T-808 implements doctor. The
 // stub-routing assertion that lived here previously is therefore
 // obsolete — no subcommand returns errSubcmdNotImplemented anymore.
 func TestRun_DoctorRouteReachesSubcmd(t *testing.T) {
-	// Point WEZSESH_CONFIG_FILE at a missing file so subcmdDoctor's
+	// Pin WEZSESH_CONFIG_JSON_BASE64 to malformed base64 so subcmdDoctor's
 	// config.LoadFromEnv path returns a deterministic error and we can
 	// assert the subcommand prefix without depending on AutoDetect's
 	// host-specific behaviour.
-	t.Setenv("WEZSESH_CONFIG_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
 	var out, errBuf strings.Builder
 	rc := run([]string{"doctor"}, &out, &errBuf)
 	if rc != exitDoctorOrSubcmd {
@@ -445,8 +446,10 @@ func TestTuiSetup_RejectsBadHMACKey(t *testing.T) {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return "not-hex"
-		case "WEZSESH_CONFIG_FILE":
-			return "/dev/null"
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			// Any non-empty value is fine — we want HMAC validation to
+			// fire BEFORE the config-env check.
+			return "Zm9v"
 		}
 		return ""
 	})
@@ -455,7 +458,7 @@ func TestTuiSetup_RejectsBadHMACKey(t *testing.T) {
 	}
 }
 
-func TestTuiSetup_RejectsMissingConfigFile(t *testing.T) {
+func TestTuiSetup_RejectsMissingConfigEnv(t *testing.T) {
 	good := strings.Repeat("a", 64)
 	_, err := tuiSetup(parsedFlags{paneID: 1}, func(k string) string {
 		if k == "WEZSESH_HMAC_KEY" {
@@ -463,8 +466,37 @@ func TestTuiSetup_RejectsMissingConfigFile(t *testing.T) {
 		}
 		return ""
 	})
-	if err == nil || !strings.Contains(err.Error(), "WEZSESH_CONFIG_FILE") {
-		t.Fatalf("got %v, want config-file error", err)
+	if err == nil || !strings.Contains(err.Error(), "WEZSESH_CONFIG_JSON_BASE64") {
+		t.Fatalf("got %v, want config-env error", err)
+	}
+}
+
+// TestTuiSetup_RejectsMalformedBase64 confirms that a bogus
+// $WEZSESH_CONFIG_JSON_BASE64 value surfaces a loud error rather than
+// silent-corrupting the loaded Config. This also documents that the
+// base64 path participates in the same fail-loud discipline as the
+// previous path's missing-file branch.
+func TestTuiSetup_RejectsMalformedBase64(t *testing.T) {
+	good := strings.Repeat("a", 64)
+	// The presence-check seam in tuiSetup uses `getEnv`; the loader
+	// inside config.LoadFromEnvJSONBase64 reads `os.Getenv` directly,
+	// so we MUST pin the real env var via t.Setenv to exercise the
+	// real loader path rather than the early presence check.
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
+	_, err := tuiSetup(parsedFlags{paneID: 1}, func(k string) string {
+		switch k {
+		case "WEZSESH_HMAC_KEY":
+			return good
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return os.Getenv("WEZSESH_CONFIG_JSON_BASE64")
+		}
+		return ""
+	})
+	if err == nil {
+		t.Fatalf("expected loud error for malformed base64; got nil")
+	}
+	if !strings.Contains(err.Error(), "base64") {
+		t.Fatalf("got %v, want error mentioning base64", err)
 	}
 }
 
@@ -526,7 +558,7 @@ func TestScrubHookEnv_DropsSensitive_KeepsLog(t *testing.T) {
 		"WEZSESH_LOG=debug",
 		"WEZSESH_HMAC_KEY=secret",
 		"WEZSESH_PROTO_VERSION=1",
-		"WEZSESH_CONFIG_FILE=/tmp/x",
+		"WEZSESH_CONFIG_JSON_BASE64=eyJ2ZXJzaW9uIjoxfQ==",
 		"WEZSESH_NO_HOOKS=0",
 		"HOME=/home/me",
 	}
@@ -542,7 +574,7 @@ func TestScrubHookEnv_DropsSensitive_KeepsLog(t *testing.T) {
 		return false
 	}
 
-	for _, drop := range []string{"WEZSESH_HMAC_KEY=", "WEZSESH_PROTO_VERSION=", "WEZSESH_CONFIG_FILE="} {
+	for _, drop := range []string{"WEZSESH_HMAC_KEY=", "WEZSESH_PROTO_VERSION=", "WEZSESH_CONFIG_JSON_BASE64="} {
 		if has(drop) {
 			t.Errorf("scrubHookEnv kept %q (must be dropped)", drop)
 		}
@@ -945,19 +977,17 @@ func TestTuiSetup_SymlinkRefuseOnManagedDir(t *testing.T) {
 	if err := os.Symlink(realDir, stateLink); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	configPath := filepath.Join(tmp, "wezsesh.json")
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), stateLink, filepath.Join(tmp, "rt"))
-	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
+		filepath.Join(tmp, "snap"), stateLink, filepath.Join(tmp, "rt"), filepath.Join(tmp, "data"))
+	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
 	good := strings.Repeat("a", 64)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_FILE":
-			return configPath
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return configB64
 		}
 		return ""
 	}
@@ -969,6 +999,188 @@ func TestTuiSetup_SymlinkRefuseOnManagedDir(t *testing.T) {
 	// the dir path. We tolerate the logger having opened an earlier
 	// directory; the assertion is simply that setup did not return ok.
 	t.Logf("setup error: %v", err)
+}
+
+// TestTuiSetup_SymlinkRefuseOnDataDir — fix #6: a symlinked
+// <data_dir> at startup must be rejected before any trust file is
+// written. Per-use enforcement in trust.go is the second line of
+// defense; this test pins the startup-time refuse (closes the
+// startup-to-first-use plant window).
+func TestTuiSetup_SymlinkRefuseOnDataDir(t *testing.T) {
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, "real-data")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	dataLink := filepath.Join(tmp, "data-link")
+	if err := os.Symlink(real, dataLink); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
+		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"), dataLink)
+	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	good := strings.Repeat("a", 64)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
+	getEnv := func(k string) string {
+		switch k {
+		case "WEZSESH_HMAC_KEY":
+			return good
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return configB64
+		}
+		return ""
+	}
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	if err == nil {
+		t.Fatalf("expected symlink-refuse error on data dir")
+	}
+	if !strings.Contains(err.Error(), "safefs enforce") {
+		t.Errorf("error should mention safefs enforce, got %v", err)
+	}
+}
+
+// TestTuiSetup_SymlinkRefuseOnAllowDir — fix #6: a symlinked
+// <data_dir>/allow at startup must be rejected. Pre-existing trust
+// dir as a symlink is the planted-symlink primitive an attacker
+// uses to redirect later trust.Approve writes.
+func TestTuiSetup_SymlinkRefuseOnAllowDir(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	realAllow := filepath.Join(tmp, "real-allow")
+	if err := os.MkdirAll(realAllow, 0o700); err != nil {
+		t.Fatalf("mkdir real-allow: %v", err)
+	}
+	if err := os.Symlink(realAllow, filepath.Join(dataDir, "allow")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
+		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"), dataDir)
+	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	good := strings.Repeat("a", 64)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
+	getEnv := func(k string) string {
+		switch k {
+		case "WEZSESH_HMAC_KEY":
+			return good
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return configB64
+		}
+		return ""
+	}
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	if err == nil {
+		t.Fatalf("expected symlink-refuse error on allow/")
+	}
+	if !strings.Contains(err.Error(), "safefs enforce") {
+		t.Errorf("error should mention safefs enforce, got %v", err)
+	}
+}
+
+// TestTuiSetup_SymlinkRefuseOnReqDir — fix #6: a symlinked
+// <runtime_dir>/req at startup must be rejected before any IPC
+// request file is written. Plugin's request files would otherwise
+// land at attacker-chosen paths.
+func TestTuiSetup_SymlinkRefuseOnReqDir(t *testing.T) {
+	tmp := t.TempDir()
+	rtDir := filepath.Join(tmp, "rt")
+	if err := os.MkdirAll(rtDir, 0o700); err != nil {
+		t.Fatalf("mkdir rt: %v", err)
+	}
+	realReq := filepath.Join(tmp, "real-req")
+	if err := os.MkdirAll(realReq, 0o700); err != nil {
+		t.Fatalf("mkdir real-req: %v", err)
+	}
+	if err := os.Symlink(realReq, filepath.Join(rtDir, "req")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
+		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), rtDir, filepath.Join(tmp, "data"))
+	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	good := strings.Repeat("a", 64)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
+	getEnv := func(k string) string {
+		switch k {
+		case "WEZSESH_HMAC_KEY":
+			return good
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return configB64
+		}
+		return ""
+	}
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	if err == nil {
+		t.Fatalf("expected symlink-refuse error on req/")
+	}
+	if !strings.Contains(err.Error(), "safefs enforce") {
+		t.Errorf("error should mention safefs enforce, got %v", err)
+	}
+}
+
+// TestTuiSetup_NoTmpFileLeak documents (and asserts) the
+// architectural property of fix #3: the TUI startup path no longer
+// involves any tmp-file pattern at $TMPDIR/wezsesh-<pid>-config.json.
+// We invoke tuiSetup with the new env var route and assert that
+// nothing matching the legacy filename shape was created in either
+// $TMPDIR or /tmp during the call. This is a regression lock-in: a
+// future refactor that re-introduces a tmp-file pattern would fail
+// here, even when the test does not get far enough to actually
+// exercise the entire startup sequence.
+func TestTuiSetup_NoTmpFileLeak(t *testing.T) {
+	tmp := t.TempDir()
+	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"log_level":"info"}`,
+		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"))
+	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	good := strings.Repeat("a", 64)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
+	getEnv := func(k string) string {
+		switch k {
+		case "WEZSESH_HMAC_KEY":
+			return good
+		case "WEZSESH_CONFIG_JSON_BASE64":
+			return configB64
+		}
+		return ""
+	}
+	// Snapshot the candidate tmp dirs before the call.
+	tmpdirs := []string{os.Getenv("TMPDIR"), "/tmp"}
+	beforeFiles := map[string]bool{}
+	for _, d := range tmpdirs {
+		if d == "" {
+			continue
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			beforeFiles[filepath.Join(d, e.Name())] = true
+		}
+	}
+	_, _ = tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	for _, d := range tmpdirs {
+		if d == "" {
+			continue
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			full := filepath.Join(d, e.Name())
+			if beforeFiles[full] {
+				continue
+			}
+			// Only the legacy pattern matters; other test scaffolding
+			// (e.g., t.TempDir() outputs under /tmp) is ignored.
+			matched, _ := filepath.Match("wezsesh-*-config.json", e.Name())
+			if matched {
+				t.Errorf("legacy tmp-file leaked at %s — fix #3 should have eliminated this pattern", full)
+			}
+		}
+	}
 }
 
 // TestResolveWindowID_Match exercises the §3.3 / §9.3.1 step (g) lookup
