@@ -43,8 +43,8 @@ var goldenInputs = map[string]any{
 	"explicit_null": Null,
 	"forward_slash": "a/b",
 
-	// Per-verb fixtures (§6).
-	"verb_switch_args": map[string]any{"name": "work"},
+	// Per-verb fixtures.
+	"verb_switch_args": map[string]any{"name": "work", "cwd": "/home/user/code"},
 	"verb_load_args":   map[string]any{"name": "work"},
 	"verb_save_args": map[string]any{
 		"name": "work", "overwrite": false, "expected_hash": "sha256:dead",
@@ -55,7 +55,17 @@ var goldenInputs = map[string]any{
 	"verb_new_args": map[string]any{
 		"name": "~/code", "cwd": "/home/user/code",
 	},
-	"verb_noop_args": map[string]any{},
+	"verb_noop_args":      map[string]any{},
+	"verb_list_dirs_args": map[string]any{"query": ""},
+	"verb_list_dirs_reply_data_empty": map[string]any{
+		"dirs": []any{},
+	},
+	"verb_list_dirs_reply_data": map[string]any{
+		"dirs": []any{
+			map[string]any{"path": "/home/user/code", "name": "code"},
+			map[string]any{"path": "/srv", "name": "srv"},
+		},
+	},
 }
 
 // TestGoldenCorpus loads each fixture in testdata/golden/, encodes the

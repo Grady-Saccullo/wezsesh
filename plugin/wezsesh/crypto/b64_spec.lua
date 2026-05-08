@@ -75,10 +75,10 @@ local function assert_nil(v, msg)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.10)", function()
+describe("module surface", function()
     it("exposes only `encode` and `decode`", function()
         local keys = {}
         for k in pairs(b64) do keys[#keys + 1] = k end
@@ -89,7 +89,7 @@ describe("module surface (§9.10)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — encoder: pinned RFC 4648 §4 fixtures
+-- encoder: pinned RFC 4648 fixtures
 -- ────────────────────────────────────────────────────────────────────
 --
 -- These match Go's `base64.StdEncoding.EncodeToString` byte-for-byte;
@@ -97,10 +97,10 @@ end)
 -- `wezsesh reply`, which feeds Go's StdEncoding decoder. Any divergence
 -- here breaks the wire format silently.
 
-describe("encode — RFC 4648 §4 fixtures", function()
+describe("encode — RFC 4648 fixtures", function()
     -- (input, expected base64) pairs spanning every padding length
     -- and every alphabet quadrant. The "f", "fo", "foo", ...
-    -- sequence is RFC 4648 §10's own test vector set.
+    -- sequence is RFC 4648's own test vector set.
     local fixtures = {
         {"", ""},
         {"f", "Zg=="},
@@ -136,7 +136,7 @@ describe("encode — input typing", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — round-trip gate (acceptance: 0–4096 bytes)
+-- round-trip gate (acceptance: 0–4096 bytes)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("round-trip — 0..4096 byte inputs (acceptance gate)",
@@ -195,7 +195,7 @@ function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — decoder: shape and alphabet rejection
+-- decoder: shape and alphabet rejection
 -- ────────────────────────────────────────────────────────────────────
 
 describe("decode — input typing", function()
@@ -267,7 +267,7 @@ describe("decode — '=' position rejection", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — non-canonical residual-bit rejection (security gate)
+-- non-canonical residual-bit rejection (security gate)
 -- ────────────────────────────────────────────────────────────────────
 --
 -- The encoder MUST emit zero residual bits in the final sextet. The
@@ -383,14 +383,14 @@ function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.10 — Go StdEncoding interop (pinned cross-encoder fixtures)
+-- Go StdEncoding interop (pinned cross-encoder fixtures)
 -- ────────────────────────────────────────────────────────────────────
 --
 -- The reply path's bytes flow through Go's `base64.StdEncoding`. Drift
 -- between the two encoders is silent on the happy path (Go decodes
 -- fine), but a divergent character set or padding rule manifests as
 -- "REPLY_DECODE_FAILED" on the binary side. Pinning a few outputs
--- locks the alphabet AND padding to RFC 4648 §4.
+-- locks the alphabet AND padding to RFC 4648.
 
 describe("Go StdEncoding interop (pinned)", function()
     -- Outputs computed via Go's `base64.StdEncoding.EncodeToString`.
@@ -419,7 +419,7 @@ describe("Go StdEncoding interop (pinned)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §0.1 row 34 — performance gate: decode 4 KiB warm in < 1 ms
+-- performance gate: decode 4 KiB warm in < 1 ms
 -- ────────────────────────────────────────────────────────────────────
 --
 -- The hot-path contract. The literal "< 1 ms" is the per-call
@@ -433,7 +433,7 @@ end)
 -- this — going from sub-ms to multi-ms shows up as a 10–100×
 -- regression in the average.
 
-describe("performance gate (§0.1 row 34) — decode 4 KiB < 1 ms warm",
+describe("performance gate — decode 4 KiB < 1 ms warm",
 function()
     it("avg decode time on a 4096-byte input is well under 1 ms",
     function()

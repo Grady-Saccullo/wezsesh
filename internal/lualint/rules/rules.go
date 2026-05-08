@@ -87,7 +87,12 @@ func AllLuaRules() []lualint.Rule {
 		DofileBan(),
 		LineLeadingParenRule(),
 		WeztermGlobalNestedTableRule(),
+		GlobalsOnly(),
+		CryptoVendorOnly(),
+		ProvidersVendorOnly(),
+		DirProvidersOnly(),
 		ResurrectErrorOutsideOwner(),
+		ResurrectRefOnly(),
 		RestoreFinishedBan(),
 		BarePcallSaveStateRule(),
 		BarePcallLoadStateRule(),
@@ -104,11 +109,41 @@ type RepoShapeRule interface {
 	Check(repoRoot string) []lualint.Finding
 }
 
-// AllRepoRules returns the repo-shape rules: verb_args_shape parity
-// and the init.lua presence checks (bust loop + resurrect_error.register).
+// repoRuleFunc adapts a function to the RepoShapeRule interface. Used
+// by every rule constructor in this package.
+type repoRuleFunc struct {
+	id string
+	fn func(repoRoot string) []lualint.Finding
+}
+
+// ID returns the rule identifier.
+func (r repoRuleFunc) ID() string { return r.id }
+
+// Check delegates to the wrapped function.
+func (r repoRuleFunc) Check(repoRoot string) []lualint.Finding {
+	if r.fn == nil {
+		return nil
+	}
+	return r.fn(repoRoot)
+}
+
+// warning is a tiny constructor for an informational finding pinned
+// at line 1; used when a check cannot fully run (e.g., missing file
+// in a partial tree).
+func warning(path, ruleID, msg string) lualint.Finding {
+	return lualint.Finding{
+		Path: path, Line: 1, Col: 1,
+		RuleID: ruleID, Severity: lualint.SevWarning,
+		Message: msg,
+	}
+}
+
+// AllRepoRules returns the repo-shape rules: per-verb-module contract
+// (each verbs/X.lua must export args_shape + dispatch) and the
+// init.lua presence checks (bust loop + resurrect_error.register).
 func AllRepoRules() []RepoShapeRule {
 	return []RepoShapeRule{
-		VerbShapeParityRule(),
+		VerbContractRule(),
 		PackageLoadedBustLoopRule(),
 		ResurrectErrorRegisterPresenceRule(),
 	}

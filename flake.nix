@@ -95,11 +95,7 @@
             staticcheck ./...
             govulncheck ./...
             sha256sum -c plugin/wezsesh/vendor/SOURCES.lock
-            if [ -f plugin/wezsesh/default_allowlist.lua ]; then
-              go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
-            else
-              echo "[placeholder] default_allowlist.lua not yet generated (T-605)"
-            fi
+            go run ./internal/argvallow/codegen --check plugin/wezsesh/default_allowlist.lua
             LC_ALL=C go test ./internal/canonicaljson/... ./plugin/...
             go test -race ./...
             go build -trimpath \
@@ -107,10 +103,10 @@
               ./cmd/wezsesh
           '';
 
-          # End-to-end smoke (§17.6 / T-900). The test compiles
-          # unconditionally under `-tags e2e` and skips at runtime when
-          # WEZSESH_E2E is unset; this means the same target runs green
-          # on hosts without wezterm.
+          # End-to-end smoke. The test compiles unconditionally under
+          # `-tags e2e` and skips at runtime when WEZSESH_E2E is unset;
+          # this means the same target runs green on hosts without
+          # wezterm.
           #
           #   nix run .#e2e               # gated; skips cleanly without wezterm
           #   WEZSESH_E2E=1 nix run .#e2e # full run (requires wezterm on PATH)
@@ -183,7 +179,7 @@
             echo "release-package: dist/''${base}.tar.gz"
           '';
 
-          # Cross-compile + package all four §16.4 targets locally and write
+          # Cross-compile + package all release targets locally and write
           # a SHA256SUMS file. NOTE: this rehearses the workflow's *shape*,
           # not its byte-for-byte output — the published binaries are
           # native builds across four GitHub runners, while this target
@@ -243,7 +239,6 @@
             "-X=main.version=${wezsesh.version}"
           ];
 
-          # Reproducible-builds requirement (PRD §8.1).
           env.CGO_ENABLED = "0";
           preBuild = ''
             export GOFLAGS="$GOFLAGS -trimpath"
@@ -293,16 +288,16 @@
           name = "wezsesh-dev";
 
           packages = [
-            # Go toolchain (PRD_V7 §8.1)
+            # Go toolchain
             go
             pkgs.gopls
             pkgs.gotools # goimports, godoc, etc.
-            pkgs.go-tools # staticcheck (PRD §8.1 required check)
+            pkgs.go-tools # staticcheck
             pkgs.golangci-lint
-            pkgs.govulncheck # PRD §8.1 required check
+            pkgs.govulncheck
             pkgs.delve # debugger
 
-            # Lua side (PRD §6.10 plugin/)
+            # Lua side
             lua
             pkgs.stylua # formatter
             pkgs.selene # linter (Rust-based, faster than luacheck)
@@ -314,7 +309,6 @@
             # override the nixpkgs input to pin a different version.
             pkgs.wezterm
 
-            # Supply-chain helpers (PRD §8.1: sha256sum -c on vendored Lua).
             # `coreutils` provides sha256sum on darwin where it isn't system.
             pkgs.coreutils
             pkgs.git
@@ -324,10 +318,11 @@
 
           shellHook = ''
             export GOFLAGS="''${GOFLAGS:-} -trimpath"
-            # PRD §6.3: canonical-JSON byte-equality tests must run with
-            # LC_ALL=C to remove locale drift in Lua's string `<` ordering.
+            # canonical-JSON byte-equality tests must run with LC_ALL=C
+            # to remove locale drift in Lua's string `<` ordering.
             export LC_ALL=C
 
+            echo ""
             echo "wezsesh dev shell"
             echo "  go        $(${lib.getExe go} version | awk '{print $3}')"
             echo "  wezterm   $(${pkgs.wezterm}/bin/wezterm --version | awk '{print $2}')"
@@ -337,24 +332,25 @@
             echo "  nix develop --override-input nixpkgs github:NixOS/nixpkgs/<rev>"
             echo ""
             echo "Common tasks (single source of truth — flake.nix):"
-            echo "  nix run .#ci                   # full local-CI suite (§16.4)"
+            echo "  nix run .#ci                   # full local-CI suite"
             echo "  nix run .#test-race            # go test -race ./..."
             echo "  nix run .#test-canonical       # LC_ALL=C canonical-JSON tests"
             echo "  nix run .#staticcheck          # static analysis"
             echo "  nix run .#govulncheck          # CVE scan"
             echo "  nix run .#crypto               # vendored Lua sha256sum -c"
             echo "  nix run .#build                # local-parity reproducible build"
-            echo "  nix run .#e2e                  # gated end-to-end smoke (§17.6)"
+            echo "  nix run .#e2e                  # gated end-to-end smoke"
             echo "  nix build                      # nix-built reproducible binary"
             echo "  nix flake check                # all flake checks"
             echo ""
             echo "Release pre-flight (rehearse the workflow locally — see docs/release.md):"
             echo "  TAG=v0.1.0 nix run .#release-build       # one host-native build"
             echo "  TAG=v0.1.0 nix run .#release-package     # build + tarball"
-            echo "  TAG=v0.1.0 nix run .#release-build-all   # cross-compile all 4 targets + SHA256SUMS"
+            echo "  TAG=v0.1.0 nix run .#release-build-all   # cross-compile all targets + SHA256SUMS"
             echo ""
             echo "VCS: jj-colocated (.jj/ + .git/). Use jj for commits/diffs;"
             echo "git tooling (CI, IDE) sees the colocated .git/ normally."
+            echo ""
           '';
         };
 

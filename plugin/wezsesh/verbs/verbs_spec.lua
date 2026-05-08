@@ -13,7 +13,7 @@
 -- The spec installs a wezterm-shim via `package.preload["wezterm"]`
 -- BEFORE requiring the module under test. The shim records every
 -- `wezterm.background_child_process` invocation in `bg_calls` so the
--- spec can decode the b64 reply payload and assert on the §3.4
+-- spec can decode the b64 reply payload and assert on the reply
 -- envelope shape. `wezterm.mux` is a stub the per-test setup mutates
 -- to exercise the switch / new dispatch arms.
 --
@@ -24,163 +24,36 @@
 -- exercised end-to-end.
 
 local function script_dir()
-    local src = arg and arg[0] or "plugin/wezsesh/ops_spec.lua"
+    local src = arg and arg[0] or "plugin/wezsesh/verbs/verbs_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;"
-            .. script_dir() .. "/../?.lua;"
+local function parent_dir(p)
+    return p:match("^(.*)/[^/]+$") or "."
+end
+local SPEC_DIR = script_dir()                        -- plugin/wezsesh/verbs
+local PARENT_DIR = parent_dir(SPEC_DIR)              -- plugin/wezsesh
+local GRANDPARENT_DIR = parent_dir(PARENT_DIR)       -- plugin
+-- Three roots: SPEC_DIR for sibling files (verbs/_deps, verbs/_restore),
+-- PARENT_DIR for cousins (canonical_json, resurrect_error, b64),
+-- GRANDPARENT_DIR for dotted requires (wezsesh.runtime.*, wezsesh.crypto.*,
+-- wezsesh.verbs). The `/?/init.lua` suffix lets the dotted form
+-- `require("wezsesh.verbs")` resolve to the verbs/init.lua file.
+package.path = SPEC_DIR .. "/?.lua;"
+            .. PARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?/init.lua;"
             .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
--- wezterm shim — installed BEFORE require("ops")
+-- wezterm shim — installed BEFORE require("wezsesh.verbs")
 -- ────────────────────────────────────────────────────────────────────
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
--- Tiny pure-Lua JSON encode/parse — sufficient for the flat envelopes
--- result.lua emits. Mirrors the helpers in result_spec.lua so the
--- shapes can be asserted by round-tripping through the b64'd argv[4].
-
-local function json_encode_shim(v)
-    local function emit(x)
-        local t = type(x)
-        if t == "number" then return tostring(x) end
-        if t == "boolean" then return x and "true" or "false" end
-        if t == "string" then
-            return '"' .. x:gsub("[\\\"]", "\\%0") .. '"'
-        end
-        if t == "table" then
-            local n = 0
-            local is_array = true
-            for k in pairs(x) do
-                if type(k) ~= "number" then is_array = false; break end
-                n = n + 1
-            end
-            if is_array and n > 0 then
-                local parts = {}
-                for i = 1, n do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local keys = {}
-            for k in pairs(x) do keys[#keys + 1] = k end
-            table.sort(keys, function(a, b)
-                return tostring(a) < tostring(b)
-            end)
-            local parts = {}
-            for _, k in ipairs(keys) do
-                parts[#parts + 1] = '"' .. tostring(k) .. '":' .. emit(x[k])
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-        if t == "nil" then return "null" end
-        error("json_encode_shim: unsupported type " .. t)
-    end
-    return emit(v)
-end
-
-local function json_parse_shim(s)
-    local pos = 1
-    local function err(msg)
-        error("json_parse_shim: " .. msg .. " at " .. pos, 0)
-    end
-    local function skip_ws()
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == " " or c == "\t" or c == "\n" or c == "\r" then
-                pos = pos + 1
-            else return end
-        end
-    end
-    local parse_value
-    local function parse_string()
-        if s:sub(pos, pos) ~= '"' then err("expected string") end
-        pos = pos + 1
-        local out = {}
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == '"' then pos = pos + 1; return table.concat(out) end
-            if c == "\\" then
-                pos = pos + 1
-                out[#out + 1] = s:sub(pos, pos)
-                pos = pos + 1
-            else
-                out[#out + 1] = c
-                pos = pos + 1
-            end
-        end
-        err("unterminated string")
-    end
-    local function parse_number()
-        local s2 = s:sub(pos)
-        local num_str = s2:match("^%-?%d+%.?%d*[eE]?[%-+]?%d*")
-        if not num_str or num_str == "" then err("bad number") end
-        pos = pos + #num_str
-        local n = tonumber(num_str)
-        if not num_str:find("[.eE]") then
-            n = math.tointeger(n) or n
-        end
-        return n
-    end
-    local function parse_object()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "}" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            local k = parse_string()
-            skip_ws()
-            if s:sub(pos, pos) ~= ":" then err("expected ':'") end
-            pos = pos + 1; skip_ws()
-            out[k] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "}" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or '}'") end
-            pos = pos + 1
-        end
-    end
-    local function parse_array()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "]" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            out[#out + 1] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "]" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or ']'") end
-            pos = pos + 1
-        end
-    end
-    parse_value = function()
-        skip_ws()
-        local c = s:sub(pos, pos)
-        if c == "{" then return parse_object() end
-        if c == "[" then return parse_array() end
-        if c == '"' then return parse_string() end
-        if c == "t" then
-            if s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true end
-            err("bad literal")
-        end
-        if c == "f" then
-            if s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false end
-            err("bad literal")
-        end
-        if c == "n" then
-            if s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
-            err("bad literal")
-        end
-        return parse_number()
-    end
-    skip_ws()
-    return parse_value()
-end
+local codec = helpers.make_json_codec()
+local json_encode_shim = codec.encode
+local json_parse_shim  = codec.decode
 
 -- Mutable shim surface — reset between tests by `reset_state()`.
 local bg_calls
@@ -207,8 +80,21 @@ local wezterm_shim = {
     log_error = function(msg)
         log_warns[#log_warns + 1] = "ERR: " .. tostring(msg)
     end,
+    -- `wezterm.action.<Name>(args)` returns a sentinel table the test
+    -- can pattern-match on. Production wezterm builds an opaque
+    -- userdata-shaped Action; the only thing wezsesh ever does with
+    -- it is hand it to `gui_window:perform_action`, so a sentinel
+    -- table is enough for the assertions.
+    action = setmetatable({}, {
+        __index = function(_, name)
+            return function(args)
+                return { _action = name, args = args }
+            end
+        end,
+    }),
     -- mux is a per-test stub. Production wezterm.mux methods used by
-    -- ops.lua: get_workspace_names, set_active_workspace, spawn_window.
+    -- ops.lua: get_workspace_names, set_active_workspace, spawn_window,
+    -- rename_workspace, all_windows.
     mux = setmetatable({}, {
         __index = function(_, k) return mux_stub[k] end,
     }),
@@ -232,10 +118,13 @@ end
 package.preload["wezterm"] = function() return wezterm_shim end
 
 -- Now load the modules under test.
-local b64 = require("b64")
+local b64             = require("wezsesh.crypto.b64")
 local resurrect_error = require("resurrect_error")
-local canonical_json = require("canonical_json")
-local ops = require("ops")
+local canonical_json  = require("canonical_json")
+local verbs           = require("wezsesh.verbs")
+-- Tests written against the previous ops module; alias preserves the
+-- assertions verbatim.
+local ops             = verbs
 
 -- Install the persistent resurrect.error listener once (matches the
 -- production `apply_to_config` flow). The _G install gate keeps this
@@ -325,7 +214,7 @@ end
 -- Module surface (T-601 done-when)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.4)", function()
+describe("module surface", function()
     it("exposes dispatch_table, dispatch, _set_deps, _reset_deps",
     function()
         assert_true(type(ops.dispatch_table) == "table",
@@ -338,8 +227,10 @@ describe("module surface (§9.4)", function()
             "M._reset_deps missing")
     end)
 
-    it("dispatch_table has exactly the five §6 verbs", function()
-        local want = { "load", "new", "noop", "save", "switch" }
+    it("dispatch_table has exactly the registered wire verbs", function()
+        local want = {
+            "list_dirs", "load", "new", "noop", "save", "switch",
+        }
         local keys = {}
         for k in pairs(ops.dispatch_table) do keys[#keys + 1] = k end
         table.sort(keys)
@@ -349,16 +240,16 @@ describe("module surface (§9.4)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.4 — verb / shape parity (runtime mirror of CI lint)
+-- verb / shape parity (runtime mirror of CI lint)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("verb / shape parity (§17.4)", function()
-    it("verb_args_shape keys equal dispatch_table keys", function()
+describe("verb / shape parity", function()
+    it("verbs.shapes() keys equal dispatch_table keys", function()
         local sk, dk = {}, {}
-        for k in pairs(canonical_json.verb_args_shape) do
+        for k in pairs(verbs.shapes()) do
             sk[#sk + 1] = k
         end
-        for k in pairs(ops.dispatch_table) do
+        for k in pairs(verbs.dispatch_table) do
             dk[#dk + 1] = k
         end
         table.sort(sk); table.sort(dk)
@@ -369,10 +260,10 @@ describe("verb / shape parity (§17.4)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §13.13 — Unknown verb (defensive branch unreachable in production)
+-- Unknown verb (defensive branch unreachable in production)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("unknown verb (§13.13 / §9.4 defensive branch)", function()
+describe("unknown verb (defensive branch)", function()
     it("dispatching `op=bogus` replies UNKNOWN_VERB, ok=false, "
         .. "status=completed", function()
         local p = fixture_payload("bogus")
@@ -390,10 +281,10 @@ describe("unknown verb (§13.13 / §9.4 defensive branch)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.5 — noop
+-- noop verb
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.5 — noop", function()
+describe("noop", function()
     it("replies completed + empty data", function()
         local p = fixture_payload("noop")
         ops.dispatch(p, nil, nil)
@@ -408,10 +299,10 @@ describe("§6.5 — noop", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.4.2 — save (dual-path detector)
+-- save (dual-path detector)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§9.4.2 — save", function()
+describe("save", function()
     it("Lua-side I/O failure (capture non-empty) → SAVE_FAILED via "
         .. "with_capture", function()
         ops._set_deps{
@@ -514,15 +405,15 @@ describe("§9.4.2 — save", function()
         assert_eq(env.data.name, "snap-1", "save success: data.name wrong")
         assert_nil(env.data.hash,
             "save success: Lua MUST NOT set `hash`; binary fills it "
-            .. "in Phase C (§13.4)")
+            .. "post-reply once it has hashed the on-disk snapshot")
     end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.4.1 — load (split-reply restore-class)
+-- load (split-reply restore-class)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§9.4.1 — load", function()
+describe("load", function()
     it("torn JSON (pcall raised) → started preamble + "
         .. "SNAPSHOT_LOAD_FAILED; restore_workspace NEVER called",
     function()
@@ -567,7 +458,7 @@ describe("§9.4.1 — load", function()
             .. tostring(err_env.error.details.raw_error))
         assert_true(not restore_called,
             "load torn-JSON: restore_workspace MUST NOT run on a "
-            .. "failed load (§9.4.1 step 2 guard)")
+            .. "failed load")
     end)
 
     it("silent decrypt failure ({} return + capture) → "
@@ -578,7 +469,7 @@ describe("§9.4.1 — load", function()
             resurrect = {
                 state_manager = {
                     load_state = function(_name, _kind)
-                        -- Spike #2 V5: decrypt failure path. resurrect's
+                        -- Decrypt failure path. resurrect's
                         -- state_manager returns `{}` after emitting a
                         -- resurrect.error.
                         emit("resurrect.error",
@@ -615,7 +506,7 @@ describe("§9.4.1 — load", function()
             .. tostring(err_env.error.details.raw_error))
         assert_true(not restore_called,
             "load decrypt: restore_workspace MUST NOT run when the "
-            .. "load has no .window_states (§9.4.1 step 2 guard)")
+            .. "load has no .window_states")
     end)
 
     it("success → started + completed; data: { name, workspace }",
@@ -688,10 +579,10 @@ describe("§9.4.1 — load", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.1 — switch (live target vs saved-not-live)
+-- switch (live target vs saved-not-live)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.1 — switch", function()
+describe("switch", function()
     it("live target → completed + data: { active_workspace }; "
         .. "set_active_workspace called; load/restore NEVER", function()
         local set_called_with = nil
@@ -778,19 +669,296 @@ describe("§6.1 — switch", function()
         mux_stub.set_active_workspace = function()
             error("mux gone", 0)
         end
-        local p = fixture_payload("switch", { name = "main" })
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
         ops.dispatch(p, nil, nil)
         local env = decode_envelope()
         assert_eq(env.error.code, "MUX_UNREACHABLE",
             "switch mux-unreachable: error.code wrong")
     end)
+
+    -- Branch 3 invariant set, post-redesign per wezterm's official
+    -- workspaces model (https://wezterm.org/workspaces.html):
+    --
+    --   "Every MuxWindow is associated with a workspace, which is
+    --    just a label."
+    --   "You can spawn windows into differently named workspaces
+    --    and they won't become visible until you set the active
+    --    workspace to that name."
+    --   "When switching the active workspace, wezterm will swap the
+    --    contents of the GUI windows with the MuxWindows that
+    --    belong to the now-focused workspace."
+    --
+    -- Wezterm hides source-workspace MuxWindows for free when
+    -- `set_active_workspace` flips the active workspace label. The
+    -- implementation MUST NOT try to rename, close, or kill
+    -- source-workspace windows manually — earlier revisions did and
+    -- ended up either re-labelling every source MuxWindow into the
+    -- target (so wezterm correctly showed all of them — Grady's
+    -- "windows aren't closing" bug) or racing the GUI action queue
+    -- via `perform_action(CloseCurrentTab)`.
+    --
+    -- The spec pins:
+    --   * NO rename_workspace call
+    --   * NO mux.spawn_window call from switch.lua itself (resurrect
+    --     does that via spawn_in_workspace)
+    --   * NO `wezterm cli kill-pane` shellouts
+    --   * restore_workspace receives spawn_in_workspace=true with
+    --     no opts.window (so resurrect spawns each window_state at
+    --     its saved cwd)
+    --   * set_active_workspace fires AFTER restore_workspace returns
+    --     (workspace must exist before flipping it active)
+    --   * opts.on_pane_restore is the wezsesh argv-allowlisted
+    --     callback so saved processes / scrollback come back
+    it("saved-not-live: spawn_in_workspace + set_active_workspace; "
+        .. "no rename, no manual window close (wezterm hides source "
+        .. "workspace via the viewport swap)", function()
+        local rename_called = false
+        local rcp_called = false
+        local set_active_with = nil
+        local set_active_call_index = nil
+        local restore_call_index = nil
+        local restore_opts_seen = nil
+        local call_seq = 0
+
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            mux_window = function(_self)
+                return {
+                    window_id = function(_self2) return 1 end,
+                }
+            end,
+        }
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_old, _new)
+            rename_called = true
+        end
+        mux_stub.set_active_workspace = function(n)
+            call_seq = call_seq + 1
+            set_active_call_index = call_seq
+            set_active_with = n
+        end
+        wezterm_shim.executable_dir = "/usr/local/bin"
+        wezterm_shim.run_child_process = function(_argv)
+            rcp_called = true
+            return true, "", ""
+        end
+
+        ops._set_deps{
+            resurrect = {
+                state_manager = {
+                    load_state = function(_name, _kind)
+                        return { window_states = { { dummy = true } } }
+                    end,
+                },
+                workspace_state = {
+                    restore_workspace = function(_state, opts)
+                        call_seq = call_seq + 1
+                        restore_call_index = call_seq
+                        restore_opts_seen = opts
+                    end,
+                },
+            },
+            with_capture = resurrect_error.with_capture,
+        }
+
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
+        ops.dispatch(p, fake_window, nil)
+
+        assert_true(not rename_called,
+            "switch: rename_workspace MUST NOT be called — wezterm's "
+            .. "active-workspace swap handles source-window hiding")
+        assert_true(not rcp_called,
+            "switch: `wezterm cli kill-pane` MUST NOT be called — "
+            .. "source-workspace MuxWindows stay alive (just hidden) "
+            .. "so switching back via set_active_workspace reveals them")
+        assert_true(restore_opts_seen ~= nil,
+            "switch: restore_workspace not called")
+        assert_eq(restore_opts_seen.window, nil,
+            "switch: opts.window MUST be nil so resurrect spawns each "
+            .. "window_state via mux.spawn_window{workspace=target, "
+            .. "cwd=saved}; passing the user's MuxWindow would adopt "
+            .. "the wezsesh TUI tab as the snapshot's first tab")
+        assert_eq(restore_opts_seen.spawn_in_workspace, true,
+            "switch: opts.spawn_in_workspace=true keeps the spawned "
+            .. "MuxWindows under the target workspace label")
+        assert_eq(restore_opts_seen.close_open_tabs, nil,
+            "switch: opts.close_open_tabs MUST be unset — there's no "
+            .. "user window to clear (the snapshot windows are all "
+            .. "fresh spawns)")
+        assert_eq(restore_opts_seen.relative, true,
+            "switch: opts.relative MUST default to true")
+        assert_eq(restore_opts_seen.restore_text, true,
+            "switch: opts.restore_text MUST default to true")
+        assert_true(type(restore_opts_seen.on_pane_restore) == "function",
+            "switch: opts.on_pane_restore must be the wezsesh "
+            .. "argv-allowlisted callback")
+        assert_eq(set_active_with, "main",
+            "switch: set_active_workspace not called with 'main'")
+        assert_true(restore_call_index ~= nil
+            and set_active_call_index ~= nil
+            and restore_call_index < set_active_call_index,
+            "switch: set_active_workspace MUST fire AFTER "
+            .. "restore_workspace; it errors if the workspace doesn't "
+            .. "exist in the mux yet, and the spawn_in_workspace path "
+            .. "is what creates it")
+        local env = decode_envelope(2)
+        assert_eq(env.status, "completed",
+            "switch: terminal status wrong")
+        assert_eq(env.data.active_workspace, "main",
+            "switch: data.active_workspace wrong")
+
+        wezterm_shim.run_child_process = nil
+        wezterm_shim.executable_dir = nil
+    end)
+
+    it("no-op when name == window:active_workspace(); set_active "
+        .. "and rename are NEVER called", function()
+        local set_called = false
+        local rename_called = false
+        mux_stub.get_workspace_names = function()
+            -- Even if `main` shows up live, the no-op branch must
+            -- short-circuit BEFORE the live-switch branch.
+            return { "main" }
+        end
+        mux_stub.set_active_workspace = function(_n)
+            set_called = true
+        end
+        mux_stub.rename_workspace = function(_o, _n)
+            rename_called = true
+        end
+        local fake_window = {
+            active_workspace = function(_self) return "main" end,
+            active_pane = function(_self) return nil end,
+        }
+        local p = fixture_payload("switch", { name = "main", cwd = "" })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(not set_called,
+            "switch no-op: set_active_workspace must NOT run")
+        assert_true(not rename_called,
+            "switch no-op: rename_workspace must NOT run")
+        local env = decode_envelope()
+        assert_eq(env.status, "completed",
+            "switch no-op: status wrong")
+        assert_eq(env.data.active_workspace, "main",
+            "switch no-op: data.active_workspace wrong")
+    end)
+
+    it("rename branch: not live, not saved → rename_workspace from "
+        .. "current to target; cwd != '' triggers send_text", function()
+        local rename_calls = {}
+        local sent_text = nil
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(old, new)
+            rename_calls[#rename_calls + 1] = { old = old, new = new }
+        end
+        local fake_pane = {
+            send_text = function(_self, txt) sent_text = txt end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        -- No resurrect plugin wired → get_state_files absent → branch
+        -- 3 declines, branch 4 (rename) fires.
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "newproj",
+            cwd  = "/home/u/proj",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_eq(#rename_calls, 1,
+            "switch rename: expected exactly one rename")
+        assert_eq(rename_calls[1].old, "default",
+            "switch rename: old name wrong")
+        assert_eq(rename_calls[1].new, "newproj",
+            "switch rename: new name wrong")
+        assert_true(sent_text ~= nil,
+            "switch rename: send_text not invoked despite cwd != ''")
+        assert_true(sent_text:find("cd ", 1, true) == 1,
+            "switch rename: send_text did not start with `cd `; got: "
+            .. tostring(sent_text))
+        assert_true(sent_text:find("'/home/u/proj'", 1, true) ~= nil,
+            "switch rename: cwd not single-quoted; got: "
+            .. tostring(sent_text))
+        assert_true(sent_text:sub(-1) == "\r",
+            "switch rename: send_text must end with carriage return")
+        local env = decode_envelope()
+        assert_eq(env.status, "completed",
+            "switch rename: status wrong")
+        assert_eq(env.data.active_workspace, "newproj",
+            "switch rename: data.active_workspace wrong")
+    end)
+
+    it("rename branch: cwd == '' does NOT trigger send_text", function()
+        local sent_text_called = false
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_o, _n) end
+        local fake_pane = {
+            send_text = function(_self, _t) sent_text_called = true end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "newproj",
+            cwd  = "",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(not sent_text_called,
+            "switch rename: send_text fired despite empty cwd")
+    end)
+
+    it("shellescape: a cwd with embedded single quotes is escaped "
+        .. "as '\\''", function()
+        local sent_text = nil
+        mux_stub.get_workspace_names = function()
+            return { "default" }
+        end
+        mux_stub.rename_workspace = function(_o, _n) end
+        local fake_pane = {
+            send_text = function(_self, t) sent_text = t end,
+        }
+        local fake_window = {
+            active_workspace = function(_self) return "default" end,
+            active_pane = function(_self) return fake_pane end,
+        }
+        ops._set_deps{
+            resurrect = {},
+            with_capture = resurrect_error.with_capture,
+        }
+        local p = fixture_payload("switch", {
+            name = "x",
+            cwd  = "/foo'bar",
+        })
+        ops.dispatch(p, fake_window, nil)
+        assert_true(sent_text ~= nil, "send_text not invoked")
+        -- Expect the embedded `'` to be escaped as `'\''` so the
+        -- shell sees it literally inside the outer single quotes.
+        assert_true(sent_text:find("'/foo'\\''bar'", 1, true) ~= nil,
+            "shell escape did not survive single-quote injection: "
+            .. tostring(sent_text))
+    end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §6.4 — new
+-- new
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§6.4 — new", function()
+describe("new", function()
     it("success → completed + data: { name, pane_id }", function()
         local fake_pane = { pane_id = function(_self) return 42 end }
         mux_stub.spawn_window = function(_opts)
@@ -828,7 +996,7 @@ end)
 -- Outer dispatch — pcall boundary swallows verb raises
 -- ────────────────────────────────────────────────────────────────────
 
-describe("dispatch outer pcall boundary (§9.4)", function()
+describe("dispatch outer pcall boundary", function()
     it("a verb raise does NOT propagate; replies UNKNOWN error",
     function()
         -- Inject a bogus dispatch arm that raises immediately. We use

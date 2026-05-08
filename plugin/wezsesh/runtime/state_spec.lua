@@ -19,10 +19,10 @@
 --     time), so partial mutation of a previously-read snapshot is
 --     LOST unless the caller writes the whole bucket back;
 --   * an explicit write-counter on the underlying store lets us
---     assert the §9.6 contract: every mutating call MUST flush via
+--     assert the contract: every mutating call MUST flush via
 --     a write-back assignment, never bypass it;
 --   * a "force a nested-table value into a scalar slot" hatch
---     exercises the §0.1 row 30 (`wezterm.GLOBAL` value-shape rule)
+--     exercises the GLOBAL value-shape rule (no nested tables)
 --     so the spec proves state.lua's read paths refuse to dereference
 --     a value that should never have been there.
 
@@ -30,7 +30,9 @@ local function script_dir()
     local src = arg and arg[0] or "plugin/wezsesh/state_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
-package.path = script_dir() .. "/?.lua;" .. package.path
+package.path = script_dir() .. "/?.lua;"
+            .. script_dir() .. "/../../?.lua;"
+            .. package.path
 
 -- ────────────────────────────────────────────────────────────────────
 -- wezterm shim — installed BEFORE require("state")
@@ -50,12 +52,8 @@ package.path = script_dir() .. "/?.lua;" .. package.path
 --   * a test-only `__store`/`__write_count`/`__inject_raw` surface for
 --     the spec's assertions. Production code never sees these.
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
 local function make_global()
     local store = {}
@@ -83,7 +81,7 @@ local function make_global()
         reset_writes = function() writes = 0 end,
         -- Test-only escape hatch: bypasses __newindex's deep-copy so
         -- the spec can prove state.lua's read paths reject a value
-        -- that VIOLATES the §0.1 row 30 value-shape rule. Production
+        -- that VIOLATES the value-shape rule. Production
         -- code can never hit this — that's the whole point.
         inject_raw = function(bucket, key, value)
             store[bucket] = store[bucket] or {}
@@ -285,11 +283,11 @@ local function assert_nil(v, msg)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.6)", function()
-    it("exposes the §9.6 API and nothing more", function()
+describe("module surface", function()
+    it("exposes the public API and nothing more", function()
         local want = {
             "delete_request", "delete_state", "get_request", "get_state",
             "is_writing", "mark_seen", "prune_requests", "prune_seen_ids",
@@ -305,10 +303,10 @@ describe("module surface (§9.6)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 / §10.6 — wezsesh_state per-pane bucket
+-- wezsesh_state per-pane bucket
 -- ────────────────────────────────────────────────────────────────────
 
-describe("set_state / get_state / delete_state (§9.6, §10.6)", function()
+describe("set_state / get_state / delete_state", function()
     it("round-trips a {target_window_id, spawned_at} record", function()
         state.set_state(7, { target_window_id = 1, spawned_at = 1700000000 })
         local got = state.get_state(7)
@@ -317,7 +315,7 @@ describe("set_state / get_state / delete_state (§9.6, §10.6)", function()
         assert_eq(got.spawned_at, 1700000000, "spawned_at wrong")
     end)
 
-    it("coerces integer pane ids to string keys (§10.6)", function()
+    it("coerces integer pane ids to string keys", function()
         state.set_state(42, { target_window_id = 1, spawned_at = 100 })
         -- Read the raw bucket (test-only) and confirm the key is a
         -- STRING, not the integer that was passed in. Production
@@ -348,7 +346,7 @@ describe("set_state / get_state / delete_state (§9.6, §10.6)", function()
         assert_nil(state.get_state(5), "delete didn't take")
     end)
 
-    it("set_state flushes via write-back (§9.6 acceptance gate)",
+    it("set_state flushes via write-back",
     function()
         -- Each mutating call MUST issue at least one assignment to
         -- wezterm.GLOBAL.<bucket> so the snapshot mlua handed us is
@@ -393,10 +391,10 @@ describe("set_state / get_state / delete_state (§9.6, §10.6)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 / §10.6 — wezsesh_requests per-id bucket
+-- wezsesh_requests per-id bucket
 -- ────────────────────────────────────────────────────────────────────
 
-describe("set_request / get_request / delete_request (§9.6, §10.6)",
+describe("set_request / get_request / delete_request",
 function()
     it("round-trips a {spawned_pane_id, started_at} record", function()
         state.set_request("01JABC", { spawned_pane_id = 7, started_at = 100 })
@@ -406,7 +404,7 @@ function()
         assert_eq(got.started_at, 100, "started_at wrong")
     end)
 
-    it("set_request flushes via write-back (§9.6 acceptance gate)",
+    it("set_request flushes via write-back",
     function()
         control.reset_writes()
         state.set_request("01JREQ", { spawned_pane_id = 1, started_at = 1 })
@@ -429,10 +427,10 @@ function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 / §10.6 — wezsesh_writing per-path flag
+-- wezsesh_writing per-path flag
 -- ────────────────────────────────────────────────────────────────────
 
-describe("set_writing / is_writing (§9.6, §10.6)", function()
+describe("set_writing / is_writing", function()
     it("round-trips a true/false marker keyed by absolute path",
     function()
         state.set_writing("/abs/path/to/snap", true)
@@ -448,7 +446,7 @@ describe("set_writing / is_writing (§9.6, §10.6)", function()
             "expected false on miss")
     end)
 
-    it("the GLOBAL bucket value is a flat boolean (§10.6 storage rule)",
+    it("the GLOBAL bucket value is a flat boolean",
     function()
         state.set_writing("/p", true)
         local raw = control.get_raw_bucket("wezsesh_writing")
@@ -472,10 +470,10 @@ describe("set_writing / is_writing (§9.6, §10.6)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §5.4 / §0.1 row 30 — seen_ids: flat int (unix-seconds) per ULID
+-- seen_ids: flat int (unix-seconds) per ULID
 -- ────────────────────────────────────────────────────────────────────
 
-describe("seen / mark_seen (§5.4, §0.1 row 30)", function()
+describe("seen / mark_seen", function()
     it("seen() returns false on a fresh ULID", function()
         assert_false(state.seen("01JFRESH"), "expected false on miss")
     end)
@@ -486,7 +484,7 @@ describe("seen / mark_seen (§5.4, §0.1 row 30)", function()
         assert_true(state.seen("01JABC"), "expected true after mark_seen")
     end)
 
-    it("mark_seen flushes via write-back (§9.6 acceptance gate)",
+    it("mark_seen flushes via write-back",
     function()
         control.reset_writes()
         state.mark_seen("01JWRT")
@@ -494,7 +492,7 @@ describe("seen / mark_seen (§5.4, §0.1 row 30)", function()
             "no GLOBAL write-back observed for mark_seen")
     end)
 
-    it("storage shape is flat int unix-seconds (§0.1 row 30)", function()
+    it("storage shape is flat int unix-seconds", function()
         state.mark_seen("01JSHAPE")
         local raw = control.get_raw_bucket("wezsesh_seen_ids")
         assert_true(raw ~= nil, "seen_ids bucket missing")
@@ -514,7 +512,7 @@ describe("seen / mark_seen (§5.4, §0.1 row 30)", function()
     it("forbidden value-shape: a nested-table value would silently "
         .. "break indexing in production mlua — the read path "
         .. "MUST refuse to dereference it", function()
-        -- Simulate the v2-draft regression that spike #1 caught: a
+        -- Simulate the regression that the value-shape rule caught: a
         -- nested {ts = N} value smuggled past state.lua via the test
         -- harness's escape hatch. Production mlua's GLOBAL would
         -- accept the write here too — but the next read would throw
@@ -539,10 +537,10 @@ describe("seen / mark_seen (§5.4, §0.1 row 30)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §5.5 — TTL prune (session-wide, never per-pane)
+-- TTL prune (session-wide, never per-pane)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("prune_seen_ids (§5.5)", function()
+describe("prune_seen_ids", function()
     it("drops entries older than ttl_seconds; keeps fresh ones",
     function()
         local now = os.time()
@@ -568,8 +566,8 @@ describe("prune_seen_ids (§5.5)", function()
     end)
 
     it("ULIDs from different panes share the SAME bucket "
-        .. "(no per-pane bucketing per §0.1 row 27)", function()
-        -- The §17.3 'seen_ids TTL prune (session-wide)' gate checks
+        .. "(no per-pane bucketing)", function()
+        -- The seen_ids TTL prune is session-wide; the gate checks
         -- this: two ULIDs marked from "different" panes must land in
         -- the same bucket and prune together. We can't simulate panes
         -- here (state.lua has no pane parameter on mark_seen) but we
@@ -609,7 +607,7 @@ describe("prune_seen_ids (§5.5)", function()
     end)
 end)
 
-describe("prune_states (§5.5)", function()
+describe("prune_states", function()
     it("drops states with spawned_at older than ttl", function()
         local now = os.time()
         state.set_state(1, { target_window_id = 1, spawned_at = now })
@@ -640,7 +638,7 @@ describe("prune_states (§5.5)", function()
     end)
 end)
 
-describe("prune_requests (§5.5)", function()
+describe("prune_requests", function()
     it("drops requests with started_at older than ttl", function()
         local now = os.time()
         state.set_request("01JFRESH",
@@ -663,10 +661,10 @@ describe("prune_requests (§5.5)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.6 — wipe_all
+-- wipe_all
 -- ────────────────────────────────────────────────────────────────────
 
-describe("wipe_all (§9.6)", function()
+describe("wipe_all", function()
     it("clears every bucket this module owns", function()
         state.set_state(1, { target_window_id = 1, spawned_at = 100 })
         state.set_request("01JREQ",
@@ -708,13 +706,14 @@ describe("wipe_all (§9.6)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §10.6 — value-shape rule: nested-table values are forbidden in
--- every GLOBAL sub-bucket this module owns. The §17.4 CI lint
--- enforces this statically; this spec exercises the runtime contract
--- via the test-only escape hatch.
+-- value-shape rule: nested-table values are forbidden in every
+-- GLOBAL sub-bucket this module owns. The
+-- `lua-wezterm-global-nested-table` lint enforces this statically;
+-- this spec exercises the runtime contract via the test-only escape
+-- hatch.
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§10.6 GLOBAL value-shape rule (no nested-table values)",
+describe("GLOBAL value-shape rule (no nested-table values)",
 function()
     it("set_state stores a STRING value (JSON-encoded), not a "
         .. "nested table, so the bucket is mlua-safe",
@@ -742,7 +741,7 @@ function()
             .. type(stored))
     end)
 
-    it("seen_ids stores integers only (§0.1 row 30)", function()
+    it("seen_ids stores integers only", function()
         state.mark_seen("01JX")
         local raw = control.get_raw_bucket("wezsesh_seen_ids")
         assert_eq(type(raw["01JX"]), "number",
@@ -758,19 +757,19 @@ function()
 
     it("the harness exercises the spec's intent: a nested-table "
         .. "value injected via the escape hatch is what state.lua "
-        .. "MUST not produce — and what the §17.4 grep lint MUST "
+        .. "MUST not produce — and what the lualint rule MUST "
         .. "catch in source", function()
         -- We're not running the lint here (Go-side tool). What we
         -- ARE proving is that NO state.lua API path produced a
         -- nested-table value: every set_*/mark_seen above was
         -- followed by a `type(stored) == "string|number|boolean"`
-        -- check against the raw bucket. Combined with the §17.4
+        -- check against the raw bucket. Combined with the
         -- grep lint over plugin/wezsesh/*.lua, the value-shape
         -- contract has belt + suspenders.
         --
         -- This test exists so that anyone refactoring state.lua to
         -- "just store the table" gets a single clear failure here
-        -- pointing at §0.1 row 30 / spike #1.
+        -- pointing at the value-shape rule.
         for _, name in ipairs({"wezsesh_state", "wezsesh_seen_ids",
                                 "wezsesh_requests", "wezsesh_writing"}) do
             local raw = control.get_raw_bucket(name) or {}
@@ -780,7 +779,7 @@ function()
                     or type(v) == "boolean",
                     name .. "[" .. tostring(k)
                     .. "] is type " .. type(v)
-                    .. " — violates §10.6 storage rule")
+                    .. " — violates GLOBAL storage rule")
             end
         end
     end)

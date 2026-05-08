@@ -19,8 +19,7 @@
 --     `wezterm_shim.__handlers[event]` so the spec can synthesise
 --     emissions via `emit(...)`. Mirrors mlua's append-only
 --     registration semantics (no de-register API; multiple handlers
---     for the same event fan out in registration order, per spike #2
---     V2 PASS).
+--     for the same event fan out in registration order).
 --   * `wezterm.log_warn` — captures messages into `log_warns` so the
 --     spec can assert the "uncaptured" warn is emitted.
 --   * `wezterm.GLOBAL` — empty stub; resurrect_error.lua does not
@@ -73,7 +72,7 @@ end
 -- Synthesise a `wezterm.emit("resurrect.error", msg)` by calling each
 -- handler registered against `event` in registration order. mlua's
 -- semantics: handlers run synchronously on the emitter's thread
--- (spike #2 V1 confirmed) and return values are not used by us here.
+-- and return values are not used by us here.
 local function emit(event, ...)
     local hs = handlers[event] or {}
     for i = 1, #hs do hs[i](...) end
@@ -108,8 +107,8 @@ end
 --     `clear_uncaptured()`);
 --   * the production module's package cache, so a subsequent
 --     `require("resurrect_error")` re-loads a clean copy. This
---     mirrors what §9.1's `package.loaded["wezsesh.*"] = nil` cache-
---     bust loop does on every config reload — an idempotency test
+--     mirrors what init.lua's `package.loaded["wezsesh.*"] = nil`
+--     cache-bust loop does on every config reload — an idempotency test
 --     that doesn't reset this would only ever exercise the fast-path
 --     after the very first call.
 local function reset_state()
@@ -163,11 +162,11 @@ local function fresh_module()
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.13 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.13)", function()
-    it("exposes the §9.13 API and nothing more", function()
+describe("module surface", function()
+    it("exposes the public API and nothing more", function()
         local M = fresh_module()
         local want = {
             "clear_uncaptured", "recent_uncaptured",
@@ -288,7 +287,7 @@ describe("register() is idempotent (spike-#2)", function()
 
     it("the second register() is a no-op even if the install gate is "
         .. "set but the wezterm shim has been re-shimmed", function()
-        -- Simulates the §9.1 cache-bust loop: package.loaded is nilled
+        -- Simulates init.lua's cache-bust loop: package.loaded is nilled
         -- but `_G` (and therefore the install gate) survives. After a
         -- subsequent `require("resurrect_error")`, register() must
         -- still be a no-op — the gate's purpose is exactly this.
@@ -329,7 +328,7 @@ describe("register() is idempotent (spike-#2)", function()
 
     it("apply_to_config-style double-call (cache-bust + register) → "
         .. "exactly one registration in one Lua state", function()
-        -- §9.1 apply_to_config:
+        -- init.lua's apply_to_config:
         --   1. nil out package.loaded["wezsesh.*"]
         --   2. require + register every wezsesh.* module
         -- A user editing wezterm.lua and triggering Ctrl+Shift+R does
@@ -356,7 +355,7 @@ describe("register() is idempotent (spike-#2)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.13 — capture buffer interleaved with the persistent listener
+-- capture buffer interleaved with the persistent listener
 -- ("Done when: spec verifies the per-call buffer interleaved with the
 -- persistent listener.")
 -- ────────────────────────────────────────────────────────────────────

@@ -13,27 +13,41 @@
 -- regardless of CWD: derive this spec's directory from arg[0] and
 -- prepend it.
 local function script_dir()
-    local src = arg and arg[0] or "plugin/wezsesh/hmac_spec.lua"
+    local src = arg and arg[0] or "plugin/wezsesh/crypto/hmac_spec.lua"
     return src:match("^(.*)/[^/]+$") or "."
 end
--- T-907: hmac.lua now uses `require("wezsesh.vendor.sha2")`. wezterm's
--- `wezterm.plugin.require` adds `<plugin_root>/plugin/?.lua` to
--- package.path, under which that name resolves. Locally the spec runs
--- without that machinery, so we add the parent of script_dir() (i.e.
--- `plugin/`) to package.path so the wezsesh-prefixed lookup matches
--- `plugin/wezsesh/vendor/sha2.lua`. The original script_dir() entries
--- stay so `require("hmac")` and `require("canonical_json")` below still
--- resolve.
+-- Three roots so this spec runs both bare and under wezterm's
+-- `wezterm.plugin.require` (which adds `<plugin_root>/plugin/?.lua`):
+--
+--   * SPEC_DIR     — `plugin/wezsesh/crypto/?.lua`. Lets bare
+--                    `require("hmac")` find this directory's hmac.lua.
+--   * SPEC_DIR/..  — `plugin/wezsesh/?.lua`. Lets bare
+--                    `require("canonical_json")` find the sibling
+--                    plugin/wezsesh/canonical_json.lua.
+--   * SPEC_DIR/../.. — `plugin/?.lua`. Lets the dotted form
+--                    `require("wezsesh.vendor.sha2")` (used inside
+--                    hmac.lua) resolve to plugin/wezsesh/vendor/sha2.lua.
 local function parent_dir(p)
     return p:match("^(.*)/[^/]+$") or "."
 end
 local SPEC_DIR = script_dir()
 local PARENT_DIR = parent_dir(SPEC_DIR)
-package.path = PARENT_DIR .. "/?.lua;"
-            .. PARENT_DIR .. "/?/init.lua;"
-            .. SPEC_DIR .. "/?.lua;"
+local GRANDPARENT_DIR = parent_dir(PARENT_DIR)
+package.path = SPEC_DIR .. "/?.lua;"
             .. SPEC_DIR .. "/?/init.lua;"
+            .. PARENT_DIR .. "/?.lua;"
+            .. PARENT_DIR .. "/?/init.lua;"
+            .. GRANDPARENT_DIR .. "/?.lua;"
+            .. GRANDPARENT_DIR .. "/?/init.lua;"
             .. package.path
+
+-- canonical_json's verb_args_shape sources from wezsesh.verbs at module
+-- load. The verb modules indirectly require wezterm (via result.lua and
+-- runtime/globals.lua); the minimal-wezterm shim is enough to satisfy
+-- the load — none of those module bodies actually call into wezterm at
+-- load time.
+local helpers = require("spec_helpers")
+package.preload["wezterm"] = function() return helpers.minimal_wezterm() end
 
 local hm = require("hmac")
 local cj = require("canonical_json")
@@ -104,7 +118,7 @@ local function assert_raises(fn, sentinel)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §17.2 fixture (mirrors internal/hmac/testdata/roundtrip.json)
+-- HMAC round-trip fixture (mirrors internal/hmac/testdata/roundtrip.json)
 -- ────────────────────────────────────────────────────────────────────
 
 local FIXTURE_KEY_HEX =
@@ -118,7 +132,7 @@ local FIXTURE_CANONICAL_SANS_HMAC =
 local FIXTURE_EXPECTED_HMAC =
     "52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5"
 
--- The §17.2 payload as a Lua table, identical in shape to the Go
+-- The fixture payload as a Lua table, identical in shape to the Go
 -- fixture's `payload` map. `args` is the parser-style empty table; the
 -- canonical_json verb tagger upgrades it to an object below.
 local function fixture_payload()
@@ -137,7 +151,7 @@ end
 -- tests
 -- ────────────────────────────────────────────────────────────────────
 
-describe("§17.2 round-trip fixture", function()
+describe("round-trip fixture", function()
     it("compute over the pinned canonical sans-hmac bytes "
         .. "= expected_hmac", function()
         local got = hm.compute(FIXTURE_CANONICAL_SANS_HMAC, FIXTURE_KEY_HEX)
@@ -158,10 +172,10 @@ describe("§17.2 round-trip fixture", function()
         local sans = cj.copy_without(payload, "hmac")
         local sans_bytes = cj.encode(sans)
         assert_eq(sans_bytes, FIXTURE_CANONICAL_SANS_HMAC,
-            "encoded sans-hmac bytes diverge from §17.2 fixture")
+            "encoded sans-hmac bytes diverge from fixture")
         local got = hm.compute(sans_bytes, FIXTURE_KEY_HEX)
         assert_eq(got, FIXTURE_EXPECTED_HMAC,
-            "round-trip digest diverges from §17.2 fixture")
+            "round-trip digest diverges from fixture")
     end)
 
     it("verify accepts the freshly-signed payload (Lua sign → "
@@ -181,7 +195,7 @@ describe("§17.2 round-trip fixture", function()
     end)
 end)
 
-describe("§4.3 field-removal sequence (no hmac=\"\" set-then-encode)",
+describe("field-removal sequence (no hmac=\"\" set-then-encode)",
 function()
     it("the canonical sans-hmac bytes contain no \"hmac\":"
         .. " fragment", function()
@@ -209,9 +223,9 @@ function()
 
         -- Forbidden: payload constructed with hmac = "" and encoded.
         -- Used here as the negative control — its bytes contain
-        -- `"hmac":""` and the digest MUST diverge from the §17.2
-        -- expected. If these matched, the §4.3 invariant would be
-        -- silently violable.
+        -- `"hmac":""` and the digest MUST diverge from the
+        -- fixture expected. If these matched, the field-removal
+        -- invariant would be silently violable.
         local wrong_payload = fixture_payload()
         wrong_payload.hmac = ""
         cj.tag_in_place(wrong_payload, cj.ROOT_PAYLOAD_SHAPE,
@@ -224,7 +238,7 @@ function()
         assert_true(right_digest ~= wrong_digest,
             "removal vs zeroing collided: both produced " .. right_digest)
         assert_eq(right_digest, FIXTURE_EXPECTED_HMAC,
-            "removal-form digest diverges from §17.2 expected")
+            "removal-form digest diverges from fixture expected")
     end)
 end)
 
@@ -273,7 +287,7 @@ describe("verify shape negatives", function()
     end)
 end)
 
-describe("compute key-shape enforcement (§5.1)", function()
+describe("compute key-shape enforcement", function()
     it("rejects non-string key", function()
         assert_raises(function()
             hm.compute(FIXTURE_CANONICAL_SANS_HMAC, nil)
@@ -295,7 +309,7 @@ describe("compute key-shape enforcement (§5.1)", function()
         end, "HMAC_BAD_KEY")
     end)
 
-    it("rejects uppercase hex (lowercase-only per §5.1)", function()
+    it("rejects uppercase hex (lowercase-only)", function()
         assert_raises(function()
             hm.compute(FIXTURE_CANONICAL_SANS_HMAC,
                 FIXTURE_KEY_HEX:upper())
@@ -318,7 +332,7 @@ describe("compute key-shape enforcement (§5.1)", function()
     end)
 end)
 
-describe("hex-decoded key length (§5.1: 32 raw bytes)", function()
+describe("hex-decoded key length (32 raw bytes)", function()
     it("compute produces a 64-char lowercase-hex digest", function()
         local d = hm.compute("", FIXTURE_KEY_HEX)
         assert_eq(#d, 64, "digest length")
@@ -327,22 +341,20 @@ describe("hex-decoded key length (§5.1: 32 raw bytes)", function()
     end)
 end)
 
-describe("§16.3 require-name resolves under wezterm.plugin.require "
+describe("require-name resolves under wezterm.plugin.require "
     .. "search root", function()
-    -- T-907 regression pin. wezterm.plugin.require adds
+    -- Regression pin. wezterm.plugin.require adds
     -- `<plugin_root>/plugin/?.lua` to package.path. With that single
     -- entry, `require("wezsesh.vendor.sha2")` MUST resolve to
     -- `<plugin_root>/plugin/wezsesh/vendor/sha2.lua`. If a future change
     -- reverts hmac.lua to `require("vendor.sha2")`, the spec would
-    -- still pass under the SPEC_DIR fallback (because SPEC_DIR points
-    -- at `plugin/wezsesh` and `vendor/sha2.lua` lives directly under
-    -- it), but the production wezterm plugin load would BREAK with
-    -- "module 'vendor.sha2' not found". This test exercises ONLY the
-    -- production-equivalent search root, isolating the require-name
-    -- contract.
+    -- still pass under one of the local fallbacks, but the production
+    -- wezterm plugin load would BREAK with "module 'vendor.sha2' not
+    -- found". This test exercises ONLY the production-equivalent
+    -- search root, isolating the require-name contract.
     it("package.searchpath('wezsesh.vendor.sha2', '<plugin>/?.lua') "
         .. "resolves to plugin/wezsesh/vendor/sha2.lua", function()
-        local production_search = PARENT_DIR .. "/?.lua"
+        local production_search = GRANDPARENT_DIR .. "/?.lua"
         local found = package.searchpath("wezsesh.vendor.sha2",
             production_search)
         assert_true(found ~= nil,
@@ -364,7 +376,7 @@ describe("§16.3 require-name resolves under wezterm.plugin.require "
         -- `vendor.sha2` name MUST NOT resolve. If it did, reverting
         -- hmac.lua's require would silently still work in production
         -- and the rename would be cosmetic.
-        local production_search = PARENT_DIR .. "/?.lua"
+        local production_search = GRANDPARENT_DIR .. "/?.lua"
         local found = package.searchpath("vendor.sha2",
             production_search)
         assert_true(found == nil,

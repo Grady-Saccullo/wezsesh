@@ -9,8 +9,8 @@
 -- Exits 0 with `OK N/N` on success, 1 with FAIL lines on stderr
 -- otherwise.
 --
--- This spec exercises every §17.3 acceptance gate listed under T-600:
---   * Pointer-shape validation (spike-#3): malformed JSON, path outside
+-- This spec exercises every IPC acceptance gate:
+--   * Pointer-shape validation: malformed JSON, path outside
 --     `<runtime_dir>/req/`, wrong mode, symlink, `pointer.id ≠
 --     payload.id` → silent-drop + log_warn REQ_POINTER_REJECTED.
 --   * HMAC mismatch silent on wire — corrupted payload → no spawn.
@@ -56,193 +56,14 @@ package.path = script_dir() .. "/?.lua;"
 -- spec stubs `M._deps.dispatch` to a recorder so we can assert on
 -- dispatch invocation count for HMAC-drop scenarios.
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
--- Pure-Lua JSON encoder/parser shim. The same dialect state_spec.lua
--- uses; sufficient for every shape ipc.lua sees on its way through
--- the handler.
-local function json_encode_shim(v)
-    local function emit(x)
-        local t = type(x)
-        if t == "number" then
-            if math.type and math.type(x) == "integer" then
-                return tostring(x)
-            end
-            return string.format("%.17g", x)
-        end
-        if t == "boolean" then return x and "true" or "false" end
-        if t == "string" then
-            local out = { '"' }
-            for i = 1, #x do
-                local b = x:byte(i)
-                if b == 0x22 then out[#out + 1] = '\\"'
-                elseif b == 0x5c then out[#out + 1] = "\\\\"
-                elseif b < 0x20 then
-                    out[#out + 1] = string.format("\\u%04x", b)
-                else out[#out + 1] = string.char(b)
-                end
-            end
-            out[#out + 1] = '"'
-            return table.concat(out)
-        end
-        if t == "table" then
-            -- Detect array vs object — array-tagged via metatable
-            -- (compatible with canonical_json.lua) wins.
-            local mt = getmetatable(x)
-            local kind = mt and mt.__wezsesh_canonical
-            if kind == "array" then
-                local parts = {}
-                for i = 1, #x do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local n = 0
-            local is_array = true
-            for k in pairs(x) do
-                if type(k) ~= "number" then is_array = false; break end
-                n = n + 1
-            end
-            if is_array and n > 0 and kind ~= "object" then
-                local parts = {}
-                for i = 1, n do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local keys = {}
-            for k in pairs(x) do keys[#keys + 1] = k end
-            table.sort(keys, function(a, b)
-                return tostring(a) < tostring(b)
-            end)
-            local parts = {}
-            for _, k in ipairs(keys) do
-                parts[#parts + 1] = emit(tostring(k)) .. ":" .. emit(x[k])
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-        if t == "nil" then return "null" end
-        error("json_encode_shim: unsupported type " .. t)
-    end
-    return emit(v)
-end
+local codec = helpers.make_json_codec()
+local json_encode_shim = codec.encode
+local json_parse_shim  = codec.decode
 
-local function json_parse_shim(s)
-    if type(s) ~= "string" then
-        error("json_parse_shim: input must be string", 0)
-    end
-    local pos = 1
-    local function err(msg)
-        error("json_parse_shim: " .. msg .. " at " .. pos, 0)
-    end
-    local function skip_ws()
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == " " or c == "\t" or c == "\n" or c == "\r" then
-                pos = pos + 1
-            else return end
-        end
-    end
-    local parse_value
-    local function parse_string()
-        if s:sub(pos, pos) ~= '"' then err("expected string") end
-        pos = pos + 1
-        local out = {}
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == '"' then pos = pos + 1; return table.concat(out) end
-            if c == "\\" then
-                pos = pos + 1
-                local esc = s:sub(pos, pos)
-                if esc == "u" then
-                    -- minimal: pass through hex bytes for our shapes
-                    out[#out + 1] = s:sub(pos + 1, pos + 4)
-                    pos = pos + 5
-                else
-                    out[#out + 1] = esc
-                    pos = pos + 1
-                end
-            else
-                out[#out + 1] = c
-                pos = pos + 1
-            end
-        end
-        err("unterminated string")
-    end
-    local function parse_number()
-        local s2 = s:sub(pos)
-        local num_str = s2:match("^%-?%d+%.?%d*[eE]?[%-+]?%d*")
-        if not num_str or num_str == "" then err("bad number") end
-        pos = pos + #num_str
-        local n = tonumber(num_str)
-        if not num_str:find("[.eE]") then
-            n = math.tointeger(n) or n
-        end
-        return n
-    end
-    local function parse_object()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "}" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            local k = parse_string()
-            skip_ws()
-            if s:sub(pos, pos) ~= ":" then err("expected ':'") end
-            pos = pos + 1; skip_ws()
-            out[k] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "}" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or '}'") end
-            pos = pos + 1
-        end
-    end
-    local function parse_array()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "]" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            out[#out + 1] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "]" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or ']'") end
-            pos = pos + 1
-        end
-    end
-    parse_value = function()
-        skip_ws()
-        local c = s:sub(pos, pos)
-        if c == "{" then return parse_object() end
-        if c == "[" then return parse_array() end
-        if c == '"' then return parse_string() end
-        if c == "t" then
-            if s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true end
-            err("bad literal")
-        end
-        if c == "f" then
-            if s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false end
-            err("bad literal")
-        end
-        if c == "n" then
-            if s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
-            err("bad literal")
-        end
-        return parse_number()
-    end
-    skip_ws()
-    return parse_value()
-end
-
--- GLOBAL proxy mirroring state_spec.lua's snapshot-on-read shape.
-local global_store = {}
-local global_proxy = setmetatable({}, {
-    __index = function(_, k) return deepcopy(global_store[k]) end,
-    __newindex = function(_, k, v) global_store[k] = deepcopy(v) end,
-})
+local global_proxy = helpers.make_global_proxy()
 
 local log_warn_calls = {}
 local log_error_calls = {}
@@ -261,9 +82,9 @@ package.preload["wezterm"] = function() return wezterm_shim end
 
 -- Now load the modules under test (production require path).
 local ipc            = require("wezsesh.ipc")
-local state          = require("wezsesh.state")
+local state          = require("wezsesh.runtime.state")
 local canonical_json = require("wezsesh.canonical_json")
-local hmac           = require("wezsesh.hmac")
+local hmac           = require("wezsesh.crypto.hmac")
 
 -- ────────────────────────────────────────────────────────────────────
 -- minimal busted-shaped harness
@@ -283,9 +104,13 @@ local function reset_state()
     log_warn_calls = {}
     log_error_calls = {}
     state.wipe_all()
-    -- Default GLOBAL bootstrap: a valid 64-hex HMAC key.
-    global_store = {}
+    for k in pairs(global_proxy) do global_proxy[k] = nil end
     global_proxy.wezsesh_session_key = string.rep("a", 64)
+    -- Clear the user-var-changed install gate so each test exercises a
+    -- fresh `M.register` call. Production code relies on this gate to
+    -- avoid stacking handlers on apply_to_config re-runs; tests need to
+    -- bypass it to assert the registration path on every it() block.
+    _G._wezsesh_user_var_listener_installed = nil
 end
 
 local function it(name, fn)
@@ -326,9 +151,9 @@ end
 -- payload + pointer fixture builders
 -- ────────────────────────────────────────────────────────────────────
 --
--- Build a §3.3-shaped canonical-JSON payload, sign it with the same
--- 64-hex key the GLOBAL holds (default `aaa…`), then build a §3.1
--- pointer envelope referring to a synthetic on-disk path. The handler
+-- Build a canonical-JSON payload, sign it with the same 64-hex key
+-- the GLOBAL holds (default `aaa…`), then build a pointer envelope
+-- referring to a synthetic on-disk path. The handler
 -- never actually reads the file from disk in the spec — the stat seam
 -- and the read seam route through fakes — but the pointer's `path`
 -- still has to satisfy the prefix check in pre-step (2).
@@ -341,9 +166,8 @@ local DEFAULT_KEY        = string.rep("a", 64)
 
 local function valid_ulid()
     -- 26-char Crockford-base32 placeholder. The validator only checks
-    -- length (#id == 26) per §9.3.1.A/B; alphabet enforcement lives in
-    -- the binary side (canonical_json acceptor would also reject
-    -- non-string).
+    -- length (#id == 26); alphabet enforcement lives in the binary
+    -- side (canonical_json acceptor would also reject non-string).
     return "01JABCDEFGHJKMNPQRSTVWXYZA"
 end
 
@@ -365,7 +189,7 @@ local function build_payload(overrides)
         args             = args,
     }
 
-    -- §4.2 / §4.3 signer: tag the full (with-hmac) payload, then
+    -- Signer: tag the full (with-hmac) payload, then
     -- copy_without("hmac") + encode + sign. Mirrors the verifier order
     -- in ipc.lua step (e). For the signer we don't yet HAVE an hmac
     -- to drop, so we tag a placeholder, then re-tag the real payload
@@ -394,7 +218,7 @@ local function build_payload(overrides)
     return payload
 end
 
--- Build a §3.1 pointer envelope. Returns `(pointer_value, payload_json)`.
+-- Build a pointer envelope. Returns `(pointer_value, payload_json)`.
 -- wezterm pre-decodes the base64 form of the OSC value before firing
 -- `user-var-changed`, so the handler receives the raw pointer JSON
 -- directly; the spec mirrors that contract by handing JSON in. The
@@ -548,11 +372,11 @@ local function drive_handler(payload, pointer_overrides, opts_overrides)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3 — module surface
+-- module surface
 -- ────────────────────────────────────────────────────────────────────
 
-describe("module surface (§9.3)", function()
-    it("exposes the §9.3 API (validate_pointer, validate_payload, "
+describe("module surface", function()
+    it("exposes the public API (validate_pointer, validate_payload, "
         .. "register, handle_user_var)", function()
         assert_true(type(ipc.validate_pointer) == "function",
             "validate_pointer missing")
@@ -568,10 +392,10 @@ describe("module surface (§9.3)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3.1.A — pointer field-shape validator
+-- pointer field-shape validator
 -- ────────────────────────────────────────────────────────────────────
 
-describe("validate_pointer (§9.3.1.A)", function()
+describe("validate_pointer", function()
     it("accepts a well-formed pointer", function()
         local p = { v = 1, id = valid_ulid(),
                     path = DEFAULT_REQ_PREFIX .. "ab.json" }
@@ -609,10 +433,10 @@ describe("validate_pointer (§9.3.1.A)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §9.3.1.B — payload field-shape validator
+-- payload field-shape validator
 -- ────────────────────────────────────────────────────────────────────
 
-describe("validate_payload (§9.3.1.B)", function()
+describe("validate_payload", function()
     local function base()
         return {
             v = 1, id = valid_ulid(), ts = 1700000000,
@@ -620,7 +444,7 @@ describe("validate_payload (§9.3.1.B)", function()
             op = "noop", args = {}, hmac = string.rep("a", 64),
         }
     end
-    it("accepts the §3.3 envelope shape", function()
+    it("accepts the canonical envelope shape", function()
         assert_true(ipc.validate_payload(base()),
             "well-formed payload rejected")
     end)
@@ -651,10 +475,10 @@ describe("validate_payload (§9.3.1.B)", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- §13.9 — SUN_PATH validation (Lua side)
+-- SUN_PATH validation (Lua side)
 -- ────────────────────────────────────────────────────────────────────
 
-describe("SUN_PATH validation (§13.9)", function()
+describe("SUN_PATH validation", function()
     it("accepts a sane runtime_dir", function()
         local ok, _ = pcall(ipc.validate_runtime_dir, "/tmp/wezsesh-1000")
         assert_true(ok, "sane runtime_dir rejected")
@@ -829,7 +653,7 @@ end)
 -- HMAC mismatch silent on wire
 -- ────────────────────────────────────────────────────────────────────
 
-describe("HMAC mismatch silent on wire (§17.3)", function()
+describe("HMAC mismatch silent on wire", function()
     it("flipped hex char → no dispatch, no spawn, log_warn 'HMAC mismatch'",
     function()
         seed_session()
@@ -862,7 +686,7 @@ end)
 -- Freshness boundary
 -- ────────────────────────────────────────────────────────────────────
 
-describe("Freshness boundary (§5.3 / §17.3)", function()
+describe("Freshness boundary", function()
     it("ts = now - 30 → accept (boundary inclusive)", function()
         seed_session()
         local payload = build_payload({ ts = 1700000000 - 30 })
@@ -905,7 +729,7 @@ end)
 -- seen_ids TTL prune (session-wide) — entries older than 60s dropped
 -- ────────────────────────────────────────────────────────────────────
 
-describe("seen_ids TTL prune (§5.4 / §5.5 / §17.3)", function()
+describe("seen_ids TTL prune", function()
     it("a stale entry (age > 60s) is pruned at end-of-dispatch", function()
         seed_session()
         -- Pre-seed a stale entry with a fake clock helper. We use
@@ -986,7 +810,7 @@ describe("Multi-window broadcast (#3524)", function()
     end)
 
     it("wire target_window_id == 0 matches session.target_window_id == 0 "
-        .. "(wezterm's first-window id; T-905 / §9.3.1.C)", function()
+        .. "(wezterm's first-window id)", function()
         -- wezterm assigns WINID = 0 to the first window; a keybinding
         -- spawned from that window emits a wire target_window_id of 0.
         -- The handler MUST match it strictly against session = 0 — `0`
@@ -1014,7 +838,7 @@ describe("Multi-window broadcast (#3524)", function()
     end)
 
     it("wire target_window_id == -1 (any-window sentinel) → dispatch "
-        .. "regardless of session.target_window_id (§9.3.1.C row 1)",
+        .. "regardless of session.target_window_id",
     function()
         -- Apply-time emissions (init.lua step 7) carry -1 because no
         -- wezterm window is bound at apply_to_config time. The handler
@@ -1126,9 +950,9 @@ describe("happy path", function()
 
     it("valid switch payload → dispatch invoked exactly once", function()
         seed_session()
-        -- switch's args shape requires a `name` string. Build the
-        -- payload from scratch so build_payload's signer path picks up
-        -- the `name` key from the start (re-signing after-the-fact would
+        -- switch's args shape requires `name` and `cwd` strings. Build
+        -- the payload from scratch so build_payload's signer path picks
+        -- up the keys from the start (re-signing after-the-fact would
         -- have to invert the in-place tagging build_payload did to the
         -- shared static args object).
         local payload = {
@@ -1138,7 +962,10 @@ describe("happy path", function()
             target_window_id = DEFAULT_WINDOW_ID,
             reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
             op               = "switch",
-            args             = canonical_json.object{ name = "main" },
+            args             = canonical_json.object{
+                name = "main",
+                cwd  = "",
+            },
         }
         local sign_shape = { _shape = "object" }
         for k, sub in pairs(canonical_json.ROOT_PAYLOAD_SHAPE) do
@@ -1152,6 +979,83 @@ describe("happy path", function()
 
         local calls = drive_handler(payload)
         assert_eq(#calls, 1, "switch didn't dispatch")
+    end)
+
+    it("save with expected_hash=null round-trips through json_parse "
+        .. "(rehydrate_nullable_args)", function()
+        -- Regression: the TUI's first-save path sends
+        -- `expected_hash: canonicaljson.Null`, the binary signs the
+        -- bytes including `"expected_hash":null`, but
+        -- `wezterm.json_parse` decodes JSON `null` as Lua `nil` —
+        -- which is indistinguishable from a missing key. Without the
+        -- rehydrate step before tag_in_place + HMAC re-encode, the
+        -- tag walk raised CANONICAL_SHAPE_MISMATCH (or, if it hadn't,
+        -- the sans-hmac re-encode would have produced bytes WITHOUT
+        -- expected_hash, busting HMAC parity with the binary's pre-
+        -- sign bytes).
+        seed_session()
+
+        -- Build the SAME bytes the binary would sign: a save payload
+        -- with expected_hash = cj.NULL. canonical_json.encode emits
+        -- `"expected_hash":null` for the sentinel.
+        local payload = {
+            v                = 1,
+            id               = valid_ulid(),
+            ts               = 1700000000,
+            target_window_id = DEFAULT_WINDOW_ID,
+            reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
+            op               = "save",
+            args             = canonical_json.object{
+                name          = "work",
+                overwrite     = false,
+                expected_hash = canonical_json.NULL,
+            },
+        }
+        local sign_shape = { _shape = "object" }
+        for k, sub in pairs(canonical_json.ROOT_PAYLOAD_SHAPE) do
+            if k ~= "_shape" and k ~= "hmac" then
+                sign_shape[k] = sub
+            end
+        end
+        canonical_json.tag_in_place(payload, sign_shape,
+            canonical_json.verb_args_shape.save)
+        local pre_sign_bytes = canonical_json.encode(payload)
+        payload.hmac = hmac.compute(pre_sign_bytes, DEFAULT_KEY)
+
+        -- Sanity: the bytes the binary would sign include the JSON
+        -- null literal at the expected_hash slot (this is also the
+        -- shape the spec_helpers json_encode_shim emits for cj.NULL,
+        -- which is what drive_handler will hand to the parser).
+        assert_true(
+            pre_sign_bytes:find('"expected_hash":null', 1, true) ~= nil,
+            "fixture failed: expected_hash:null not in pre-sign bytes")
+
+        local calls = drive_handler(payload)
+
+        -- (1) tag_in_place must not raise after rehydrate.
+        assert_false(log_contains("canonical tag failed"),
+            "tag_in_place raised on parsed-null expected_hash; the "
+            .. "rehydrate step (e) didn't restore the cj.NULL sentinel")
+
+        -- (2) HMAC verify must succeed → silent on the wire is now a
+        -- successful dispatch; the only path to step (i) is HMAC pass.
+        assert_false(log_contains("HMAC mismatch"),
+            "HMAC mismatched after rehydrate — the sans-hmac re-encode "
+            .. "produced bytes != the binary's pre-sign bytes")
+
+        -- (3) dispatch reached step (i) exactly once.
+        assert_eq(#calls, 1,
+            "expected dispatch to fire on parsed-null expected_hash; "
+            .. "did the rehydrate step run before validate / tag_in_place?")
+
+        -- (4) the payload that reached dispatch carries the sentinel,
+        -- not a missing key — downstream verbs reading expected_hash
+        -- can rely on the rehydrated form being present.
+        local dispatched = calls[1][1]
+        local rehydrated = dispatched.args.expected_hash
+        local mt = getmetatable(rehydrated)
+        assert_true(mt and mt.__wezsesh_canonical == "null",
+            "args.expected_hash didn't end up as cj.NULL after rehydrate")
     end)
 
     it("dispatch raise is swallowed (CLAUDE.md invariant 1)", function()
@@ -1187,7 +1091,7 @@ end)
 -- M.register — wezterm.on hookup + SUN_PATH gate at register time
 -- ────────────────────────────────────────────────────────────────────
 
-describe("M.register (§9.3 / §13.9)", function()
+describe("M.register", function()
     it("registers a single user-var-changed handler with a sane "
         .. "runtime_dir", function()
         local registered = {}

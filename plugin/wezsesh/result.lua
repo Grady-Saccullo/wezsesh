@@ -1,54 +1,56 @@
--- §9.5 — reply emitter for the Lua side of the IPC protocol.
+-- Reply emitter for the Lua side of the IPC protocol.
 --
 -- This module owns the second half of the request/reply round-trip:
--- after `ops.dispatch` (§9.4) decides what happened, it calls one of
+-- after the verb dispatcher decides what happened, it calls one of
 -- the four `reply_*` functions here to spit a JSON envelope back to
 -- the binary's reply socket. Every reply (started / completed /
 -- partial / error) lands on the wire via the same path:
 --
---   1. Build a flat Lua table matching the §3.4 reply envelope —
+--   1. Build a flat Lua table matching the reply envelope:
 --      `v`, `id`, `status`, `ok`, plus the verb-shape's `data`,
---      `warnings`, or `error` fields per §3.4 invariants.
+--      `warnings`, or `error` fields per the kind invariants.
 --   2. JSON-encode it via the local `json_encode` defined below. The
---      reply channel is NOT the canonical-JSON wire (that's request-
---      only, §4) — Go's reply parser feeds the bytes through
+--      reply channel is NOT the canonical-JSON wire (that's
+--      request-only) — Go's reply parser feeds the bytes through
 --      encoding/json which has no byte-equality contract. We avoid
 --      `wezterm.json_encode` here because production mlua serialises
 --      an empty Lua table as `[]`, which the Go reply decoder cannot
 --      unmarshal into `Data map[string]any` for the noop / nil-details
 --      paths. The local encoder defaults empty to `{}` and honours
 --      explicit `as_object` / `as_array` tags.
---   3. Base64-encode the JSON via `b64.encode` (RFC 4648 §4) — the
---      `wezsesh reply` subcommand takes its payload as a single argv
---      to dodge shell-quoting concerns.
+--   3. Base64-encode the JSON via `b64.encode` — the `wezsesh reply`
+--      subcommand takes its payload as a single argv to dodge
+--      shell-quoting concerns.
 --   4. Spawn `wezsesh reply <sock> <b64>` via
---      `wezterm.background_child_process`. The §16.5 lint requires
---      this call to be `pcall`-wrapped: a failed spawn (binary
---      missing, sock vanished, fork ENOMEM) MUST NOT propagate up to
---      the `user-var-changed` handler, where an uncaught raise wedges
---      the wezterm event loop (CLAUDE.md invariant 1).
+--      `wezterm.background_child_process`. The
+--      `lua-bg-child-process-pcall` lint requires this call to be
+--      `pcall`-wrapped: a failed spawn (binary missing, sock
+--      vanished, fork ENOMEM) MUST NOT propagate up to the
+--      `user-var-changed` handler, where an uncaught raise wedges the
+--      wezterm event loop.
 --
 -- The reply is fire-and-forget. We never block on the binary's
 -- consumption of it; the TUI side has its own 5 s / 30 s reply-budget
--- timers (§14.1) and the binary runs `io.LimitedReader` over the
--- socket. If the binary is gone, the spawn is a noop.
+-- timers and the binary runs `io.LimitedReader` over the socket. If
+-- the binary is gone, the spawn is a noop.
 --
--- §0.1 row 5: every reply carries `v: 1`. The `v` we emit is sourced
--- from `payload.v` so a future protocol bump only needs to round-trip
--- the request's `v` correctly; today payload.v is always 1.
+-- Every reply carries `v: 1`. The `v` we emit is sourced from
+-- `payload.v` so a future protocol bump only needs to round-trip the
+-- request's `v` correctly; today payload.v is always 1.
 --
--- §3.4 invariants encoded structurally per kind:
+-- Reply-kind invariants encoded structurally:
 --   * `started`  — ok=true; NO data, warnings, or error.
 --   * `completed`+ok=true — data present (may be `{}`).
 --   * `completed`+ok=false (error) — error present, no data.
 --   * `partial`  — ok=true; data AND warnings present.
 --
--- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
--- §9.0.1. The standalone spec (`result_spec.lua`) installs a wezterm
--- shim via `package.preload["wezterm"]` BEFORE requiring this file.
+-- mlua sandbox: acquired via `local wezterm = require("wezterm")`. The
+-- standalone spec (`result_spec.lua`) installs a wezterm shim via
+-- `package.preload["wezterm"]` BEFORE requiring this file.
 
 local wezterm = require("wezterm")
-local b64 = require("wezsesh.b64")
+local b64     = require("wezsesh.crypto.b64")
+local globals = require("wezsesh.runtime.globals")
 
 local M = {}
 
@@ -58,7 +60,7 @@ local M = {}
 -- `Data map[string]any` / `Error.Details map[string]any`. We need an
 -- empty `data`/`details` to land on the wire as `{}` while `warnings`
 -- stays as `[]`. Since the reply path is NOT the canonical-JSON wire
--- (§3.4 vs §4 — header comment above), byte-equality with Go is not
+-- (see header comment above), byte-equality with Go is not
 -- required; only valid JSON with the right shape distinction.
 --
 -- The encoder honours an explicit metatable-tag set by `as_object` /
@@ -81,7 +83,8 @@ local json_encode
 local function escape_string(s)
     -- Standard JSON escapes for the reply path. ASCII passthrough is
     -- fine — UTF-8 validation isn't required here (the canonical-JSON
-    -- §4 wire is what enforces UTF-8; this is the reply channel).
+    -- canonical-JSON request wire is what enforces UTF-8; this is the
+    -- reply channel).
     local out = { '"' }
     for i = 1, #s do
         local b = s:byte(i)
@@ -167,18 +170,18 @@ json_encode = function(v)
     error("json_encode: unsupported type " .. t, 0)
 end
 
--- Resolve the wezsesh binary path from `wezterm.GLOBAL.wezsesh_bin_path`
--- per §10.6. The plugin's `apply_to_config` writes this at load. If
--- unset (mis-configured), the spawn is a noop — the binary on the
--- other end will hit IPC_TIMEOUT and the TUI will surface that.
+-- Resolve the wezsesh binary path. apply_to_config writes it via
+-- `runtime.globals.set_bin_path` at load time; an unset value (mis-
+-- configured plugin) makes the spawn a noop and the binary on the
+-- other end hits IPC_TIMEOUT, which the TUI surfaces.
 local function bin_path()
-    local p = wezterm.GLOBAL.wezsesh_bin_path
+    local p = globals.bin_path()
     if type(p) == "string" and #p > 0 then return p end
     return nil
 end
 
--- Spawn `wezsesh reply <sock> <b64>` fire-and-forget. The §16.5 lint
--- (AST walker over result.lua + ipc.lua) verifies this single call to
+-- Spawn `wezsesh reply <sock> <b64>` fire-and-forget. The
+-- `lua-bg-child-process-pcall` lint verifies this single call to
 -- `wezterm.background_child_process` is wrapped in `pcall` — a failed
 -- spawn MUST NOT bubble out of the user-var-changed handler.
 --
@@ -207,21 +210,20 @@ local function spawn_reply(reply_sock, envelope)
 
     local b64s = b64.encode(json)
 
-    -- §16.5 — pcall-wrap the spawn. The argv is the public CLI
-    -- contract from §8.20: `wezsesh reply <sock> <b64json>`. Argv form
-    -- (not a shell string) sidesteps every shell-escaping concern
-    -- CLAUDE.md invariant 11 enumerates.
+    -- pcall-wrap the spawn. The argv is the public CLI contract:
+    -- `wezsesh reply <sock> <b64json>`. Argv form (not a shell string)
+    -- sidesteps every shell-escaping concern.
     local ok = pcall(wezterm.background_child_process,
                      { bin, "reply", reply_sock, b64s })
     return ok
 end
 
--- §3.4 / §9.5 — `started` reply. Restore-class verbs (`switch` to
--- saved-not-live, `load`) emit this BEFORE running the actual
--- restore. The TUI dismisses immediately on receipt; a `completed`
--- or `partial` follow-up is required within 30 s (§14.1).
+-- `started` reply. Restore-class verbs (`switch` to saved-not-live,
+-- `load`) emit this BEFORE running the actual restore. The TUI
+-- dismisses immediately on receipt; a `completed` or `partial`
+-- follow-up is required within 30 s.
 --
--- §3.4 invariant: started ⇒ ok=true, NO data / warnings / error.
+-- Invariant: started ⇒ ok=true, NO data / warnings / error.
 -- We deliberately do NOT thread through any optional kwargs here —
 -- the structural shape is fixed and a future call site that wants
 -- to attach data to a `started` reply is a bug we want to catch
@@ -235,10 +237,10 @@ function M.reply_started(payload)
     })
 end
 
--- §3.4 / §9.5 — `completed` + ok=true reply. The verb-specific `data`
--- shape is the caller's responsibility (per-verb shapes live in §6).
--- A nil `data` is normalised to an empty table — §3.4 mandates `data`
--- be present (may be `{}`) for completed+ok=true.
+-- `completed` + ok=true reply. The verb-specific `data` shape is the
+-- caller's responsibility (per-verb shapes live in the verb modules).
+-- A nil `data` is normalised to an empty table — the wire mandates
+-- `data` be present (may be `{}`) for completed+ok=true.
 function M.reply_completed(payload, data)
     return spawn_reply(payload.reply_sock, {
         v      = payload.v,
@@ -251,11 +253,11 @@ function M.reply_completed(payload, data)
     })
 end
 
--- §3.4 / §9.5 — `partial` reply. Terminal: success-with-warnings
--- (e.g., `RESURRECT_PARTIAL` after a mid-restore Lua error). §3.4
+-- `partial` reply. Terminal: success-with-warnings (e.g.,
+-- `RESURRECT_PARTIAL` after a mid-restore Lua error). The wire
 -- mandates BOTH `data` AND `warnings` present; we normalise nils to
 -- empty containers so a caller passing nil for either still produces
--- a §3.4-conforming envelope.
+-- a conforming envelope.
 function M.reply_partial(payload, data, warnings)
     -- Per-warning `details` tagging: the heuristic already classifies
     -- a populated `details` table as an object (string keys), but a
@@ -273,7 +275,7 @@ function M.reply_partial(payload, data, warnings)
         id       = payload.id,
         status   = "partial",
         ok       = true,
-        -- §3.4: data + warnings BOTH present. Object for data, array
+        -- data + warnings BOTH present. Object for data, array
         -- for warnings — empty containers must serialise to `{}` and
         -- `[]` respectively to match the Go reply decoder's shape.
         data     = as_object(data),
@@ -281,11 +283,11 @@ function M.reply_partial(payload, data, warnings)
     })
 end
 
--- §3.4 / §9.5 — `completed` + ok=false reply. Terminal failure with
--- a structured error. `code` is the §7 error-code identifier, e.g.
+-- `completed` + ok=false reply. Terminal failure with a structured
+-- error. `code` is the wire-stable error-code identifier, e.g.
 -- `UNKNOWN_VERB`, `SNAPSHOT_LOAD_FAILED`. `message` is human-readable;
 -- `details` is the per-code shape (e.g., `{raw_error = "..."}` for
--- SAVE_FAILED — see §7).
+-- SAVE_FAILED).
 function M.reply_error(payload, code, message, details)
     return spawn_reply(payload.reply_sock, {
         v      = payload.v,
@@ -302,7 +304,7 @@ function M.reply_error(payload, code, message, details)
     })
 end
 
--- §9.5 — toast helper. Surfaces a wezterm overlay toast for non-wire
+-- Toast helper. Surfaces a wezterm overlay toast for non-wire
 -- failure modes (HMAC mismatch logged + IPC_INIT_FAILED on the Lua
 -- side, etc.). pcall-wrapped: `window:toast_notification(...)` is a
 -- userdata method call on a wezterm-side object and a stale `window`

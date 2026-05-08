@@ -25,10 +25,13 @@ import (
 	"github.com/Grady-Saccullo/wezsesh/internal/wezcli"
 )
 
-// reqOrphanThreshold is the per §3.5 / §12.4 / §3.1 sweep window — a
+// ReqOrphanThreshold is the per §3.5 / §12.4 / §3.1 sweep window — a
 // `*.json` request file older than this is considered orphaned and
-// surfaced by the `runtime.dir.req_orphans` check.
-const reqOrphanThreshold = 60 * time.Second
+// surfaced by the `runtime.dir.req_orphans` check. Exported so the
+// startup-sweep helper in `internal/reqsweep` can stay in lockstep
+// with the doctor's definition of "orphaned"; if these two drift,
+// users see a doctor row that disagrees with what the sweep just did.
+const ReqOrphanThreshold = 60 * time.Second
 
 // encryptionAgentBudget is the §7 ENCRYPTION_AGENT_SLOW threshold.
 // Anything past this surfaces as a doctor warn.
@@ -738,7 +741,7 @@ func checkRuntimeDirReqOrphans(env Env) Check {
 			continue
 		}
 		age := now.Sub(info.ModTime())
-		if age > reqOrphanThreshold {
+		if age > ReqOrphanThreshold {
 			orphans++
 			if age > worst {
 				worst = age

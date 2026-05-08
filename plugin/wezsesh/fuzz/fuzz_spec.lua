@@ -1,8 +1,8 @@
--- §17.5 — Lua handler fuzz harness for ipc.lua's `user-var-changed`
--- step machine. Drives 15 mutation classes (the §17.5 fixed-width list
--- + the row-#35 amendments `unknown_verb` and `v_field_swap`) into the
--- production `M.handle_user_var(window, pane, name, value, opts)` entry
--- point and asserts the four §17.5 invariants on every iteration:
+-- Lua handler fuzz harness for ipc.lua's `user-var-changed` step
+-- machine. Drives 15 mutation classes (the fixed-width list plus the
+-- `unknown_verb` and `v_field_swap` amendments) into the production
+-- `M.handle_user_var(window, pane, name, value, opts)` entry point
+-- and asserts the four invariants on every iteration:
 --
 --   (1) no Lua error escapes the handler (outer pcall returns true);
 --   (2) `ops.dispatch` invocation count = 0 unless the input by
@@ -30,7 +30,7 @@
 -- touching the real disk.
 --
 -- The harness deliberately does NOT use any wezterm API (foreign to
--- standalone-Lua) and stays outside the §17.4 lualint AST walker (the
+-- standalone-Lua) and stays outside the lualint AST walker (the
 -- file is `*_spec.lua`, which lualint skips wholesale at line 103 of
 -- cmd/lualint/main.go).
 
@@ -50,12 +50,12 @@ package.path = script_dir() .. "/?.lua;"
 -- argv parsing — `--seed=<int>`, `--iters=<int>`, `--no-shim`
 -- ────────────────────────────────────────────────────────────────────
 --
--- `--no-shim` switches `oversized_string` to the §17.5-spec-literal 1
--- MiB id fixture (`string.rep("X", 1<<20)`). Without it the harness
+-- `--no-shim` switches `oversized_string` to the spec-literal 1 MiB
+-- id fixture (`string.rep("X", 1<<20)`). Without it the harness
 -- cycles 256/1024/4096 bytes because the pure-Lua `json_parse_shim`
 -- would dominate the per-iter budget at 1 MiB. Real wezterm ships a C
--- json_parse and the production budget is comfortable at 1<<20 — that
--- environment is exercised by the §17.6 e2e job, where the spec's 1
+-- json_parse and the production budget is comfortable at 1<<20 —
+-- that environment is exercised by the e2e job, where the spec's 1
 -- MiB intent is honoured. CI does NOT pass `--no-shim`; the
 -- division-of-labor is intentional.
 
@@ -86,187 +86,14 @@ math.randomseed(SEED)
 -- wezterm shim — minimum surface to satisfy ipc.lua + transitive deps
 -- ────────────────────────────────────────────────────────────────────
 
-local function deepcopy(v)
-    if type(v) ~= "table" then return v end
-    local out = {}
-    for k, vv in pairs(v) do out[k] = deepcopy(vv) end
-    return out
-end
+local helpers = require("spec_helpers")
+local deepcopy = helpers.deepcopy
 
-local function json_encode_shim(v)
-    local function emit(x)
-        local t = type(x)
-        if t == "number" then
-            if math.type and math.type(x) == "integer" then
-                return tostring(x)
-            end
-            return string.format("%.17g", x)
-        end
-        if t == "boolean" then return x and "true" or "false" end
-        if t == "string" then
-            local out = { '"' }
-            for i = 1, #x do
-                local b = x:byte(i)
-                if b == 0x22 then out[#out + 1] = '\\"'
-                elseif b == 0x5c then out[#out + 1] = "\\\\"
-                elseif b < 0x20 then
-                    out[#out + 1] = string.format("\\u%04x", b)
-                else out[#out + 1] = string.char(b)
-                end
-            end
-            out[#out + 1] = '"'
-            return table.concat(out)
-        end
-        if t == "table" then
-            local mt = getmetatable(x)
-            local kind = mt and mt.__wezsesh_canonical
-            if kind == "null" then return "null" end
-            if kind == "array" then
-                local parts = {}
-                for i = 1, #x do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local n = 0
-            local is_array = true
-            for k in pairs(x) do
-                if type(k) ~= "number" then is_array = false; break end
-                n = n + 1
-            end
-            if is_array and n > 0 and kind ~= "object" then
-                local parts = {}
-                for i = 1, n do parts[i] = emit(x[i]) end
-                return "[" .. table.concat(parts, ",") .. "]"
-            end
-            local keys = {}
-            for k in pairs(x) do keys[#keys + 1] = k end
-            table.sort(keys, function(a, b)
-                return tostring(a) < tostring(b)
-            end)
-            local parts = {}
-            for _, k in ipairs(keys) do
-                parts[#parts + 1] = emit(tostring(k)) .. ":" .. emit(x[k])
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-        if t == "nil" then return "null" end
-        error("json_encode_shim: unsupported type " .. t)
-    end
-    return emit(v)
-end
+local codec = helpers.make_json_codec()
+local json_encode_shim = codec.encode
+local json_parse_shim  = codec.decode
 
-local function json_parse_shim(s)
-    if type(s) ~= "string" then
-        error("json_parse_shim: input must be string", 0)
-    end
-    local pos = 1
-    local function err(msg)
-        error("json_parse_shim: " .. msg .. " at " .. pos, 0)
-    end
-    local function skip_ws()
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == " " or c == "\t" or c == "\n" or c == "\r" then
-                pos = pos + 1
-            else return end
-        end
-    end
-    local parse_value
-    local function parse_string()
-        if s:sub(pos, pos) ~= '"' then err("expected string") end
-        pos = pos + 1
-        local out = {}
-        while pos <= #s do
-            local c = s:sub(pos, pos)
-            if c == '"' then pos = pos + 1; return table.concat(out) end
-            if c == "\\" then
-                pos = pos + 1
-                local esc = s:sub(pos, pos)
-                if esc == "u" then
-                    out[#out + 1] = s:sub(pos + 1, pos + 4)
-                    pos = pos + 5
-                else
-                    out[#out + 1] = esc
-                    pos = pos + 1
-                end
-            else
-                out[#out + 1] = c
-                pos = pos + 1
-            end
-        end
-        err("unterminated string")
-    end
-    local function parse_number()
-        local s2 = s:sub(pos)
-        local num_str = s2:match("^%-?%d+%.?%d*[eE]?[%-+]?%d*")
-        if not num_str or num_str == "" then err("bad number") end
-        pos = pos + #num_str
-        local n = tonumber(num_str)
-        if not num_str:find("[.eE]") then
-            n = math.tointeger(n) or n
-        end
-        return n
-    end
-    local function parse_object()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "}" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            local k = parse_string()
-            skip_ws()
-            if s:sub(pos, pos) ~= ":" then err("expected ':'") end
-            pos = pos + 1; skip_ws()
-            out[k] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "}" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or '}'") end
-            pos = pos + 1
-        end
-    end
-    local function parse_array()
-        pos = pos + 1; skip_ws()
-        local out = {}
-        if s:sub(pos, pos) == "]" then pos = pos + 1; return out end
-        while true do
-            skip_ws()
-            out[#out + 1] = parse_value()
-            skip_ws()
-            local c = s:sub(pos, pos)
-            if c == "]" then pos = pos + 1; return out end
-            if c ~= "," then err("expected ',' or ']'") end
-            pos = pos + 1
-        end
-    end
-    parse_value = function()
-        skip_ws()
-        local c = s:sub(pos, pos)
-        if c == "{" then return parse_object() end
-        if c == "[" then return parse_array() end
-        if c == '"' then return parse_string() end
-        if c == "t" then
-            if s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true end
-            err("bad literal")
-        end
-        if c == "f" then
-            if s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false end
-            err("bad literal")
-        end
-        if c == "n" then
-            if s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
-            err("bad literal")
-        end
-        return parse_number()
-    end
-    skip_ws()
-    return parse_value()
-end
-
-local global_store = {}
-local global_proxy = setmetatable({}, {
-    __index = function(_, k) return deepcopy(global_store[k]) end,
-    __newindex = function(_, k, v) global_store[k] = deepcopy(v) end,
-})
+local global_proxy = helpers.make_global_proxy()
 
 local log_warn_calls = {}
 local log_error_calls = {}
@@ -284,10 +111,10 @@ local wezterm_shim = {
 package.preload["wezterm"] = function() return wezterm_shim end
 
 local ipc            = require("wezsesh.ipc")
-local state          = require("wezsesh.state")
+local state          = require("wezsesh.runtime.state")
 local canonical_json = require("wezsesh.canonical_json")
-local hmac           = require("wezsesh.hmac")
-local b64            = require("wezsesh.b64")
+local hmac           = require("wezsesh.crypto.hmac")
+local b64            = require("wezsesh.crypto.b64")
 
 -- ────────────────────────────────────────────────────────────────────
 -- per-iteration constants + shared fixtures
@@ -324,7 +151,7 @@ local function reset_world()
     log_warn_calls = {}
     log_error_calls = {}
     state.wipe_all()
-    global_store = {}
+    for k in pairs(global_proxy) do global_proxy[k] = nil end
     global_proxy.wezsesh_session_key = DEFAULT_KEY
     state.set_state(DEFAULT_PANE_ID, {
         target_window_id = DEFAULT_WINDOW_ID,
@@ -333,7 +160,7 @@ local function reset_world()
     ipc._reset_deps()
 end
 
--- Build a properly signed §3.3 payload table. Caller may override any
+-- Build a properly signed canonical payload table. Caller may override any
 -- field; build_payload then re-tags + re-signs with the verb-keyed
 -- shape so tag_in_place succeeds during the verifier path.
 local function build_signed_payload(overrides)
@@ -343,7 +170,11 @@ local function build_signed_payload(overrides)
     if args == nil then
         if op == "noop" then
             args = canonical_json.object{}
-        elseif op == "switch" or op == "load" then
+        elseif op == "switch" then
+            args = canonical_json.object{ name = "main", cwd = "" }
+        elseif op == "list_dirs" then
+            args = canonical_json.object{ query = "" }
+        elseif op == "load" then
             args = canonical_json.object{ name = "main" }
         elseif op == "new" then
             args = canonical_json.object{
@@ -384,7 +215,7 @@ local function build_signed_payload(overrides)
     return payload
 end
 
--- Build a §3.1 pointer envelope referring to `path` with `id`. wezterm
+-- Build a pointer envelope referring to `path` with `id`. wezterm
 -- pre-decodes the base64 form of the SetUserVar OSC value before
 -- firing `user-var-changed`, so the handler receives the raw pointer
 -- JSON directly; the harness mirrors that contract.
@@ -401,7 +232,7 @@ end
 -- (restore_fn, dispatch_calls, reply_writes). dispatch_calls is the
 -- canonical record (pcall'd from step (i)). reply_writes is a
 -- separate counter the dispatch shim increments to model the
--- §13.13 reply-on-socket contract — neither is incremented unless
+-- Reply-on-socket contract — neither is incremented unless
 -- the handler reaches step (i).
 local function install_seams(file_entries, now)
     local real_io_open  = io.open
@@ -466,7 +297,7 @@ local frozen_opts = {
 }
 
 -- ────────────────────────────────────────────────────────────────────
--- Mutation generators — one per §17.5 class
+-- Mutation generators — one per mutation class
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Each generator returns (value, file_entries, byte_count) where
@@ -544,7 +375,7 @@ local function build_file_class(payload_table, want_id)
 end
 
 local function gen_field_missing(idx)
-    -- 7 required root fields per §3.3 (sans hmac which is 8th):
+    -- 7 required root fields (sans hmac which is 8th):
     -- v, id, ts, target_window_id, reply_sock, op, args, hmac.
     local fields = { "v", "id", "ts", "target_window_id",
                      "reply_sock", "op", "args", "hmac" }
@@ -555,7 +386,7 @@ local function gen_field_missing(idx)
 end
 
 local function gen_type_swapped()
-    -- The §17.5 fixture: ts="string", args=42, target_window_id="x".
+    -- The shape-mismatch fixture: ts="string", args=42, target_window_id="x".
     -- Random selection per iter so we exercise each type-swap branch.
     local payload = build_signed_payload{ op = "noop" }
     local choice = math.random(1, 4)
@@ -594,13 +425,13 @@ local function gen_untagged_table()
 end
 
 local function gen_oversized_string()
-    -- §17.5 fixture: id = string.rep("X", 1<<20). The handler's
+    -- Oversized fixture: id = string.rep("X", 1<<20). The handler's
     -- validate_payload (step (d)) rejects on #id != 26, so the gate
     -- is independent of length; under the pure-Lua json_parse_shim
     -- the harness-side length is capped to keep the per-iter wall-
-    -- clock under the §17.5 50ms budget. Real wezterm uses a C
+    -- clock under the 50ms budget. Real wezterm uses a C
     -- parser; the production budget is comfortable at 1<<20. Pass
-    -- `--no-shim` (e.g. from the §17.6 e2e env) to honour the spec
+    -- `--no-shim` (e.g. from the e2e env) to honour the spec
     -- literally; CI's standalone harness invocation does not.
     local big
     if NO_SHIM then
@@ -643,7 +474,7 @@ local function gen_control_char_field()
     return build_file_class(payload, payload.id)
 end
 
-local VERBS = { "noop", "switch", "load", "save", "new" }
+local VERBS = { "noop", "switch", "load", "save", "new", "list_dirs" }
 
 local function gen_hmac_corrupted()
     -- Properly signed payload, last hex char of payload.hmac flipped
@@ -683,7 +514,7 @@ local function gen_unknown_verb()
     local op = bogus_verbs[math.random(1, #bogus_verbs)]
     -- We sign with the verb_args_shape table missing → can't sign
     -- correctly. So we sign as `noop` (whose shape exists), then
-    -- swap the op label after signing. The §17.5 spec says HMAC
+    -- swap the op label after signing. The spec says HMAC
     -- verify never runs anyway — step (e) drops first.
     local payload = build_signed_payload{ op = "noop" }
     payload.op = op
@@ -703,7 +534,7 @@ local function gen_v_field_swap(branch)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- Per-iteration driver — drives one mutation, asserts §17.5 gates.
+-- Per-iteration driver — drives one mutation, asserts gates.
 -- ────────────────────────────────────────────────────────────────────
 
 local FRAME_BUDGET_MS = 50
@@ -720,7 +551,7 @@ local function drive(class_name, value, file_entries, must_dispatch, now)
     -- MEDIUM-2 (round 1): os.clock() measures CPU seconds, not wall.
     -- Under the in-memory shim (no real I/O, no network, no disk) the
     -- CPU/wall ratio is ≈1, so this remains a sound lower-bound proxy
-    -- for the §17.5 50 ms wall-clock gate. If the harness ever swaps
+    -- for the 50 ms wall-clock gate. If the harness ever swaps
     -- the in-memory shim for real I/O, re-check this gate under
     -- wall-clock (e.g. socket(2) syscall + poll). Don't switch to
     -- os.date-diff — its 1-second resolution would silently invalidate
@@ -763,7 +594,7 @@ local function drive(class_name, value, file_entries, must_dispatch, now)
         if #reply_writes ~= 0 then
             return false, string.format(
                 "%s: reply written on unauthenticated input (count=%d). "
-                .. "§13.13 silent-drop contract violated.",
+                .. "silent-drop contract violated.",
                 class_name, #reply_writes)
         end
     end
@@ -772,7 +603,7 @@ end
 
 -- ────────────────────────────────────────────────────────────────────
 -- Per-class iteration plan. Total mutated bytes across all classes
--- MUST be ≥ 10 000 (§17.5 acceptance gate).
+-- MUST be ≥ 10 000 (the acceptance gate).
 -- ────────────────────────────────────────────────────────────────────
 --
 -- random_bytes drives the bulk: 60 iters × ~2048 byte avg = ~120k.
@@ -789,7 +620,7 @@ local function plan(name, default_iters)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- Run plan — one entry per §17.5 mutation class
+-- Run plan — one entry per mutation class
 -- ────────────────────────────────────────────────────────────────────
 
 local total_mutations = 0
@@ -927,7 +758,7 @@ run_class("hmac_corrupted", plan("hmac_corrupted", 8), function(_)
 end)
 
 -- 13. ts_boundary — exactly 8 (2 sweeps × 4 branches), each branch
--- asserts the right accept/reject side per §17.3.
+-- asserts the right accept/reject side.
 run_class("ts_boundary", plan("ts_boundary", 8), function(i)
     local v, fe, bytes, accept = gen_ts_boundary(i)
     total_mutations = total_mutations + 1
@@ -990,20 +821,20 @@ if total_classes ~= EXPECTED_CLASSES then
             EXPECTED_CLASSES, total_classes))
 end
 
--- The §17.5 acceptance gate requires ≥ 10 000 mutated bytes per run.
+-- The acceptance gate requires ≥ 10 000 mutated bytes per run.
 -- Skip the gate when the operator has explicitly downscaled with
 -- --iters (cmd/lua-fuzzer --iters=10 smoke).
 --
 -- MEDIUM-3 (round 1): `--iters=<n>` overrides BYTE_FLOOR. The
 -- load-bearing constraint is therefore that the CI invocation MUST
 -- NOT pass `--iters` — see `.github/workflows/ci.yml` step "Lua
--- handler fuzz harness (§17.5)". This is enforced by inspection of
+-- handler fuzz harness". This is enforced by inspection of
 -- ci.yml; we deliberately don't gate on a CI-marker env var here to
 -- keep the harness simple.
 local BYTE_FLOOR = 10000
 if ITERS_OVERRIDE == nil and total_bytes < BYTE_FLOOR then
     record_fail("byte_floor",
-        string.format("total mutated bytes %d < %d (§17.5 gate)",
+        string.format("total mutated bytes %d < %d (acceptance gate)",
             total_bytes, BYTE_FLOOR))
 end
 

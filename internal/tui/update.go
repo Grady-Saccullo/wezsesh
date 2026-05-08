@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,19 +24,28 @@ var dispatchSeqCounter uint64
 // verbExitsOnSuccess returns true for verbs whose successful terminal
 // reply ends the picker's purpose: the user has navigated away and the
 // TUI tab is now in the way. The remaining verbs (`save`, `delete`,
-// `rename`, etc.) keep the picker open so the user can do more work.
+// `rename`, `new`, `list_dirs`, etc.) keep the picker open so the user
+// can do more work. `new` deliberately stays open: the binary spawns
+// the workspace without switching the active client into it, and the
+// picker re-surfaces the freshly-created row with the cursor on it so
+// the user can decide whether to switch (`s`) or stay. `list_dirs` is
+// a startup data fetch — its reply trickles external rows into the
+// picker, never quits.
 func verbExitsOnSuccess(verb string) bool {
 	switch verb {
-	case "switch", "load", "new":
+	case "switch", "load":
 		return true
 	}
 	return false
 }
 
-// Init satisfies tea.Model. The picker has no startup side effects;
-// every dispatch is keyed off a user action.
+// Init satisfies tea.Model. Fires the startup `list_dirs` dispatch so
+// the picker can surface external (provider-supplied) rows alongside
+// live + saved entries. The reply is merged into m.rows by the
+// list_dirs branch in Update; failures degrade to "no external rows"
+// without blocking the picker.
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return m.startDispatch("list_dirs", "", map[string]any{"query": ""})
 }
 
 // Update handles every tea.Msg. The function is intentionally large but
@@ -108,12 +118,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			status = nameval.SanitizeForDisplay(
 				fmt.Sprintf("%s: %s", m.currentVerb, msg.reply.Status))
 		}
-		autoQuit := msg.reply.OK && verbExitsOnSuccess(m.currentVerb)
+		// Capture verb before finishOp clears m.currentVerb; the post-
+		// finish handler for `new` needs it to gate the row insert.
+		verb := m.currentVerb
+		var newName string
+		if verb == "new" && msg.reply.OK {
+			if v, ok := msg.reply.Data["name"].(string); ok {
+				newName = v
+			}
+		}
+		var dirRows []map[string]any
+		if verb == "list_dirs" && msg.reply.OK {
+			if raw, ok := msg.reply.Data["dirs"].([]any); ok {
+				for _, e := range raw {
+					if entry, ok := e.(map[string]any); ok {
+						dirRows = append(dirRows, entry)
+					}
+				}
+			}
+		}
+
+		autoQuit := msg.reply.OK && verbExitsOnSuccess(verb)
 		m.finishOp(status)
 		if autoQuit {
 			m.quitting = true
+			m.closeOwnPane = true
 			m.shutdown()
 			return m, tea.Quit
+		}
+		if newName != "" {
+			m.applyNewWorkspace(newName)
+		}
+		if verb == "list_dirs" && len(dirRows) > 0 {
+			m.applyExternalDirs(dirRows)
 		}
 		// Continue reading until the channel closes so we observe the
 		// drain goroutine's clean-up; the dispatcher closes the channel
@@ -153,6 +190,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.replyReceived || !m.opInFlight {
 			return m, nil
 		}
+		// Structured log BEFORE finishOp clears m.currentVerb /
+		// m.currentTarget. m.currentTarget is disk-sourced (a workspace
+		// name) and must be sanitised before it lands in the JSON log
+		// line; m.currentVerb comes from a fixed catalog and is safe
+		// verbatim. Logger.Error sync-flushes (logger.go:125-143) so the
+		// line survives even if the user closes the TUI immediately.
+		m.log.Error("ipc timeout",
+			"verb", m.currentVerb,
+			"target", nameval.SanitizeForDisplay(m.currentTarget),
+			"dispatch_id", msg.dispatchID)
 		m.finishOp(nameval.SanitizeForDisplay(
 			fmt.Sprintf("%s: IPC_TIMEOUT", m.currentVerb)))
 		return m, nil
@@ -178,6 +225,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "y", "Y":
 			m.quitting = true
+			m.closeOwnPane = true
 			m.shutdown()
 			return m, tea.Quit
 		}
@@ -220,7 +268,15 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if action == actLoad {
 			verb = "load"
 		}
-		return m, m.startDispatch(verb, row.Name, nil)
+		var args map[string]any
+		if verb == "switch" {
+			cwd := ""
+			if row.Source == SourceExternal {
+				cwd = row.CWD
+			}
+			args = map[string]any{"name": row.Name, "cwd": cwd}
+		}
+		return m, m.startDispatch(verb, row.Name, args)
 	case actSave:
 		// §6.3 save: name = the active workspace (the one whose state
 		// we'd be persisting). Cursor row is irrelevant — wezterm.mux
@@ -229,7 +285,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// UX simple. The confirm-overwrite modal is v0.2 work.
 		name := m.data.ActiveWorkspace
 		if name == "" {
-			if row, ok := m.rowAt(m.cursor); ok && row.Live {
+			if row, ok := m.rowAt(m.cursor); ok && row.Source == SourceLive {
 				name = row.Name
 			}
 		}
@@ -280,6 +336,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.quitting = true
+		m.closeOwnPane = true
 		m.shutdown()
 		return m, tea.Quit
 	case actMark, actClearMarks, actPin:
@@ -436,6 +493,96 @@ func (m *Model) finishOp(status string) {
 	m.replyCh = nil
 	m.currentVerb = ""
 	m.currentTarget = ""
+}
+
+// applyNewWorkspace inserts (or marks live) the workspace named `name`
+// after a successful `new` reply, re-runs the configured sort, clears
+// any active filter, and parks the cursor on the new row. The Lua
+// `mux.spawn_window` call creates the workspace but does NOT activate
+// it — the picker stays open so the user can decide to `s`witch into
+// it or move on; positioning the cursor on the row is what makes that
+// decision a single keystroke.
+func (m *Model) applyNewWorkspace(name string) {
+	if name == "" {
+		return
+	}
+	matched := false
+	for i := range m.rows {
+		if m.rows[i].Name == name {
+			m.rows[i].Source = SourceLive
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		m.rows = append(m.rows, WorkspaceRow{Name: name, Source: SourceLive})
+	}
+	sortRows(m.rows, m.cfg.Sort, m.data.State)
+
+	if m.mode == modeFilter {
+		m.mode = modeNav
+	}
+	m.filterBuf = ""
+	m.filtered = nil
+
+	for i := range m.rows {
+		if m.rows[i].Name == name {
+			m.cursor = i
+			break
+		}
+	}
+}
+
+// applyExternalDirs merges provider-supplied directory entries into
+// m.rows as SourceExternal rows. Each entry is a map carrying `path`
+// and (optionally) `name` strings. Names are sanitised + validated;
+// invalid entries are dropped silently. External rows whose name
+// already matches a live or saved row are dropped — the live/saved
+// row wins because it carries richer state (mtime, snapshot pointer,
+// pin, etc.). After the merge the configured sort runs again and the
+// active filter is re-applied so the cursor lands somewhere reasonable.
+func (m *Model) applyExternalDirs(entries []map[string]any) {
+	if len(entries) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(m.rows))
+	for _, r := range m.rows {
+		existing[r.Name] = struct{}{}
+	}
+	added := false
+	for _, e := range entries {
+		path, _ := e["path"].(string)
+		name, _ := e["name"].(string)
+		path = nameval.SanitizeForDisplay(path)
+		name = nameval.SanitizeForDisplay(name)
+		if name == "" {
+			if path == "" {
+				continue
+			}
+			name = filepath.Base(path)
+		}
+		if name == "" {
+			continue
+		}
+		if err := nameval.ValidateWorkspaceName(name); err != nil {
+			continue
+		}
+		if _, dup := existing[name]; dup {
+			continue
+		}
+		existing[name] = struct{}{}
+		m.rows = append(m.rows, WorkspaceRow{
+			Name:   name,
+			Source: SourceExternal,
+			CWD:    path,
+		})
+		added = true
+	}
+	if !added {
+		return
+	}
+	sortRows(m.rows, m.cfg.Sort, m.data.State)
+	m.refreshFilter()
 }
 
 // refreshFilter applies the current filterBuf to m.rows and resets the

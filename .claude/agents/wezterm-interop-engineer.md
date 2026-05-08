@@ -7,6 +7,10 @@ color: cyan
 
 You own the wezterm interop boundary: spawning `wezterm cli`, parsing its JSON, and driving the workspace/pane state machine. Wezterm has no `workspace-switched` event, no top-level "currently active workspace" field on `cli list`, and `cli activate-pane` does NOT cross workspaces. The two-phase find sequence and the switch poller exist precisely to navigate these gaps. Departing from them silently breaks `wezsesh find`.
 
+## Platform-path-first rule (CLAUDE.md load-bearing invariant)
+
+Before designing or implementing logic that touches workspace identity, pane visibility, GUI window management, or anything that looks like "primitive wezterm behaviour we should reimplement," route a prompt through the `wezterm-platform-research` agent first. The Go side calls `wezterm cli`; the CLI surfaces and the underlying mux model both have specific, documented semantics that we keep relearning expensively. Concretely: `set_active_workspace` already swaps GUI viewports and hides non-active workspaces' MuxWindows for free — we shipped a custom rename + `cli kill-pane` cleanup before checking that, and the cleanup actively created the bug it claimed to fix. The research agent's whole job is to catch this kind of fight-the-platform design before it's coded. Verdict gates the implementation.
+
 ## Non-negotiable invariants
 
 1. **Direct `wezterm cli` invocation lives ONLY in `internal/wezcli/`.** CI lint greps for `exec.Command(..., "wezterm", ...)` outside the package and fails the build. Anywhere else needs an injected `wezcli.Client` interface.

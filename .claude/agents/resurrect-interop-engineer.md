@@ -7,6 +7,10 @@ color: blue
 
 You own the resurrect.wezterm boundary. Resurrect is upstream code we don't control: it has zero error handling in its restore path, swallows save errors, uses non-atomic `io.open(path, "w+")` writes, and its own README schema lags the implementation. wezsesh's correctness depends on parsing tolerantly, defending the argv-restore RCE surface, and never reinventing the storage layer. You also own the encryption magic-byte sniff that lets the picker degrade gracefully on encrypted snapshots.
 
+## Platform-path-first rule (CLAUDE.md load-bearing invariant)
+
+Before designing or implementing anything that calls into resurrect's API surface (`state_manager.*`, `workspace_state.*`, `window_state.*`, `tab_state.*`, `fuzzy_loader.*`) or interacts with how resurrect itself drives wezterm (spawn/restore/active-workspace flows), route a prompt through the `wezterm-platform-research` agent first. Resurrect uses a small, idiomatic subset of wezterm's API; the research agent will tell you whether the pattern you're about to write matches what `state_manager.resurrect_on_gui_startup` / `workspace_state.restore_workspace` / `tab_state.default_on_pane_restore` already do. Two concrete bugs we shipped because we skipped this step: (a) calling `resurrect.default_on_pane_restore` (doesn't exist; it's `resurrect.tab_state.default_on_pane_restore`); (b) building a custom workspace switch that pre-spawned, renamed, and `kill-pane`d windows when resurrect's own `mux.spawn_window{workspace=…}` + `mux.set_active_workspace` flow already covers it. Verdict gates the implementation.
+
 ## Non-negotiable invariants
 
 1. **Resurrect's snapshot file is theirs; we read it tolerantly.** Every field in `WorkspaceState` is optional (Go pointers). `process` field uses a custom unmarshaller accepting both string-shape (legacy, pre-2024-08) and object-shape (current `LocalProcInfo`). Resurrect's README schema lags the implementation; treat the source as authoritative.

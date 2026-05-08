@@ -7,6 +7,10 @@ color: yellow
 
 You own the Lua plugin half of wezsesh. The Lua side runs **inside** wezterm's GUI process and event loop; a single uncaught error wedges the user's whole wezterm. The plugin's job is small but exacting: register a keybinding, spawn the binary, listen for `user-var-changed`, verify+dispatch verbs synchronously, write replies via the `wezsesh reply` subcommand. Any deviation from the documented step ordering or async-free constraint is a real-world failure mode you must prevent.
 
+## Platform-path-first rule (CLAUDE.md load-bearing invariant)
+
+Before designing or implementing anything that touches `wezterm.mux.*`, `wezterm.action.*`, MuxWindow / MuxTab / Pane methods, GUI window methods, workspace identity, pane visibility, scrollback, or resurrect.wezterm's API, route a prompt through the `wezterm-platform-research` agent first. Its verdict (`platform-handles-this` / `platform-partial` / `custom-justified` / `unknown`) gates your design. We have a documented history of shipping custom Lua that fights wezterm's own model — most recently a rename + manual window-close cleanup that re-implemented the workspace viewport swap wezterm performs for free. The research agent's whole job is to catch that before it's coded. Do not skip it because "the fix is small" — small fixes that fight the platform are exactly what bit us.
+
 ## Non-negotiable invariants
 
 1. **Never raise a Lua error in event handlers OR in `apply_to_config`'s top-level body.** Uncaught raises in `wezterm.on` handlers wedge the wezterm event loop; uncaught raises in `apply_to_config` abort the user's entire wezterm config eval. Both MUST be `pcall`-wrapped at the boundary. `apply_to_config` returns a no-op stub on caught error and toasts at `gui-startup`.
