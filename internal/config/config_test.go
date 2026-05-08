@@ -2,9 +2,7 @@ package config
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,7 +27,7 @@ func minimalConfigJSON(t *testing.T, overrides map[string]any) []byte {
 		"confirm_overwrite":             true,
 		"exclude":                       []string{"^default$"},
 		"new_workspace_command":         nil,
-		"preview":                       map[string]any{"enabled": true, "width": 0.4},
+		"preview":                       map[string]any{"enabled": true, "width": 40},
 		"markers": map[string]any{
 			"active":  "▶",
 			"live":    "●",
@@ -78,7 +76,6 @@ func clearConfigEnv(t *testing.T) {
 		"WEZSESH_DATA_DIR",
 		"WEZSESH_LOG",
 		"WEZSESH_NO_HOOKS",
-		"WEZSESH_CONFIG_JSON_BASE64",
 		"XDG_STATE_HOME",
 		"XDG_DATA_HOME",
 		"XDG_RUNTIME_DIR",
@@ -182,12 +179,6 @@ func TestLoad_RoundTripDefaults(t *testing.T) {
 	}
 	if cfg.Hooks.TimeoutSeconds != 600 {
 		t.Errorf("Hooks.TimeoutSeconds=%d, want 600", cfg.Hooks.TimeoutSeconds)
-	}
-	if cfg.ProtoVersion != 1 {
-		t.Errorf("ProtoVersion=%d, want 1", cfg.ProtoVersion)
-	}
-	if cfg.Version != 1 {
-		t.Errorf("Version=%d, want 1 (§10.7 schema version)", cfg.Version)
 	}
 }
 
@@ -613,75 +604,60 @@ func TestLoadFromEnv_EnvOverridesAutoDetect_NoHooks(t *testing.T) {
 	}
 }
 
-// TestLoadFromEnv_MalformedBase64 confirms LoadFromEnv surfaces a loud
-// error (NOT a silent fall-through to AutoDetect) when the env var is
-// set but contains malformed base64. This is the post-fix-#3
-// equivalent of the legacy "config file missing" error path: the
-// failure has to be loud so a misbehaving plugin doesn't silently
-// drift the binary onto unrelated config defaults.
-func TestLoadFromEnv_MalformedBase64(t *testing.T) {
+// TestLoadFromBootstrapData_RoundTrip — the bootstrap-IPC reply
+// data map flows through LoadFromBootstrapData → applyEnvOverrides
+// to produce a *Config in the same shape the env-blob path used to.
+func TestLoadFromBootstrapData_RoundTrip(t *testing.T) {
 	clearConfigEnv(t)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
-	if _, err := LoadFromEnv(context.Background()); err == nil {
-		t.Fatal("LoadFromEnv with malformed base64: want error, got nil")
+	data := map[string]any{
+		"snapshot_dir":     "/sd",
+		"state_dir":        "/st",
+		"runtime_dir":      "/rd",
+		"data_dir":         "/dd",
+		"log_level":        "warn",
+		"sort":             "alphabetical",
+		"default_action":   "switch",
+		"confirm_delete":   true,
+		"exclude":          []any{"^default$"},
+		"hooks":            map[string]any{"run_hooks": true, "prompt_on_untrusted": false, "timeout_seconds": 600},
+		"plugin_version":   "0.1.0",
+		"preview":          map[string]any{"enabled": true, "width": 40},
+		"markers":          map[string]any{},
+		"columns":          []any{"marker", "name"},
+		"keys":             map[string]any{},
+		"colors":           map[string]any{},
+		"resurrect_argv_allowlist": []any{},
 	}
-}
-
-// TestLoadFromEnv_SetAndPresent walks the new path: a valid
-// base64-encoded JSON config in $WEZSESH_CONFIG_JSON_BASE64 round-trips
-// through LoadFromEnv and surfaces the field values to the caller.
-func TestLoadFromEnv_SetAndPresent(t *testing.T) {
-	clearConfigEnv(t)
-	body := minimalConfigJSON(t, map[string]any{"snapshot_dir": "/from-env"})
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
-	cfg, err := LoadFromEnv(context.Background())
+	cfg, err := LoadFromBootstrapData(context.Background(), data)
 	if err != nil {
-		t.Fatalf("LoadFromEnv: %v", err)
+		t.Fatalf("LoadFromBootstrapData: %v", err)
 	}
-	if cfg.SnapshotDir != "/from-env" {
-		t.Errorf("SnapshotDir=%q, want /from-env", cfg.SnapshotDir)
+	if cfg.SnapshotDir != "/sd" {
+		t.Errorf("SnapshotDir=%q, want /sd", cfg.SnapshotDir)
 	}
-}
-
-// TestLoadFromEnvJSONBase64_NoEnvReturnsErrNoConfigEnv is a sentinel
-// check on the explicit base64 loader: when the env var is unset, the
-// caller (cmd/wezsesh:tuiSetup) must be able to distinguish "no config
-// env present" from "config env present but malformed" via
-// errors.Is(err, ErrNoConfigEnv). The general LoadFromEnv falls back to
-// AutoDetect on this sentinel; the TUI startup path treats it as a
-// hard refuse.
-func TestLoadFromEnvJSONBase64_NoEnvReturnsErrNoConfigEnv(t *testing.T) {
-	clearConfigEnv(t)
-	_, err := LoadFromEnvJSONBase64(context.Background())
-	if !errors.Is(err, ErrNoConfigEnv) {
-		t.Fatalf("got %v, want ErrNoConfigEnv", err)
+	if cfg.StateDir != "/st" {
+		t.Errorf("StateDir=%q, want /st", cfg.StateDir)
+	}
+	if cfg.LogLevel != "warn" {
+		t.Errorf("LogLevel=%q, want warn", cfg.LogLevel)
+	}
+	if cfg.Preview.Width != 40 {
+		t.Errorf("Preview.Width=%d, want 40", cfg.Preview.Width)
+	}
+	// TrustDir is derived from DataDir + "allow" by applyEnvOverrides.
+	if cfg.TrustDir != filepath.Join("/dd", "allow") {
+		t.Errorf("TrustDir=%q, want /dd/allow", cfg.TrustDir)
 	}
 }
 
-// TestLoadFromEnvJSONBase64_GoodConfig walks the explicit loader's
-// happy path: a valid base64-encoded JSON config decodes, parses,
-// and round-trips its fields.
-func TestLoadFromEnvJSONBase64_GoodConfig(t *testing.T) {
-	clearConfigEnv(t)
-	body := minimalConfigJSON(t, map[string]any{"state_dir": "/from-env-state"})
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
-	cfg, err := LoadFromEnvJSONBase64(context.Background())
-	if err != nil {
-		t.Fatalf("LoadFromEnvJSONBase64: %v", err)
-	}
-	if cfg.StateDir != "/from-env-state" {
-		t.Errorf("StateDir=%q, want /from-env-state", cfg.StateDir)
-	}
-}
-
-// TestLoadFromEnvJSONBase64_BadJSON walks the loader's bad-JSON path.
-// Base64 valid + JSON invalid → loud error (no silent fall-through).
-func TestLoadFromEnvJSONBase64_BadJSON(t *testing.T) {
-	clearConfigEnv(t)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString([]byte("{not-json")))
-	_, err := LoadFromEnvJSONBase64(context.Background())
+// TestLoadFromBootstrapData_NilRejected — a nil data map is a
+// programming error (the caller should have surfaced an upstream
+// failure), and we want a loud error here rather than silently
+// returning a default Config.
+func TestLoadFromBootstrapData_NilRejected(t *testing.T) {
+	_, err := LoadFromBootstrapData(context.Background(), nil)
 	if err == nil {
-		t.Fatal("LoadFromEnvJSONBase64 with bad JSON: want error, got nil")
+		t.Fatal("LoadFromBootstrapData(nil): want error, got nil")
 	}
 }
 
@@ -834,12 +810,6 @@ func TestAutoDetectFor_Defaults(t *testing.T) {
 	}
 	if cfg.Hooks.TimeoutSeconds != 600 {
 		t.Errorf("Hooks.TimeoutSeconds=%d, want 600", cfg.Hooks.TimeoutSeconds)
-	}
-	if cfg.ProtoVersion != 1 {
-		t.Errorf("ProtoVersion=%d, want 1", cfg.ProtoVersion)
-	}
-	if cfg.Version != 1 {
-		t.Errorf("Version=%d, want 1 (§10.7 schema version)", cfg.Version)
 	}
 	if len(cfg.Exclude) != 1 || cfg.Exclude[0] != "^default$" {
 		t.Errorf("Exclude=%v, want [\"^default$\"]", cfg.Exclude)

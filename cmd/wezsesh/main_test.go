@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -35,6 +34,37 @@ import (
 	"github.com/Grady-Saccullo/wezsesh/internal/uservar"
 	"github.com/Grady-Saccullo/wezsesh/internal/wezcli"
 )
+
+// testBinarySessionID is the deterministic 26-char ULID supplied to
+// run() / runTUI() / tuiSetup() / logger.New() in package-local tests.
+// Production main() mints a fresh ULID per process via
+// ipcdispatcher.NewULID; tests pin a known value so log records and
+// outgoing envelopes carry a reproducible binary_session_id.
+const testBinarySessionID = "01JABCDEFGHJKMNPQRSTVWXYZB"
+
+// fakeBootstrapCfg returns a bootstrapFetcher that yields the given
+// *config.Config. Used by TUI integration tests to bypass the live
+// IPC bootstrap roundtrip — the live path requires a running wezterm
+// plugin to produce the reply.
+func fakeBootstrapCfg(cfg *config.Config) bootstrapFetcher {
+	return func(_ context.Context, _ ipc.Dispatcher) (*config.Config, error) {
+		return cfg, nil
+	}
+}
+
+// requireTTY skips the test when /dev/tty isn't available. The TUI
+// startup path constructs uservar.Writer (which opens /dev/tty) before
+// any user-supplied path is exercised, so tests that drive the full
+// startup sequence cannot run in CI environments without a controlling
+// terminal. Mirrors the convention in internal/uservar/writer_test.go.
+func requireTTY(t *testing.T) {
+	t.Helper()
+	probe, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("/dev/tty not available in this environment: %v", err)
+	}
+	_ = probe.Close()
+}
 
 // TestMain implements the subprocess re-exec dance used by
 // TestSave_FlockSerialisation: when invoked with WEZSESH_TEST_LOCK_HOLDER
@@ -235,7 +265,7 @@ func newSaveDeps(t *testing.T, disp ipc.Dispatcher) (saveDeps, *snapshots.Repo, 
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		t.Fatalf("mkdir log: %v", err)
 	}
-	lg, err := logger.New(logDir, logger.LevelError)
+	lg, err := logger.New(logDir, logger.LevelError, testBinarySessionID)
 	if err != nil {
 		t.Fatalf("logger.New: %v", err)
 	}
@@ -346,7 +376,7 @@ func TestParseArgs_PaneIDOverride(t *testing.T) {
 
 func TestRun_VersionPrints(t *testing.T) {
 	var out, errBuf strings.Builder
-	rc := run([]string{"--version"}, &out, &errBuf)
+	rc := run([]string{"--version"}, &out, &errBuf, testBinarySessionID)
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d", rc, exitOK)
 	}
@@ -356,35 +386,26 @@ func TestRun_VersionPrints(t *testing.T) {
 }
 
 // TestRun_DoctorRouteReachesSubcmd asserts the `doctor` route in run()
-// dispatches to subcmdDoctor (T-808). With WEZSESH_CONFIG_JSON_BASE64
-// set to malformed base64, subcmdDoctor's config.LoadFromEnv path
-// returns a deterministic error; the stderr surface carries the
-// "wezsesh doctor:" prefix on the failure branch which proves the
-// route is wired.
-//
-// T-801..T-807 implement keygen / reply / list / find / trust / reset
-// (with the deprecated `nuke` alias); T-808 implements doctor. The
-// stub-routing assertion that lived here previously is therefore
-// obsolete — no subcommand returns errSubcmdNotImplemented anymore.
+// dispatches to subcmdDoctor (T-808). We seed valid env via
+// newDoctorTestEnv; doctor returns 0 (clean) or exitDoctorOrSubcmd (2,
+// findings present) depending on the host's auto-detected paths —
+// either is fine, the route reached the subcommand.
 func TestRun_DoctorRouteReachesSubcmd(t *testing.T) {
-	// Pin WEZSESH_CONFIG_JSON_BASE64 to malformed base64 so subcmdDoctor's
-	// config.LoadFromEnv path returns a deterministic error and we can
-	// assert the subcommand prefix without depending on AutoDetect's
-	// host-specific behaviour.
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
+	newDoctorTestEnv(t)
 	var out, errBuf strings.Builder
-	rc := run([]string{"doctor"}, &out, &errBuf)
-	if rc != exitDoctorOrSubcmd {
-		t.Fatalf("rc = %d, want %d", rc, exitDoctorOrSubcmd)
+	rc := run([]string{"doctor"}, &out, &errBuf, testBinarySessionID)
+	if rc != 0 && rc != exitDoctorOrSubcmd {
+		t.Fatalf("rc = %d, want 0 or %d; stderr=%q",
+			rc, exitDoctorOrSubcmd, errBuf.String())
 	}
-	if !strings.Contains(errBuf.String(), "wezsesh doctor:") {
-		t.Fatalf("stderr missing 'wezsesh doctor:' prefix: %q", errBuf.String())
+	if out.Len() == 0 {
+		t.Fatalf("expected non-empty stdout from doctor")
 	}
 }
 
 func TestRun_UnknownSubcommand(t *testing.T) {
 	var out, errBuf strings.Builder
-	rc := run([]string{"frobulate"}, &out, &errBuf)
+	rc := run([]string{"frobulate"}, &out, &errBuf, testBinarySessionID)
 	if rc != exitDoctorOrSubcmd {
 		t.Fatalf("rc = %d, want %d", rc, exitDoctorOrSubcmd)
 	}
@@ -443,60 +464,26 @@ func TestResolvePaneID_RejectsNonNumeric(t *testing.T) {
 
 func TestTuiSetup_RejectsBadHMACKey(t *testing.T) {
 	_, err := tuiSetup(parsedFlags{paneID: 1}, func(k string) string {
-		switch k {
-		case "WEZSESH_HMAC_KEY":
+		if k == "WEZSESH_HMAC_KEY" {
 			return "not-hex"
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			// Any non-empty value is fine — we want HMAC validation to
-			// fire BEFORE the config-env check.
-			return "Zm9v"
 		}
 		return ""
-	})
+	}, testBinarySessionID, fakeBootstrapCfg(nil))
 	if !errors.Is(err, errBadHMACKey) {
 		t.Fatalf("got %v, want errBadHMACKey", err)
 	}
 }
 
-func TestTuiSetup_RejectsMissingConfigEnv(t *testing.T) {
+func TestTuiSetup_RejectsMissingRuntimeDir(t *testing.T) {
 	good := strings.Repeat("a", 64)
 	_, err := tuiSetup(parsedFlags{paneID: 1}, func(k string) string {
 		if k == "WEZSESH_HMAC_KEY" {
 			return good
 		}
 		return ""
-	})
-	if err == nil || !strings.Contains(err.Error(), "WEZSESH_CONFIG_JSON_BASE64") {
-		t.Fatalf("got %v, want config-env error", err)
-	}
-}
-
-// TestTuiSetup_RejectsMalformedBase64 confirms that a bogus
-// $WEZSESH_CONFIG_JSON_BASE64 value surfaces a loud error rather than
-// silent-corrupting the loaded Config. This also documents that the
-// base64 path participates in the same fail-loud discipline as the
-// previous path's missing-file branch.
-func TestTuiSetup_RejectsMalformedBase64(t *testing.T) {
-	good := strings.Repeat("a", 64)
-	// The presence-check seam in tuiSetup uses `getEnv`; the loader
-	// inside config.LoadFromEnvJSONBase64 reads `os.Getenv` directly,
-	// so we MUST pin the real env var via t.Setenv to exercise the
-	// real loader path rather than the early presence check.
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
-	_, err := tuiSetup(parsedFlags{paneID: 1}, func(k string) string {
-		switch k {
-		case "WEZSESH_HMAC_KEY":
-			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return os.Getenv("WEZSESH_CONFIG_JSON_BASE64")
-		}
-		return ""
-	})
-	if err == nil {
-		t.Fatalf("expected loud error for malformed base64; got nil")
-	}
-	if !strings.Contains(err.Error(), "base64") {
-		t.Fatalf("got %v, want error mentioning base64", err)
+	}, testBinarySessionID, fakeBootstrapCfg(nil))
+	if !errors.Is(err, errMissingRuntimeDir) {
+		t.Fatalf("got %v, want errMissingRuntimeDir", err)
 	}
 }
 
@@ -557,8 +544,8 @@ func TestScrubHookEnv_DropsSensitive_KeepsLog(t *testing.T) {
 		"PATH=/usr/bin",
 		"WEZSESH_LOG=debug",
 		"WEZSESH_HMAC_KEY=secret",
-		"WEZSESH_PROTO_VERSION=1",
-		"WEZSESH_CONFIG_JSON_BASE64=eyJ2ZXJzaW9uIjoxfQ==",
+		"WEZSESH_RUNTIME_DIR=/tmp/wezsesh",
+		"WEZSESH_PLUGIN_VERSION=0.1.0",
 		"WEZSESH_NO_HOOKS=0",
 		"HOME=/home/me",
 	}
@@ -574,12 +561,15 @@ func TestScrubHookEnv_DropsSensitive_KeepsLog(t *testing.T) {
 		return false
 	}
 
-	for _, drop := range []string{"WEZSESH_HMAC_KEY=", "WEZSESH_PROTO_VERSION=", "WEZSESH_CONFIG_JSON_BASE64="} {
-		if has(drop) {
-			t.Errorf("scrubHookEnv kept %q (must be dropped)", drop)
-		}
+	if has("WEZSESH_HMAC_KEY=") {
+		t.Errorf("scrubHookEnv kept WEZSESH_HMAC_KEY (must be dropped)")
 	}
-	for _, keep := range []string{"WEZSESH_LOG=", "WEZSESH_NO_HOOKS=", "PATH=", "HOME="} {
+	// WEZSESH_RUNTIME_DIR + WEZSESH_PLUGIN_VERSION are non-secret
+	// (path / metadata) and MUST flow through to user hooks.
+	for _, keep := range []string{
+		"WEZSESH_LOG=", "WEZSESH_NO_HOOKS=", "PATH=", "HOME=",
+		"WEZSESH_RUNTIME_DIR=", "WEZSESH_PLUGIN_VERSION=",
+	} {
 		if !has(keep) {
 			t.Errorf("scrubHookEnv dropped %q (must be kept)", keep)
 		}
@@ -925,7 +915,7 @@ func TestRunTUI_PanicRecover_LogsAndExitsTwo(t *testing.T) {
 	t.Cleanup(func() { runTUIPanicHook = prev })
 
 	var stdout, stderr strings.Builder
-	rc := runTUI(parsedFlags{paneID: 1}, &stdout, &stderr)
+	rc := runTUI(parsedFlags{paneID: 1}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitUnexpected {
 		t.Fatalf("rc = %d, want %d", rc, exitUnexpected)
 	}
@@ -968,6 +958,7 @@ func TestRunTUI_PanicRecoverCallsEmergencyReply(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────
 
 func TestTuiSetup_SymlinkRefuseOnManagedDir(t *testing.T) {
+	requireTTY(t)
 	tmp := t.TempDir()
 	realDir := filepath.Join(tmp, "real-state")
 	if err := os.MkdirAll(realDir, 0o700); err != nil {
@@ -977,21 +968,25 @@ func TestTuiSetup_SymlinkRefuseOnManagedDir(t *testing.T) {
 	if err := os.Symlink(realDir, stateLink); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), stateLink, filepath.Join(tmp, "rt"), filepath.Join(tmp, "data"))
-	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	rtDir := filepath.Join(tmp, "rt")
+	cfg := &config.Config{
+		SnapshotDir: filepath.Join(tmp, "snap"),
+		StateDir:    stateLink,
+		RuntimeDir:  rtDir,
+		DataDir:     filepath.Join(tmp, "data"),
+		LogLevel:    "info",
+	}
 	good := strings.Repeat("a", 64)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return configB64
+		case "WEZSESH_RUNTIME_DIR":
+			return rtDir
 		}
 		return ""
 	}
-	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv, testBinarySessionID, fakeBootstrapCfg(cfg))
 	if err == nil {
 		t.Fatalf("expected symlink-refuse error")
 	}
@@ -1007,6 +1002,7 @@ func TestTuiSetup_SymlinkRefuseOnManagedDir(t *testing.T) {
 // defense; this test pins the startup-time refuse (closes the
 // startup-to-first-use plant window).
 func TestTuiSetup_SymlinkRefuseOnDataDir(t *testing.T) {
+	requireTTY(t)
 	tmp := t.TempDir()
 	real := filepath.Join(tmp, "real-data")
 	if err := os.MkdirAll(real, 0o700); err != nil {
@@ -1016,21 +1012,25 @@ func TestTuiSetup_SymlinkRefuseOnDataDir(t *testing.T) {
 	if err := os.Symlink(real, dataLink); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"), dataLink)
-	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	rtDir := filepath.Join(tmp, "rt")
+	cfg := &config.Config{
+		SnapshotDir: filepath.Join(tmp, "snap"),
+		StateDir:    filepath.Join(tmp, "state"),
+		RuntimeDir:  rtDir,
+		DataDir:     dataLink,
+		LogLevel:    "info",
+	}
 	good := strings.Repeat("a", 64)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return configB64
+		case "WEZSESH_RUNTIME_DIR":
+			return rtDir
 		}
 		return ""
 	}
-	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv, testBinarySessionID, fakeBootstrapCfg(cfg))
 	if err == nil {
 		t.Fatalf("expected symlink-refuse error on data dir")
 	}
@@ -1044,6 +1044,7 @@ func TestTuiSetup_SymlinkRefuseOnDataDir(t *testing.T) {
 // dir as a symlink is the planted-symlink primitive an attacker
 // uses to redirect later trust.Approve writes.
 func TestTuiSetup_SymlinkRefuseOnAllowDir(t *testing.T) {
+	requireTTY(t)
 	tmp := t.TempDir()
 	dataDir := filepath.Join(tmp, "data")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -1056,21 +1057,25 @@ func TestTuiSetup_SymlinkRefuseOnAllowDir(t *testing.T) {
 	if err := os.Symlink(realAllow, filepath.Join(dataDir, "allow")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"), dataDir)
-	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	rtDir := filepath.Join(tmp, "rt")
+	cfg := &config.Config{
+		SnapshotDir: filepath.Join(tmp, "snap"),
+		StateDir:    filepath.Join(tmp, "state"),
+		RuntimeDir:  rtDir,
+		DataDir:     dataDir,
+		LogLevel:    "info",
+	}
 	good := strings.Repeat("a", 64)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return configB64
+		case "WEZSESH_RUNTIME_DIR":
+			return rtDir
 		}
 		return ""
 	}
-	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv, testBinarySessionID, fakeBootstrapCfg(cfg))
 	if err == nil {
 		t.Fatalf("expected symlink-refuse error on allow/")
 	}
@@ -1084,6 +1089,7 @@ func TestTuiSetup_SymlinkRefuseOnAllowDir(t *testing.T) {
 // request file is written. Plugin's request files would otherwise
 // land at attacker-chosen paths.
 func TestTuiSetup_SymlinkRefuseOnReqDir(t *testing.T) {
+	requireTTY(t)
 	tmp := t.TempDir()
 	rtDir := filepath.Join(tmp, "rt")
 	if err := os.MkdirAll(rtDir, 0o700); err != nil {
@@ -1096,26 +1102,36 @@ func TestTuiSetup_SymlinkRefuseOnReqDir(t *testing.T) {
 	if err := os.Symlink(realReq, filepath.Join(rtDir, "req")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"data_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), rtDir, filepath.Join(tmp, "data"))
-	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	cfg := &config.Config{
+		SnapshotDir: filepath.Join(tmp, "snap"),
+		StateDir:    filepath.Join(tmp, "state"),
+		RuntimeDir:  rtDir,
+		DataDir:     filepath.Join(tmp, "data"),
+		LogLevel:    "info",
+	}
 	good := strings.Repeat("a", 64)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return configB64
+		case "WEZSESH_RUNTIME_DIR":
+			return rtDir
 		}
 		return ""
 	}
-	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	_, err := tuiSetup(parsedFlags{paneID: 1}, getEnv, testBinarySessionID, fakeBootstrapCfg(cfg))
 	if err == nil {
 		t.Fatalf("expected symlink-refuse error on req/")
 	}
-	if !strings.Contains(err.Error(), "safefs enforce") {
-		t.Errorf("error should mention safefs enforce, got %v", err)
+	// Under C3 the dispatcher is constructed BEFORE bootstrap so the
+	// req/ symlink is rejected by ipcdispatcher.New itself; the error
+	// surface is "ipc init: …" rather than "safefs enforce …", but
+	// the underlying refuse is the same. Tolerate both.
+	if !(strings.Contains(err.Error(), "safefs enforce") ||
+		strings.Contains(err.Error(), "ipc init") ||
+		strings.Contains(err.Error(), "symlink") ||
+		strings.Contains(err.Error(), "req dir")) {
+		t.Errorf("error should mention safefs enforce / req dir / symlink, got %v", err)
 	}
 }
 
@@ -1129,18 +1145,22 @@ func TestTuiSetup_SymlinkRefuseOnReqDir(t *testing.T) {
 // here, even when the test does not get far enough to actually
 // exercise the entire startup sequence.
 func TestTuiSetup_NoTmpFileLeak(t *testing.T) {
+	requireTTY(t)
 	tmp := t.TempDir()
-	body := fmt.Sprintf(`{"version":1,"snapshot_dir":%q,"state_dir":%q,"runtime_dir":%q,"log_level":"info"}`,
-		filepath.Join(tmp, "snap"), filepath.Join(tmp, "state"), filepath.Join(tmp, "rt"))
-	configB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	rtDir := filepath.Join(tmp, "rt")
+	cfg := &config.Config{
+		SnapshotDir: filepath.Join(tmp, "snap"),
+		StateDir:    filepath.Join(tmp, "state"),
+		RuntimeDir:  rtDir,
+		LogLevel:    "info",
+	}
 	good := strings.Repeat("a", 64)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", configB64)
 	getEnv := func(k string) string {
 		switch k {
 		case "WEZSESH_HMAC_KEY":
 			return good
-		case "WEZSESH_CONFIG_JSON_BASE64":
-			return configB64
+		case "WEZSESH_RUNTIME_DIR":
+			return rtDir
 		}
 		return ""
 	}
@@ -1159,7 +1179,7 @@ func TestTuiSetup_NoTmpFileLeak(t *testing.T) {
 			beforeFiles[filepath.Join(d, e.Name())] = true
 		}
 	}
-	_, _ = tuiSetup(parsedFlags{paneID: 1}, getEnv)
+	_, _ = tuiSetup(parsedFlags{paneID: 1}, getEnv, testBinarySessionID, fakeBootstrapCfg(cfg))
 	for _, d := range tmpdirs {
 		if d == "" {
 			continue
@@ -1233,7 +1253,7 @@ func TestBuildTUIConfig_NarrowsConfigSlice(t *testing.T) {
 	}
 	cfg.Markers.Active = "▶"
 	cfg.Preview.Enabled = true
-	cfg.Preview.Width = 0.4
+	cfg.Preview.Width = 40
 	out := buildTUIConfig(cfg)
 	if string(out.Sort) != "live_first" {
 		t.Errorf("Sort = %q", out.Sort)

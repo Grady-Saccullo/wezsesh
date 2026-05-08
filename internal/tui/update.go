@@ -11,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Grady-Saccullo/wezsesh/internal/canonicaljson"
+	"github.com/Grady-Saccullo/wezsesh/internal/dirproviders"
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
 	"github.com/Grady-Saccullo/wezsesh/internal/nameval"
 )
@@ -24,13 +25,15 @@ var dispatchSeqCounter uint64
 // verbExitsOnSuccess returns true for verbs whose successful terminal
 // reply ends the picker's purpose: the user has navigated away and the
 // TUI tab is now in the way. The remaining verbs (`save`, `delete`,
-// `rename`, `new`, `list_dirs`, etc.) keep the picker open so the user
-// can do more work. `new` deliberately stays open: the binary spawns
-// the workspace without switching the active client into it, and the
-// picker re-surfaces the freshly-created row with the cursor on it so
-// the user can decide whether to switch (`s`) or stay. `list_dirs` is
-// a startup data fetch — its reply trickles external rows into the
-// picker, never quits.
+// `rename`, `new`, etc.) keep the picker open so the user can do more
+// work. `new` deliberately stays open: the binary spawns the workspace
+// without switching the active client into it, and the picker
+// re-surfaces the freshly-created row with the cursor on it so the
+// user can decide whether to switch (`s`) or stay.
+//
+// External dir-provider rows now flow via dirProvidersResultMsg
+// (handled separately at the top of Update) rather than through the
+// reply channel; that path bypasses verbExitsOnSuccess entirely.
 func verbExitsOnSuccess(verb string) bool {
 	switch verb {
 	case "switch", "load":
@@ -39,13 +42,44 @@ func verbExitsOnSuccess(verb string) bool {
 	return false
 }
 
-// Init satisfies tea.Model. Fires the startup `list_dirs` dispatch so
-// the picker can surface external (provider-supplied) rows alongside
-// live + saved entries. The reply is merged into m.rows by the
-// list_dirs branch in Update; failures degrade to "no external rows"
-// without blocking the picker.
+// Init satisfies tea.Model. Fires a tea.Cmd that runs the user's
+// declarative dir-providers (carried in m.data.DirProviders) and
+// merges the resulting rows into m.rows via applyExternalDirs.
+//
+// Replaces the prior `list_dirs` IPC dispatch: dir-provider configs
+// now flow over the bootstrap reply and execute natively in the Go
+// binary's `internal/dirproviders` package — no Lua roundtrip. The
+// command goroutine is bounded by each command-provider's
+// timeout_ms and the directoryWalkCeiling, so a misbehaving
+// provider can't wedge startup.
+//
+// Empty / nil DirProviders → returns nil (no rows merged); the
+// picker still renders live + saved entries via initialData.
 func (m *Model) Init() tea.Cmd {
-	return m.startDispatch("list_dirs", "", map[string]any{"query": ""})
+	if len(m.data.DirProviders) == 0 {
+		return nil
+	}
+	return m.runDirProviders(m.data.DirProviders)
+}
+
+// dirProvidersResultMsg carries the pre-validated rows produced by
+// dirproviders.RunAll. The Update handler merges them via
+// applyExternalDirs.
+type dirProvidersResultMsg struct {
+	rows []dirproviders.ExternalRow
+}
+
+// runDirProviders returns a tea.Cmd that executes the configs in a
+// goroutine and emits a dirProvidersResultMsg on completion.
+// dirproviders.RunAll already isolates per-provider failures; we
+// don't surface an error path here (failures already log warn).
+func (m *Model) runDirProviders(configs []dirproviders.Config) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		rows := dirproviders.RunAll(ctx, configs, m.log)
+		return dirProvidersResultMsg{rows: rows}
+	}
 }
 
 // Update handles every tea.Msg. The function is intentionally large but
@@ -61,6 +95,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+
+	case dirProvidersResultMsg:
+		// Merge the natively-executed dir-provider rows into m.rows.
+		// Failures are already logged at warn inside dirproviders;
+		// here we just convert to the map[string]any shape that
+		// applyExternalDirs consumes.
+		if len(msg.rows) == 0 {
+			return m, nil
+		}
+		entries := make([]map[string]any, 0, len(msg.rows))
+		for _, r := range msg.rows {
+			entries = append(entries, map[string]any{
+				"path": r.Path,
+				"name": r.Name,
+			})
+		}
+		m.applyExternalDirs(entries)
+		return m, nil
 
 	case dispatchStartedMsg:
 		// dispatchStartedMsg is the synchronous result of the Cmd that
@@ -127,17 +179,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				newName = v
 			}
 		}
-		var dirRows []map[string]any
-		if verb == "list_dirs" && msg.reply.OK {
-			if raw, ok := msg.reply.Data["dirs"].([]any); ok {
-				for _, e := range raw {
-					if entry, ok := e.(map[string]any); ok {
-						dirRows = append(dirRows, entry)
-					}
-				}
-			}
-		}
-
 		autoQuit := msg.reply.OK && verbExitsOnSuccess(verb)
 		m.finishOp(status)
 		if autoQuit {
@@ -148,9 +189,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if newName != "" {
 			m.applyNewWorkspace(newName)
-		}
-		if verb == "list_dirs" && len(dirRows) > 0 {
-			m.applyExternalDirs(dirRows)
 		}
 		// Continue reading until the channel closes so we observe the
 		// drain goroutine's clean-up; the dispatcher closes the channel

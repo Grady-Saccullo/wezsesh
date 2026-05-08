@@ -124,7 +124,6 @@ func autoRuntimeDir(goos string, env func(string) string, uid int) string {
 // dirs and then call compileExclude.
 func defaultConfig() *Config {
 	cfg := &Config{
-		Version:                   1,
 		LogLevel:                  "info",
 		Sort:                      "live_first",
 		DefaultAction:             "switch",
@@ -144,10 +143,9 @@ func defaultConfig() *Config {
 		ResurrectArgvAllowlist: []string{},
 		Keys:                   defaultKeyMap(),
 		PluginVersion:          "0.1.0",
-		ProtoVersion:           1,
 	}
 	cfg.Preview.Enabled = true
-	cfg.Preview.Width = 0.4
+	cfg.Preview.Width = 40
 	cfg.Hooks.RunHooks = true
 	cfg.Hooks.PromptOnUntrusted = false
 	cfg.Hooks.TimeoutSeconds = 600

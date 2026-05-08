@@ -57,6 +57,16 @@ local M = {}
 -- (better to land in the new workspace partially activated than to
 -- regress the whole restore).
 function M.load_and_restore(payload, name, data_factory, restore_opts, after_restore)
+    -- Capture trace context up front: resurrect.workspace_state
+    -- .restore_workspace and the after_restore callback can re-enter
+    -- wezterm's event loop (spawn_window, set_active_workspace), and
+    -- the active-trace bucket is cleared by ipc.lua step (i)'s wrapper
+    -- once `verbs.dispatch` returns. The diagnostic log lines below
+    -- close over these locals so they emit with full trace correlation
+    -- even if the call sequence ends up crossing an event-loop tick.
+    local trace_id          = payload and payload.id
+    local binary_session_id = payload and payload.binary_session_id
+
     local resurrect = deps.resurrect()
     if resurrect == nil
        or type(resurrect.workspace_state) ~= "table"
@@ -144,7 +154,8 @@ function M.load_and_restore(payload, name, data_factory, restore_opts, after_res
         tostring(opts.relative),
         tostring(opts.restore_text),
         (type(state) == "table" and type(state.window_states) == "table")
-            and #state.window_states or -1))
+            and #state.window_states or -1),
+        { trace_id = trace_id, binary_session_id = binary_session_id })
 
     local ok_restore, _, captured_restore = deps.with_capture(function()
         resurrect.workspace_state.restore_workspace(state, opts)
@@ -156,7 +167,8 @@ function M.load_and_restore(payload, name, data_factory, restore_opts, after_res
         (type(captured_restore) == "table") and #captured_restore or -1,
         (type(captured_restore) == "table" and captured_restore[1])
             and tostring(captured_restore[1]):sub(1, 200)
-            or "<none>"))
+            or "<none>"),
+        { trace_id = trace_id, binary_session_id = binary_session_id })
 
     -- after_restore fires on any non-error path (full success OR
     -- captured emissions = RESURRECT_PARTIAL). The intent — switch
@@ -168,7 +180,8 @@ function M.load_and_restore(payload, name, data_factory, restore_opts, after_res
         local ok_after, after_err = pcall(after_restore)
         if not ok_after then
             log.warn("_restore: after_restore callback raised: "
-                .. tostring(after_err))
+                .. tostring(after_err),
+                { trace_id = trace_id, binary_session_id = binary_session_id })
         end
     end
 

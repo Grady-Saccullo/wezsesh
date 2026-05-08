@@ -16,6 +16,11 @@
 --      GLOBAL write or listener registration — otherwise re-init writes
 --      get nuked. Handles `wezterm.plugin.update_all()` cleanly with
 --      no migration logic.
+--   2b. Mint `plugin_session_id` (26-char ULID-shaped string) into
+--      `wezterm.GLOBAL.wezsesh_plugin_session_id`. Runs immediately
+--      after the wipe so the first log line in this boot already
+--      carries the id; re-minted on Ctrl+Shift+R reload (intentional —
+--      a reload IS a new logical session for tracing purposes).
 --   3. Install the persistent `resurrect.error` listener via
 --      `resurrect_error.register()` (backs `with_capture`'s side
 --      channel).
@@ -23,6 +28,16 @@
 --      (impossible-by-construction over the
 --      `snapshot.dir.matches.resurrect` doctor check).
 --   5. Validate `opts.runtime_dir` against the SUN_PATH ceiling.
+--   5b. Stash `runtime_dir` in
+--      `wezterm.GLOBAL.wezsesh_runtime_dir` so `runtime/log.lua` can
+--      append structured records to `<runtime_dir>/plugin.log`
+--      without each caller threading the path through.
+--   5c. Resolve the log level locally (symmetric with Go-side
+--      `logger.ResolveLevel`) via
+--      `runtime.log.resolve_level(opts.log_level, $WEZSESH_LOG)` and
+--      stamp it via `globals.set_log_level` so `runtime/log.lua` can
+--      gate record emission at the same threshold the Go side uses.
+--      Default "info" when both inputs are nil / invalid.
 --   6. Generate / fetch the HMAC session key into
 --      `wezterm.GLOBAL.wezsesh_session_key`.
 --   7. Register the `user-var-changed` handler via `ipc.register{...}`.
@@ -161,6 +176,17 @@ function M.apply_to_config(config, opts)
         -- M.VERSION).
         globals.wipe_on_version_mismatch(M.VERSION)
 
+        -- Step 2b — Mint the plugin_session_id. Runs immediately after
+        -- the wipe so the very first log line (any module loaded
+        -- below) already carries the id. Re-minted on Ctrl+Shift+R
+        -- reload because the cache-bust loop above wiped this module
+        -- AND the cross-version wipe nuked the previous stamp; that's
+        -- the intended semantics — a hot reload IS a new logical
+        -- session. Best-effort uniqueness: ulid.mint is NOT
+        -- cryptographic, just shaped like a ULID for grep-friendliness.
+        local ulid = require("wezsesh.crypto.ulid")
+        globals.set_plugin_session_id(ulid.mint())
+
         -- Step 3 — Install the persistent `resurrect.error` listener.
         -- Idempotent within a single Lua state via the `_G` install gate
         -- in `resurrect_error.lua`; cleanly re-armed on reload because
@@ -212,6 +238,16 @@ function M.apply_to_config(config, opts)
         local dir_providers = require("wezsesh.runtime.dir_providers")
         dir_providers.set(opts.dir_providers or {})
 
+        -- Step 4d — Compute and stash the bootstrap reply body. The
+        -- `bootstrap` IPC verb (called by the Go binary at TUI startup)
+        -- reads this stash and echoes it as the reply data. We compute
+        -- the body once here (when `opts` is in scope) so the dispatch
+        -- is a constant-return; mirrors the dir_providers stash idiom.
+        -- Hoisted `local manager` to here (step 5 reuses it).
+        local manager = require("wezsesh.manager")
+        local bootstrap_body = require("wezsesh.runtime.bootstrap_body")
+        bootstrap_body.set(manager.build_bootstrap_body(opts))
+
         -- Step 4c — Build the on_pane_restore argv-allowlist policy and
         -- install it via `on_pane_restore.configure`. Until this runs,
         -- the module's default policy denies every program (fail-CLOSED),
@@ -259,9 +295,30 @@ function M.apply_to_config(config, opts)
 
         -- Step 5 — Validate runtime_dir SUN_PATH budget. May raise
         -- WEZSESH_RUNTIME_DIR_TYPE / WEZSESH_SUN_PATH_OVERFLOW. Caught
-        -- by the outer pcall.
-        local manager = require("wezsesh.manager")
+        -- by the outer pcall. (`manager` was hoisted in step 4d above.)
         manager.validate_runtime_dir(opts)
+
+        -- Step 5b — Stash the runtime_dir for downstream consumers
+        -- (runtime/log appends to <runtime_dir>/plugin.log). The path
+        -- has just been validated against the SUN_PATH ceiling AND
+        -- the binary side runs `manager.validate_runtime_dir` /
+        -- `safefs.Enforce` on it before the binary spawns, so it is
+        -- safe to write through without re-running symlink checks
+        -- here. Falls through to the `/tmp/wezsesh` default when the
+        -- user didn't pin a path — same default as ipc.register below.
+        globals.set_runtime_dir(opts.runtime_dir or "/tmp/wezsesh")
+
+        -- Step 5c — Resolve the log level locally (symmetric with the
+        -- Go side's `logger.ResolveLevel`). Both sides see the same
+        -- parent env at wezterm-launch time, so the resolved level
+        -- matches without any disk-sidecar coordination. Algorithm:
+        -- the more verbose (lower-numeric) of `opts.log_level` and
+        -- `$WEZSESH_LOG`. Unrecognised inputs fall through to "info"
+        -- — same default as the Go side's parseLevel.
+        local log_runtime = require("wezsesh.runtime.log")
+        globals.set_log_level(
+            log_runtime.resolve_level(opts.log_level, os.getenv("WEZSESH_LOG"))
+        )
 
         -- Step 6 — Resolve the binary's absolute path and ensure the
         -- HMAC session key is populated in wezterm.GLOBAL via

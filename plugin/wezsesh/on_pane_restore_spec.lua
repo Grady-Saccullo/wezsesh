@@ -37,12 +37,32 @@ package.path = script_dir() .. "/?.lua;"
 
 local log_calls = { warn = {}, error = {} }
 
+-- Snapshot-on-read GLOBAL proxy. runtime/log.lua now requires
+-- runtime/state.lua and runtime/globals.lua, both of which touch
+-- wezterm.GLOBAL on every log emission. A missing GLOBAL surface here
+-- would crash the require chain.
+local helpers_for_shim = require("spec_helpers")
+local global_proxy = helpers_for_shim.make_global_proxy()
+
 local wezterm_shim = {
+    GLOBAL = global_proxy,
+    -- runtime/state.lua and runtime/log.lua call json_encode/json_parse
+    -- to round-trip the active-trace bucket and to encode the structured
+    -- log record. The codec from spec_helpers is shape-faithful.
+    json_encode = helpers_for_shim.make_json_codec().encode,
+    json_parse  = helpers_for_shim.make_json_codec().decode,
     log_warn = function(msg)
         log_calls.warn[#log_calls.warn + 1] = tostring(msg)
     end,
     log_error = function(msg)
         log_calls.error[#log_calls.error + 1] = tostring(msg)
+    end,
+    log_info = function(msg)
+        -- Some tests below assert against log_calls.warn for messages
+        -- that may now be emitted at info level if a future contributor
+        -- moves them. Capture into the same warn bucket so substring
+        -- matching keeps working.
+        log_calls.warn[#log_calls.warn + 1] = tostring(msg)
     end,
     -- Shim approximating wezterm.shell_quote_arg (which delegates to
     -- Rust's shlex::try_quote). Production uses wezterm's real impl;

@@ -319,7 +319,7 @@ func TestRun_ReplyRoute(t *testing.T) {
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"reply", sock, b64(validReplyJSON)}, &stdout, &stderr)
+	rc := run([]string{"reply", sock, b64(validReplyJSON)}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitOK, stderr.String())
 	}

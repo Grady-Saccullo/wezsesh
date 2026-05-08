@@ -98,6 +98,7 @@ local manager_calls = {
     resolve_binary       = {},
     ensure_session_key   = {},
     register_keybinding  = {},
+    build_bootstrap_body = {},
 }
 local manager_shim = {
     VERSION = "0.1.0",
@@ -130,6 +131,15 @@ local manager_shim = {
             #manager_calls.register_keybinding + 1] = {
             config = config, opts = deepcopy(opts),
         }
+    end,
+    -- Stubbed in init_spec because step 4d invokes it. Real
+    -- implementation lives in manager.lua; the stub records its
+    -- argument and returns an empty table — apply_to_config doesn't
+    -- inspect the return value, only stashes it.
+    build_bootstrap_body = function(opts)
+        manager_calls.build_bootstrap_body[
+            #manager_calls.build_bootstrap_body + 1] = deepcopy(opts)
+        return {}
     end,
 }
 
@@ -211,6 +221,7 @@ local function reset_state()
         resolve_binary       = {},
         ensure_session_key   = {},
         register_keybinding  = {},
+        build_bootstrap_body = {},
     }
     ipc_calls = { register = {} }
     resurrect_error_calls = { register = 0 }
@@ -248,6 +259,11 @@ local function reset_state()
             #manager_calls.register_keybinding + 1] = {
             config = config, opts = deepcopy(opts),
         }
+    end
+    manager_shim.build_bootstrap_body = function(opts)
+        manager_calls.build_bootstrap_body[
+            #manager_calls.build_bootstrap_body + 1] = deepcopy(opts)
+        return {}
     end
     manager_shim.VERSION = "0.1.0"
 
@@ -533,21 +549,22 @@ end)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("dir_providers stash", function()
-    it("opts.dir_providers is forwarded to runtime/dir_providers.set",
-    function()
-        local function p() return { { path = "/x", name = "x" } } end
-        init.apply_to_config({}, { dir_providers = { p } })
+    it("opts.dir_providers (declarative configs) is forwarded to "
+        .. "runtime/dir_providers.set", function()
+        local cfg = { type = "command", argv = { "zoxide", "query", "-l" } }
+        init.apply_to_config({}, { dir_providers = { cfg } })
         -- init.lua's cache-bust loop drops package.loaded[
-        -- "wezsesh.runtime.dir_providers"] on entry and re-requires
-        -- a fresh instance, so we MUST grab the post-call instance to
-        -- read the stashed list — a require() before apply_to_config
-        -- yields a different module table.
+        -- "wezsesh.runtime.dir_providers"] on entry and re-requires a
+        -- fresh instance, so we MUST grab the post-call instance to
+        -- read the stashed list.
         local dir_providers = require("wezsesh.runtime.dir_providers")
         local stashed = dir_providers.get()
         assert_eq(#stashed, 1,
             "expected exactly one stashed provider")
-        assert_true(stashed[1] == p,
-            "stashed provider identity not preserved")
+        assert_eq(stashed[1].type, "command",
+            "stashed config type not preserved")
+        assert_eq(stashed[1].argv[1], "zoxide",
+            "stashed config argv not preserved")
     end)
 
     it("absent opts.dir_providers normalises to empty list", function()

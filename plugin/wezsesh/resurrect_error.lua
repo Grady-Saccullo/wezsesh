@@ -70,6 +70,17 @@ local function on_resurrect_error(msg)
     if current_capture ~= nil then
         current_capture[#current_capture + 1] = s
     else
+        -- No trace correlation available by design: this branch fires
+        -- on `resurrect.error` emissions OUTSIDE of a `with_capture`
+        -- window — typically resurrect's `periodic_save` background
+        -- tick. There is no in-flight wezsesh request envelope (no
+        -- payload, no trace_id, no binary_session_id), and any
+        -- previous dispatch's active-trace bucket has long since been
+        -- cleared. We use `wezterm.log_warn` directly here (rather
+        -- than runtime/log.lua) to avoid coupling the resurrect-error
+        -- handler to the structured-log path; a `wezsesh tail`
+        -- consumer correlates these by timestamp + the diagnostic
+        -- ring instead.
         wezterm.log_warn("resurrect.error (uncaptured): " .. s)
         uncaptured_ring[#uncaptured_ring + 1] =
             { ts = os.time(), msg = s }

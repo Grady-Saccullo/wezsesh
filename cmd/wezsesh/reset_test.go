@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,10 +12,10 @@ import (
 )
 
 // resetTestEnv builds a self-contained config tree under t.TempDir().
-// Every dir wezsesh-managed is a subdir of dir so each test starts from
-// a clean slate. The config body is base64-encoded and pinned via
-// WEZSESH_CONFIG_JSON_BASE64 so subcmdReset's config.LoadFromEnv path
-// resolves to it.
+// Every dir wezsesh-managed is a subdir of dir so each test starts
+// from a clean slate. WEZSESH_*_DIR env overrides point AutoDetect +
+// applyEnvOverrides at the scratch tree (the env-blob transport is
+// gone post-bootstrap-cutover).
 type resetTestEnv struct {
 	dir         string
 	stateDir    string
@@ -28,10 +27,6 @@ type resetTestEnv struct {
 	workspace   string
 }
 
-// newResetTestEnv constructs the canonical layout. Each dir is created
-// with mode 0700 to match the live install. The config file written to
-// dir/wezsesh.json carries absolute paths so config.LoadFromEnv reads
-// them verbatim.
 func newResetTestEnv(t *testing.T) *resetTestEnv {
 	t.Helper()
 	dir := t.TempDir()
@@ -50,14 +45,10 @@ func newResetTestEnv(t *testing.T) *resetTestEnv {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
-	body := []byte(`{
-"version":1,
-"snapshot_dir":"` + env.snapshotDir + `",
-"state_dir":"` + env.stateDir + `",
-"runtime_dir":"` + env.runtimeDir + `",
-"data_dir":"` + env.dataDir + `"
-}`)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
+	t.Setenv("WEZSESH_SNAPSHOT_DIR", env.snapshotDir)
+	t.Setenv("WEZSESH_STATE_DIR", env.stateDir)
+	t.Setenv("WEZSESH_RUNTIME_DIR", env.runtimeDir)
+	t.Setenv("WEZSESH_DATA_DIR", env.dataDir)
 	// WEZTERM_PANE / HMAC key not consulted by reset; keep them empty.
 	t.Setenv("WEZTERM_PANE", "")
 	return env
@@ -453,7 +444,7 @@ func TestSubcmdReset_NukeAliasPrintsToast(t *testing.T) {
 func TestSubcmdReset_NukeAlias_Run(t *testing.T) {
 	_ = newResetTestEnv(t)
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"nuke", "--dry-run"}, &stdout, &stderr)
+	rc := run([]string{"nuke", "--dry-run"}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitOK, stderr.String())
 	}

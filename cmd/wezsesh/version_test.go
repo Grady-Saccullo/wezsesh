@@ -26,7 +26,7 @@ func TestRun_VersionFlag_PrintsLDFlagsValue(t *testing.T) {
 	version = "v1.2.3-test"
 
 	var stdout, stderr strings.Builder
-	rc := run([]string{"--version"}, &stdout, &stderr)
+	rc := run([]string{"--version"}, &stdout, &stderr, testBinarySessionID)
 
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitOK, stderr.String())

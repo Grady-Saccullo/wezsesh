@@ -89,6 +89,17 @@ function M.dispatch(payload, window, _pane)
     local name = args.name or ""
     local cwd  = args.cwd  or ""
 
+    -- Capture trace context for the after_restore closure below. The
+    -- `_restore.load_and_restore` callback runs after resurrect's
+    -- spawn-window storm; even when synchronous today, it crosses a
+    -- re-entrant boundary (mux.set_active_workspace can fire other
+    -- wezterm event-loop callbacks) and the active-trace bucket may
+    -- have been cleared by ipc.lua step (i)'s wrapper. Threading the
+    -- ids explicitly makes the post-restore log lines correlate with
+    -- the originating dispatch in `wezsesh tail`.
+    local trace_id          = payload and payload.id
+    local binary_session_id = payload and payload.binary_session_id
+
     -- Branch 1 — no-op: target is already the active workspace.
     local current = active_workspace(window)
     if current ~= nil and current == name then
@@ -174,7 +185,8 @@ function M.dispatch(payload, window, _pane)
         local log = require("wezsesh.runtime.log")
         log.warn(string.format(
             "switch: branch3 saved-not-live name=%q current=%q",
-            tostring(name), tostring(current)))
+            tostring(name), tostring(current)),
+            { trace_id = trace_id, binary_session_id = binary_session_id })
 
         local mux_for_switch = wezterm.mux
 
@@ -197,12 +209,18 @@ function M.dispatch(payload, window, _pane)
                                       name)
                 if not ok then
                     log.warn("switch: post-restore set_active_workspace "
-                        .. "failed: " .. tostring(err))
+                        .. "failed: " .. tostring(err), {
+                            trace_id          = trace_id,
+                            binary_session_id = binary_session_id,
+                        })
                 else
                     log.warn(string.format(
                         "switch: set_active_workspace -> %q (wezterm "
                         .. "hides source-workspace windows automatically)",
-                        tostring(name)))
+                        tostring(name)), {
+                            trace_id          = trace_id,
+                            binary_session_id = binary_session_id,
+                        })
                 end
             end
         end)

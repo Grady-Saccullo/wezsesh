@@ -437,6 +437,215 @@ func closeFD(fd int) {
 	_ = closeUnix(fd)
 }
 
+// TestRotateSingleDeepUnderThreshold — file at-or-below threshold is a
+// no-op. Strict greater-than semantics: a file whose size equals the
+// threshold does NOT rotate.
+func TestRotateSingleDeepUnderThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	active := filepath.Join(tmp, "plugin.log")
+	if err := os.WriteFile(active, []byte("abcde"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RotateSingleDeep(tmp, "plugin.log", 1<<20); err != nil {
+		t.Fatalf("RotateSingleDeep: %v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Errorf("active file should still exist: %v", err)
+	}
+	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".1 should not exist: %v", err)
+	}
+}
+
+// TestRotateSingleDeepAtThreshold — exactly threshold bytes does NOT
+// rotate (strict `>`). Documented: a file at exactly thresholdBytes is
+// untouched; the next write that crosses the threshold rotates.
+func TestRotateSingleDeepAtThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	active := filepath.Join(tmp, "plugin.log")
+	const threshold = 8
+	if err := os.WriteFile(active, []byte("abcdefgh"), 0o600); err != nil { // 8 bytes
+		t.Fatal(err)
+	}
+	if err := RotateSingleDeep(tmp, "plugin.log", threshold); err != nil {
+		t.Fatalf("RotateSingleDeep: %v", err)
+	}
+	st, err := os.Stat(active)
+	if err != nil {
+		t.Fatalf("active should still exist: %v", err)
+	}
+	if st.Size() != 8 {
+		t.Errorf("active size: want 8, got %d", st.Size())
+	}
+	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".1 should not exist: %v", err)
+	}
+}
+
+// TestRotateSingleDeepOverThreshold — file strictly larger than threshold
+// is renamed to .1.
+func TestRotateSingleDeepOverThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	active := filepath.Join(tmp, "plugin.log")
+	if err := os.WriteFile(active, []byte("abcdefghi"), 0o600); err != nil { // 9 bytes
+		t.Fatal(err)
+	}
+	if err := RotateSingleDeep(tmp, "plugin.log", 8); err != nil {
+		t.Fatalf("RotateSingleDeep: %v", err)
+	}
+	if _, err := os.Stat(active); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("active should be gone after rename: %v", err)
+	}
+	body, err := os.ReadFile(active + ".1")
+	if err != nil {
+		t.Fatalf("read .1: %v", err)
+	}
+	if string(body) != "abcdefghi" {
+		t.Errorf(".1 contents: %q", body)
+	}
+	if _, err := os.Stat(active + ".2"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("no .2 should be created: %v", err)
+	}
+}
+
+// TestRotateSingleDeepDropsExistingDotOne — pre-existing .1 is dropped
+// before the rename so the new .1 always reflects the most recent
+// pre-rotation state.
+func TestRotateSingleDeepDropsExistingDotOne(t *testing.T) {
+	tmp := t.TempDir()
+	active := filepath.Join(tmp, "plugin.log")
+	if err := os.WriteFile(active, []byte("NEW data over threshold"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active+".1", []byte("OLD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RotateSingleDeep(tmp, "plugin.log", 8); err != nil {
+		t.Fatalf("RotateSingleDeep: %v", err)
+	}
+	body, err := os.ReadFile(active + ".1")
+	if err != nil {
+		t.Fatalf("read .1: %v", err)
+	}
+	if string(body) != "NEW data over threshold" {
+		t.Errorf(".1 should hold NEW data, got %q", body)
+	}
+}
+
+// TestRotateSingleDeepMissingFile — no active file is a no-op, no error.
+func TestRotateSingleDeepMissingFile(t *testing.T) {
+	tmp := t.TempDir()
+	if err := RotateSingleDeep(tmp, "plugin.log", 8); err != nil {
+		t.Errorf("RotateSingleDeep on missing file: want nil, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("active file should still be missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.log.1")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".1 should not exist: %v", err)
+	}
+}
+
+// TestRotateSingleDeepRefusesSymlinkActive — symlink at active path is
+// refused with ErrIsSymlink; nothing on disk is touched.
+func TestRotateSingleDeepRefusesSymlinkActive(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "real.log")
+	if err := os.WriteFile(target, []byte("over threshold data here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Join(tmp, "plugin.log")
+	if err := os.Symlink(target, active); err != nil {
+		t.Fatal(err)
+	}
+	err := RotateSingleDeep(tmp, "plugin.log", 8)
+	if !errors.Is(err, ErrIsSymlink) {
+		t.Errorf("want ErrIsSymlink, got %v", err)
+	}
+	// Symlink and target still in place; nothing was renamed.
+	if _, err := os.Lstat(active); err != nil {
+		t.Errorf("symlink should still exist: %v", err)
+	}
+	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".1 should not exist: %v", err)
+	}
+}
+
+// TestRotateSingleDeepRefusesSymlinkDotOne — symlink at .1 destination
+// is refused with ErrIsSymlink; the active file is left in place.
+func TestRotateSingleDeepRefusesSymlinkDotOne(t *testing.T) {
+	tmp := t.TempDir()
+	active := filepath.Join(tmp, "plugin.log")
+	if err := os.WriteFile(active, []byte("active data over threshold"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tmp, "elsewhere.log")
+	if err := os.WriteFile(target, []byte("OLD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, active+".1"); err != nil {
+		t.Fatal(err)
+	}
+	err := RotateSingleDeep(tmp, "plugin.log", 8)
+	if !errors.Is(err, ErrIsSymlink) {
+		t.Errorf("want ErrIsSymlink, got %v", err)
+	}
+	body, err := os.ReadFile(active)
+	if err != nil {
+		t.Fatalf("active should still exist: %v", err)
+	}
+	if string(body) != "active data over threshold" {
+		t.Errorf("active should be untouched, got %q", body)
+	}
+	body2, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("symlink target should still exist: %v", err)
+	}
+	if string(body2) != "OLD" {
+		t.Errorf("symlink target should be untouched, got %q", body2)
+	}
+}
+
+// TestRotateSingleDeepNonExistentDir — VerifyDir surfaces the missing
+// parent error; rotation cannot proceed.
+func TestRotateSingleDeepNonExistentDir(t *testing.T) {
+	tmp := t.TempDir()
+	missing := filepath.Join(tmp, "does-not-exist")
+	err := RotateSingleDeep(missing, "plugin.log", 8)
+	if err == nil {
+		t.Errorf("want error for missing dir, got nil")
+	}
+}
+
+// TestRotateSingleDeepRefusesSymlinkParent — a symlinked parent dir
+// refuses via VerifyDir's existing ErrIsSymlink path. Defense-in-depth
+// for the case where the user's runtime_dir resolution somehow yielded
+// a symlink (the startup symlink-refuse pass should have caught it).
+func TestRotateSingleDeepRefusesSymlinkParent(t *testing.T) {
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sym := filepath.Join(tmp, "sym")
+	if err := os.Symlink(real, sym); err != nil {
+		t.Fatal(err)
+	}
+	err := RotateSingleDeep(sym, "plugin.log", 8)
+	if !errors.Is(err, ErrIsSymlink) {
+		t.Errorf("RotateSingleDeep through symlink parent: want ErrIsSymlink, got %v", err)
+	}
+}
+
+// TestRotateSingleDeepRejectsLeafWithSeparator — leaf must be a base name.
+func TestRotateSingleDeepRejectsLeafWithSeparator(t *testing.T) {
+	tmp := t.TempDir()
+	err := RotateSingleDeep(tmp, "sub/plugin.log", 8)
+	if err == nil {
+		t.Errorf("expected rejection for leaf with separator")
+	}
+}
+
 // closeUnix wraps unix.Close to keep the test file free of unix imports
 // where possible. Implementation lives in safefs; using io.Closer-style
 // here would require a *os.File round-trip we don't want.

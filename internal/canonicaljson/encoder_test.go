@@ -56,40 +56,138 @@ var goldenInputs = map[string]any{
 		"name": "~/code", "cwd": "/home/user/code",
 	},
 	"verb_noop_args":      map[string]any{},
-	"verb_list_dirs_args": map[string]any{"query": ""},
-	"verb_list_dirs_reply_data_empty": map[string]any{
-		"dirs": []any{},
-	},
-	"verb_list_dirs_reply_data": map[string]any{
-		"dirs": []any{
-			map[string]any{"path": "/home/user/code", "name": "code"},
-			map[string]any{"path": "/srv", "name": "srv"},
+	"verb_bootstrap_args": map[string]any{},
+	"verb_bootstrap_reply_data": map[string]any{
+		"colors": map[string]any{
+			"accent":   "#ff8800",
+			"focus_bg": "#222222",
+			"muted":    "#888888",
 		},
+		"columns":                       []any{"marker", "name", "tabs", "age", "tags"},
+		"confirm_delete":                true,
+		"confirm_overwrite":             false,
+		"data_dir":                      "/var/data",
+		"default_action":                "switch",
+		"default_action_load_no_prompt": true,
+		"dir_providers": []any{
+			map[string]any{
+				"type":       "command",
+				"argv":       []any{"zoxide", "query", "-l"},
+				"limit":      int64(200),
+				"timeout_ms": int64(5000),
+			},
+			map[string]any{
+				"type":           "directory",
+				"path":           "/home/user/code",
+				"depth":          int64(2),
+				"limit":          int64(200),
+				"include_hidden": false,
+			},
+			map[string]any{
+				"type":  "static",
+				"paths": []any{"/tmp", "/etc"},
+			},
+		},
+		"exclude":                       []any{"^default$", "^skip$"},
+		"hooks": map[string]any{
+			"prompt_on_untrusted": false,
+			"run_hooks":           true,
+			"timeout_seconds":     int64(600),
+		},
+		"keys": map[string]any{
+			"bottom": "G", "clear_marks": "c", "delete": "d",
+			"down": "j", "filter": "/", "help": "?",
+			"load": "l", "mark": "Tab", "mark_alt": "Space",
+			"new": "n", "pin": "p", "quit": "q",
+			"rename": "r", "save": "S", "switch": "s",
+			"tag": "t", "top": "gg", "up": "k",
+		},
+		"log_level": "info",
+		"markers": map[string]any{
+			"active":  "▶",
+			"live":    "●",
+			"marked":  "✓",
+			"pinned":  "[pinned]",
+			"unsaved": "(unsaved)",
+		},
+		"name_truncate":         "middle",
+		"new_workspace_command": "tmux new",
+		"plugin_version":        "0.1.0",
+		"preview": map[string]any{
+			"enabled": true,
+			"width":   int64(40),
+		},
+		"resurrect_argv_allowlist": []any{"bash", "zsh", "nvim"},
+		"runtime_dir":              "/tmp/wezsesh",
+		"snapshot_dir":             "/var/snap",
+		"sort":                     "live_first",
+		"state_dir":                "/var/state",
 	},
-
+	"verb_bootstrap_reply_data_empty": map[string]any{
+		"colors":                        map[string]any{},
+		"columns":                       []any{},
+		"confirm_delete":                false,
+		"confirm_overwrite":             false,
+		"data_dir":                      "",
+		"default_action":                "",
+		"default_action_load_no_prompt": false,
+		"dir_providers":                 []any{},
+		"exclude":                       []any{},
+		"hooks": map[string]any{
+			"prompt_on_untrusted": false,
+			"run_hooks":           false,
+			"timeout_seconds":     int64(0),
+		},
+		"keys":                     map[string]any{},
+		"log_level":                "",
+		"markers":                  map[string]any{},
+		"name_truncate":            "",
+		"new_workspace_command":    Null,
+		"plugin_version":           "",
+		"preview": map[string]any{
+			"enabled": false,
+			"width":   int64(0),
+		},
+		"resurrect_argv_allowlist": []any{},
+		"runtime_dir":              "",
+		"snapshot_dir":             "",
+		"sort":                     "",
+		"state_dir":                "",
+	},
 	// Reply-shape fixtures. The `hmac` field is a stable 64-zero string —
 	// the corpus tests encoder byte-equality for the reply shapes that
 	// the Lua-side signer now emits, not HMAC correctness.
+	//
+	// `binary_session_id` and `plugin_session_id` are 26-char ULID
+	// placeholders distinct from `id` so a human eyeballing the file
+	// can tell them apart; they ride along under the canonical sorted-
+	// key order.
 	"reply_started": map[string]any{
-		"v":      int64(1),
-		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
-		"status": "started",
-		"ok":     true,
-		"hmac":   "0000000000000000000000000000000000000000000000000000000000000000",
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status":            "started",
+		"ok":                true,
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"plugin_session_id": "01JABCDEFGHJKMNPQRSTVWXYZC",
+		"hmac":              "0000000000000000000000000000000000000000000000000000000000000000",
 	},
 	"reply_completed_ok": map[string]any{
-		"v":      int64(1),
-		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
-		"status": "completed",
-		"ok":     true,
-		"data":   map[string]any{"active_workspace": "main"},
-		"hmac":   "0000000000000000000000000000000000000000000000000000000000000000",
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status":            "completed",
+		"ok":                true,
+		"data":              map[string]any{"active_workspace": "main"},
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"plugin_session_id": "01JABCDEFGHJKMNPQRSTVWXYZC",
+		"hmac":              "0000000000000000000000000000000000000000000000000000000000000000",
 	},
 	"reply_completed_error": map[string]any{
-		"v":      int64(1),
-		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
-		"status": "completed",
-		"ok":     false,
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status":            "completed",
+		"ok":                false,
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"plugin_session_id": "01JABCDEFGHJKMNPQRSTVWXYZC",
 		"error": map[string]any{
 			"code":    "SAVE_FAILED",
 			"message": "disk full",
@@ -98,11 +196,13 @@ var goldenInputs = map[string]any{
 		"hmac": "0000000000000000000000000000000000000000000000000000000000000000",
 	},
 	"reply_partial": map[string]any{
-		"v":      int64(1),
-		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
-		"status": "partial",
-		"ok":     true,
-		"data":   map[string]any{"name": "snap-1"},
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status":            "partial",
+		"ok":                true,
+		"data":              map[string]any{"name": "snap-1"},
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"plugin_session_id": "01JABCDEFGHJKMNPQRSTVWXYZC",
 		"warnings": []any{
 			map[string]any{
 				"code":    "RESURRECT_PARTIAL",
@@ -111,6 +211,21 @@ var goldenInputs = map[string]any{
 			},
 		},
 		"hmac": "0000000000000000000000000000000000000000000000000000000000000000",
+	},
+
+	// Full request envelope fixture. Pins the v=2 sorted-key shape end
+	// to end so the byte-equality gate covers the request side with the
+	// same fidelity it covers the reply side.
+	"request_full": map[string]any{
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"ts":                int64(1700000000),
+		"target_window_id":  int64(1),
+		"reply_sock":        "/tmp/x.sock",
+		"op":                "noop",
+		"args":              map[string]any{},
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"hmac":              "0000000000000000000000000000000000000000000000000000000000000000",
 	},
 }
 
@@ -422,24 +537,26 @@ func TestUnsupported(t *testing.T) {
 }
 
 // TestRequestEnvelopeFieldOrder — §3.3 mandates the exact key order
-// (args, hmac, id, op, reply_sock, target_window_id, ts, v). This
-// test exercises the canonical encoder against a realistic request.
+// (args, binary_session_id, hmac, id, op, reply_sock, target_window_id,
+// ts, v). This test exercises the canonical encoder against a realistic
+// request envelope at v=2.
 func TestRequestEnvelopeFieldOrder(t *testing.T) {
 	req := map[string]any{
-		"v":                int64(1),
-		"id":               "01JABCDEFGHJKMNPQRSTVWXYZA",
-		"ts":               int64(1700000000),
-		"target_window_id": int64(1),
-		"reply_sock":       "/tmp/x.sock",
-		"op":               "noop",
-		"args":             map[string]any{},
-		"hmac":             "deadbeef",
+		"v":                 int64(2),
+		"id":                "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"ts":                int64(1700000000),
+		"target_window_id":  int64(1),
+		"reply_sock":        "/tmp/x.sock",
+		"op":                "noop",
+		"args":              map[string]any{},
+		"binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
+		"hmac":              "deadbeef",
 	}
 	got, err := Marshal(req)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	want := `{"args":{},"hmac":"deadbeef","id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop","reply_sock":"/tmp/x.sock","target_window_id":1,"ts":1700000000,"v":1}`
+	want := `{"args":{},"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB","hmac":"deadbeef","id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop","reply_sock":"/tmp/x.sock","target_window_id":1,"ts":1700000000,"v":2}`
 	if string(got) != want {
 		t.Fatalf("envelope canonical order wrong\n got: %s\nwant: %s", got, want)
 	}

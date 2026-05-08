@@ -173,19 +173,20 @@ func (f *fakeListener) closeAll() {
 func newTestDispatcher(t *testing.T, w OSCWriter, l listenerStarter, runtimeDir string) *Dispatcher {
 	t.Helper()
 	d := &Dispatcher{
-		osc:            w,
-		signer:         mustSigner(t),
-		runtimeDir:     runtimeDir,
-		reqDir:         filepath.Join(runtimeDir, reqDirName),
-		replyDir:       runtimeDir,
-		targetWindowID: 1,
-		log:            nil,
-		startListener:  l,
-		now:            func() time.Time { return time.Unix(1700000000, 0) },
-		newID:          newULID,
-		dialReply:      dialReplyUnix,
-		nameMutexes:    make(map[string]*sync.Mutex),
-		outstanding:    make(map[string]outstandingDispatch),
+		osc:             w,
+		signer:          mustSigner(t),
+		runtimeDir:      runtimeDir,
+		reqDir:          filepath.Join(runtimeDir, reqDirName),
+		replyDir:        runtimeDir,
+		targetWindowID:  1,
+		binarySessionID: testBinarySessionID,
+		log:             nil,
+		startListener:   l,
+		now:             func() time.Time { return time.Unix(1700000000, 0) },
+		newID:           newULID,
+		dialReply:       dialReplyUnix,
+		nameMutexes:     make(map[string]*sync.Mutex),
+		outstanding:     make(map[string]outstandingDispatch),
 	}
 	d.parseReply = func(raw []byte) (ipc.Reply, error) {
 		return parseReply(raw, d.signer)
@@ -195,6 +196,17 @@ func newTestDispatcher(t *testing.T, w OSCWriter, l listenerStarter, runtimeDir 
 	}
 	return d
 }
+
+// testBinarySessionID is the deterministic 26-char ULID stamped onto
+// every test request envelope. Distinct from `id` (the per-request
+// ULID) so test diagnostics can tell the two apart at a glance.
+const testBinarySessionID = "01JABCDEFGHJKMNPQRSTVWXYZB"
+
+// testPluginSessionID is the deterministic 26-char ULID echoed on
+// every test reply envelope. The plugin mints this in production at
+// apply_to_config; tests pin a known value so the byte-equality gate
+// is reproducible.
+const testPluginSessionID = "01JABCDEFGHJKMNPQRSTVWXYZC"
 
 // TestNew_ValidatesDeps covers ErrInvalidConfig branches: each missing
 // dep produces a wrapping of ErrInvalidConfig. Uses a zero-value
@@ -415,10 +427,16 @@ func TestDispatch_PayloadShapeAndHMAC(t *testing.T) {
 		t.Fatalf("hmac verify failed")
 	}
 
-	for _, f := range []string{"v", "id", "ts", "target_window_id", "reply_sock", "op", "args"} {
+	for _, f := range []string{"v", "id", "ts", "target_window_id", "reply_sock", "op", "args", "binary_session_id"} {
 		if _, ok := payload[f]; !ok {
 			t.Errorf("missing required field %q", f)
 		}
+	}
+	if got, _ := payload["v"].(int64); got != int64(protoVersion) {
+		t.Errorf("payload v = %d, want %d", got, protoVersion)
+	}
+	if got, _ := payload["binary_session_id"].(string); got != testBinarySessionID {
+		t.Errorf("payload binary_session_id = %q, want %q", got, testBinarySessionID)
 	}
 
 	w.mu.Lock()
@@ -471,11 +489,13 @@ func TestDispatch_ReplyChannelDeliversParsedReply(t *testing.T) {
 	id := readRequestID(t, dir)
 
 	reply := signReply(t, d.signer, map[string]any{
-		"v":      int64(1),
-		"id":     id,
-		"status": "completed",
-		"ok":     true,
-		"data":   map[string]any{"hash": "sha256:abc"},
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                true,
+		"data":              map[string]any{"hash": "sha256:abc"},
+		"binary_session_id": testBinarySessionID,
+		"plugin_session_id": testPluginSessionID,
 	})
 	fl.pushReply(0, reply)
 
@@ -484,7 +504,7 @@ func TestDispatch_ReplyChannelDeliversParsedReply(t *testing.T) {
 		if !ok {
 			t.Fatal("channel closed before reply")
 		}
-		if got.V != 1 || got.Status != "completed" || !got.OK {
+		if got.V != protoVersion || got.Status != "completed" || !got.OK {
 			t.Errorf("reply mismatch: %+v", got)
 		}
 		if got.Data["hash"] != "sha256:abc" {
@@ -526,11 +546,13 @@ func TestDispatch_BadHMACSurfacesMismatch(t *testing.T) {
 	// verifier rejects it. Sign+marshal first so the field-removal
 	// sequence stays canonical; we mutate the marshalled bytes after.
 	envelope := map[string]any{
-		"v":      int64(1),
-		"id":     id,
-		"status": "completed",
-		"ok":     true,
-		"data":   map[string]any{},
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                true,
+		"data":              map[string]any{},
+		"binary_session_id": testBinarySessionID,
+		"plugin_session_id": testPluginSessionID,
 	}
 	digest, sErr := d.signer.Sign(envelope)
 	if sErr != nil {
@@ -826,11 +848,13 @@ func TestDispatch_PhaseCRehashShape(t *testing.T) {
 
 	wantHash := "sha256:" + strings.Repeat("ab", 32)
 	reply := signReply(t, d.signer, map[string]any{
-		"v":      int64(1),
-		"id":     id,
-		"status": "completed",
-		"ok":     true,
-		"data":   map[string]any{"name": "gamma", "hash": wantHash},
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                true,
+		"data":              map[string]any{"name": "gamma", "hash": wantHash},
+		"binary_session_id": testBinarySessionID,
+		"plugin_session_id": testPluginSessionID,
 	})
 	fl.pushReply(0, reply)
 
@@ -938,11 +962,13 @@ func TestDispatch_RealListenerEndToEnd(t *testing.T) {
 		t.Fatalf("dial reply sock: %v", err)
 	}
 	reply := signReply(t, d.signer, map[string]any{
-		"v":      int64(1),
-		"id":     id,
-		"status": "completed",
-		"ok":     true,
-		"data":   map[string]any{},
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                true,
+		"data":              map[string]any{},
+		"binary_session_id": testBinarySessionID,
+		"plugin_session_id": testPluginSessionID,
 	})
 	if _, err := conn.Write(reply); err != nil {
 		t.Fatalf("write reply: %v", err)
@@ -1497,13 +1523,14 @@ func TestEmergencyReply_RealSocketDelivery(t *testing.T) {
 
 // TestBuildUnexpectedExitReply_CanonicalShape pins the byte shape of
 // the §13.1 sentinel. Field order on the wire must be (canonical-JSON
-// sorted-key) error / hmac / id / ok / status / v; error nested keys
-// code / message. The shape is verified by re-decoding. The signed
-// form interleaves the `hmac` field per byte-sorted order.
+// sorted-key) binary_session_id / error / hmac / id / ok /
+// plugin_session_id / status / v; error nested keys code / message.
+// The shape is verified by re-decoding. The signed form interleaves
+// the `hmac` field per byte-sorted order.
 func TestBuildUnexpectedExitReply_CanonicalShape(t *testing.T) {
 	id := strings.Repeat("0", 26)
 	signer := mustSigner(t)
-	body, err := buildUnexpectedExitReply(id, signer)
+	body, err := buildUnexpectedExitReply(id, testBinarySessionID, signer)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -1511,10 +1538,13 @@ func TestBuildUnexpectedExitReply_CanonicalShape(t *testing.T) {
 	// dance the function uses; the digest is deterministic given the
 	// fixture key + envelope shape.
 	envelope := map[string]any{
-		"v":      int64(protoVersion),
-		"id":     id,
-		"status": "completed",
-		"ok":     false,
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                false,
+		"binary_session_id": testBinarySessionID,
+		// panic-path: plugin id unknown at the point of synthesis.
+		"plugin_session_id": "",
 		"error": map[string]any{
 			"code":    "UNEXPECTED_EXIT",
 			"message": "",

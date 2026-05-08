@@ -1,17 +1,8 @@
--- Busted-style spec for runtime/dir_providers.lua. Self-contained —
--- runs under plain `lua plugin/wezsesh/runtime/dir_providers_spec.lua`
--- from the repo root, no busted required.
+-- Busted-style spec for runtime/dir_providers.lua. Self-contained.
 --
 -- Run:
 --     cd <repo-root>
 --     lua plugin/wezsesh/runtime/dir_providers_spec.lua
---
--- Exits 0 with `OK N/N` on success, 1 with FAIL lines on stderr
--- otherwise.
---
--- The spec installs a wezterm-shim via `package.preload["wezterm"]`
--- BEFORE requiring the module under test. dir_providers itself doesn't
--- touch wezterm, but it requires `runtime.log` which does.
 
 local function script_dir()
     local src = arg and arg[0]
@@ -32,12 +23,16 @@ package.path = SPEC_DIR .. "/?.lua;"
 
 local helpers = require("spec_helpers")
 
--- Capture log output so we can assert that bad providers / rows are
--- surfaced with a logged warn rather than silently swallowed.
+-- Capture log output so we can assert that bad entries are surfaced
+-- with a logged warn rather than silently swallowed.
 local log_warns
 local log_errors
 
 local wezterm_shim = helpers.minimal_wezterm()
+-- runtime/log.lua JSON-encodes a structured record before emitting.
+local _codec = helpers.make_json_codec()
+wezterm_shim.json_encode = _codec.encode
+wezterm_shim.json_parse  = _codec.decode
 wezterm_shim.log_warn = function(msg)
     log_warns[#log_warns + 1] = tostring(msg)
 end
@@ -102,11 +97,9 @@ end
 -- ────────────────────────────────────────────────────────────────────
 
 describe("module surface", function()
-    it("exposes set, get, invoke_all, _reset", function()
+    it("exposes set, get, _reset", function()
         assert_eq(type(dir_providers.set), "function", "set missing")
         assert_eq(type(dir_providers.get), "function", "get missing")
-        assert_eq(type(dir_providers.invoke_all), "function",
-            "invoke_all missing")
         assert_eq(type(dir_providers._reset), "function",
             "_reset missing")
     end)
@@ -117,12 +110,6 @@ end)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("empty default", function()
-    it("invoke_all returns {} when set was never called", function()
-        local rows = dir_providers.invoke_all("")
-        assert_eq(type(rows), "table", "invoke_all return type")
-        assert_eq(#rows, 0, "default empty contract")
-    end)
-
     it("get returns an empty list when set was never called", function()
         local list = dir_providers.get()
         assert_eq(type(list), "table", "get return type")
@@ -132,8 +119,6 @@ describe("empty default", function()
     it("set(nil) normalises to empty list", function()
         dir_providers.set(nil)
         assert_eq(#dir_providers.get(), 0, "nil not normalised")
-        assert_eq(#dir_providers.invoke_all(""), 0,
-            "invoke_all after set(nil)")
     end)
 
     it("set(non-table) logs a warn and clears", function()
@@ -145,169 +130,94 @@ describe("empty default", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- set + get round-trip
+-- set + get round-trip (declarative configs)
 -- ────────────────────────────────────────────────────────────────────
 
 describe("set + get round-trip", function()
-    it("preserves the list of providers in registration order",
-    function()
-        local function p1() return {} end
-        local function p2() return {} end
-        dir_providers.set({ p1, p2 })
+    it("preserves the list of configs in registration order", function()
+        local cfg1 = { type = "command", argv = { "zoxide", "query", "-l" } }
+        local cfg2 = { type = "directory", path = "~/code", depth = 2 }
+        dir_providers.set({ cfg1, cfg2 })
         local got = dir_providers.get()
         assert_eq(#got, 2, "list length")
-        assert_true(got[1] == p1, "first slot identity")
-        assert_true(got[2] == p2, "second slot identity")
+        assert_eq(got[1].type, "command", "first slot type")
+        assert_eq(got[1].argv[1], "zoxide", "first slot argv")
+        assert_eq(got[2].type, "directory", "second slot type")
+        assert_eq(got[2].path, "~/code", "second slot path")
     end)
 
     it("subsequent caller mutations to the passed-in list do not "
         .. "leak into the stashed snapshot", function()
-        local list = { function() return {} end }
+        local list = { { type = "static", paths = { "/a" } } }
         dir_providers.set(list)
-        list[2] = function() return {} end
+        list[2] = { type = "static", paths = { "/b" } }
         assert_eq(#dir_providers.get(), 1,
             "post-set caller mutation leaked into stash")
     end)
-end)
 
--- ────────────────────────────────────────────────────────────────────
--- invoke_all concatenation
--- ────────────────────────────────────────────────────────────────────
-
-describe("invoke_all concatenation", function()
-    it("concatenates rows across providers in registration order",
-    function()
-        local p1 = function(_q)
-            return { { path = "/a", name = "a" } }
-        end
-        local p2 = function(_q)
-            return {
-                { path = "/b", name = "b" },
-                { path = "/c", name = "c" },
-            }
-        end
-        dir_providers.set({ p1, p2 })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 3, "concat length")
-        assert_eq(rows[1].path, "/a", "row[1].path")
-        assert_eq(rows[2].path, "/b", "row[2].path")
-        assert_eq(rows[3].path, "/c", "row[3].path")
-    end)
-
-    it("threads the query string through to each provider", function()
-        local seen
-        local p = function(q)
-            seen = q
-            return {}
-        end
-        dir_providers.set({ p })
-        dir_providers.invoke_all("hello")
-        assert_eq(seen, "hello", "query not threaded")
-    end)
-
-    it("non-string query is normalised to empty string", function()
-        local seen
-        local p = function(q)
-            seen = q
-            return {}
-        end
-        dir_providers.set({ p })
-        dir_providers.invoke_all(nil)
-        assert_eq(seen, "", "nil query not normalised")
-        dir_providers.invoke_all(42)
-        assert_eq(seen, "", "non-string query not normalised")
+    it("subsequent mutation of a nested table (argv / paths) does NOT "
+        .. "leak into the stashed snapshot", function()
+        local argv = { "zoxide", "query", "-l" }
+        dir_providers.set({ { type = "command", argv = argv } })
+        argv[1] = "MUTATED"
+        local got = dir_providers.get()
+        assert_eq(got[1].argv[1], "zoxide",
+            "nested-array mutation leaked into stash")
     end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- pcall isolation
+-- entry validation
 -- ────────────────────────────────────────────────────────────────────
 
-describe("pcall isolation", function()
-    it("a raising provider does not tank the others", function()
-        local bad = function(_q) error("boom", 0) end
-        local good = function(_q)
-            return { { path = "/g", name = "g" } }
-        end
-        dir_providers.set({ bad, good })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 1, "good provider's row dropped")
-        assert_eq(rows[1].path, "/g", "good provider's row missing")
-        assert_true(any_warn_contains("provider #1 raised"),
-            "raise was not logged")
-    end)
-
-    it("a non-function entry is logged and skipped", function()
-        local good = function(_q)
-            return { { path = "/g", name = "g" } }
-        end
-        dir_providers.set({ "not a function", good })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 1, "good provider's row missing")
-        assert_eq(rows[1].path, "/g", "good provider's row identity")
-        assert_true(any_warn_contains("expected function"),
-            "non-function entry was not logged")
-    end)
-end)
-
--- ────────────────────────────────────────────────────────────────────
--- malformed return
--- ────────────────────────────────────────────────────────────────────
-
-describe("malformed return shape", function()
-    it("provider returning non-table is logged and dropped", function()
-        local bad = function(_q) return "nope" end
-        local good = function(_q)
-            return { { path = "/g", name = "g" } }
-        end
-        dir_providers.set({ bad, good })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 1, "good provider tanked")
-        assert_eq(rows[1].path, "/g", "good provider mis-routed")
+describe("entry validation", function()
+    it("non-table entry is logged and dropped", function()
+        dir_providers.set({
+            "not a table",
+            { type = "static", paths = { "/keep" } },
+        })
+        local got = dir_providers.get()
+        assert_eq(#got, 1, "good entry dropped")
+        assert_eq(got[1].type, "static", "good entry mis-routed")
         assert_true(any_warn_contains("expected table"),
-            "non-table return was not logged")
+            "non-table entry was not logged")
     end)
 
-    it("provider returning a row missing `path` drops THAT row only",
-    function()
-        local p = function(_q)
-            return {
-                { path = "/keep", name = "keep" },
-                { name = "missing path" },
-                { path = "/also-keep" },
-            }
-        end
-        dir_providers.set({ p })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 2, "expected 2 valid rows; got " .. #rows)
-        assert_eq(rows[1].path, "/keep", "first kept row wrong")
-        assert_eq(rows[2].path, "/also-keep", "second kept row wrong")
-        assert_true(any_warn_contains("malformed"),
-            "malformed row was not logged")
+    it("entry missing string `type` is logged and dropped", function()
+        dir_providers.set({
+            { argv = { "zoxide" } }, -- missing type
+            { type = "static", paths = { "/keep" } },
+        })
+        local got = dir_providers.get()
+        assert_eq(#got, 1, "good entry dropped")
+        assert_eq(got[1].type, "static", "good entry mis-routed")
+        assert_true(any_warn_contains("missing string `type`"),
+            "missing-type entry was not logged")
     end)
 
-    it("non-string `name` is normalised to nil (binary derives base)",
-    function()
-        local p = function(_q)
-            return { { path = "/p", name = 42 } }
-        end
-        dir_providers.set({ p })
-        local rows = dir_providers.invoke_all("")
-        assert_eq(#rows, 1, "row dropped despite valid path")
-        assert_eq(rows[1].path, "/p", "path lost")
-        assert_eq(rows[1].name, nil,
-            "non-string name not normalised; got "
-            .. tostring(rows[1].name))
+    it("empty-string `type` is rejected", function()
+        dir_providers.set({
+            { type = "" },
+            { type = "static", paths = { "/keep" } },
+        })
+        local got = dir_providers.get()
+        assert_eq(#got, 1, "good entry dropped")
+    end)
+
+    it("non-string `type` is rejected", function()
+        dir_providers.set({
+            { type = 42 },
+            { type = "static", paths = { "/keep" } },
+        })
+        local got = dir_providers.get()
+        assert_eq(#got, 1, "good entry dropped")
     end)
 end)
 
--- ────────────────────────────────────────────────────────────────────
--- summary
--- ────────────────────────────────────────────────────────────────────
-
-if failures > 0 then
+if failures == 0 then
+    io.write(string.format("OK %d/%d\n", total, total))
+    os.exit(0)
+else
     io.stderr:write(string.format("FAILED %d/%d\n", failures, total))
     os.exit(1)
-else
-    io.stdout:write(string.format("OK %d/%d\n", total, total))
 end

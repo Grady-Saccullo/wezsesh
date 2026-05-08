@@ -63,14 +63,23 @@ const (
 // be sanitised before the call. The project-wide helper for that is
 // internal/nameval.SanitizeForDisplay; the logger does not reach across
 // package boundaries to apply it.
+//
+// Child loggers (returned by With) share the parent's writer, level,
+// handler, and closeOnce by pointer — so a parent Close fully tears the
+// stream down and a follow-on child Close is a safe no-op. Children
+// dispatch through their own slogger (carrying additional sticky attrs)
+// but route Warn/Error syncFlush through the same rotatingWriter.
 type Logger struct {
 	level   Level
 	handler slog.Handler
 	writer  *rotatingWriter
-	slog    *slog.Logger
+	slogger *slog.Logger
 
-	closeOnce sync.Once
-	closeErr  error
+	// closeOnce guards the writer Close path. Pointer-shared with every
+	// child Logger derived via With so any of them may legally call
+	// Close — the first such call wins, the rest are no-ops.
+	closeOnce *sync.Once
+	closeErr  *error
 }
 
 // New opens (or creates) <stateDir>/wezsesh.log and returns a Logger
@@ -79,7 +88,19 @@ type Logger struct {
 // are guarded against symlinks via safefs (Enforce on the parent,
 // O_NOFOLLOW + dirfd-anchored openat on the leaf — closes the TOCTOU
 // window an inline Lstat-then-OpenFile pair would leave open).
-func New(stateDir string, level Level) (*Logger, error) {
+//
+// binarySessionID is stamped as a sticky slog attribute on every record
+// emitted by this Logger and any child derived via With — the
+// trace/correlation rollout (CLAUDE.md "Tracing & correlation") relies
+// on it being present in the JSON record without each callsite passing
+// it explicitly.
+//
+// Caller responsibility: pass a non-empty 26-char ULID as
+// binarySessionID. Empty is tolerated (the attr is still attached;
+// downstream consumers see "" and treat that as "unset") so the
+// signature can land before the cmd/wezsesh main() mint that supplies
+// the value, but production paths must populate it.
+func New(stateDir string, level Level, binarySessionID string) (*Logger, error) {
 	if stateDir == "" {
 		return nil, errors.New("logger: stateDir is empty")
 	}
@@ -93,12 +114,42 @@ func New(stateDir string, level Level) (*Logger, error) {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: levelToSlog(level),
 	})
+	var (
+		closeOnce sync.Once
+		closeErr  error
+	)
 	return &Logger{
-		level:   level,
-		handler: h,
-		writer:  w,
-		slog:    slog.New(h),
+		level:     level,
+		handler:   h,
+		writer:    w,
+		slogger:   slog.New(h).With("binary_session_id", binarySessionID),
+		closeOnce: &closeOnce,
+		closeErr:  &closeErr,
 	}, nil
+}
+
+// With returns a child Logger that emits every record with the
+// supplied key/value pairs attached as sticky slog attributes, on top
+// of the parent's existing attributes (e.g., binary_session_id).
+// kv follows the slog convention: alternating key/value pairs.
+//
+// The child shares the parent's writer, handler, level, and closeOnce
+// by pointer — so Warn/Error on a child still drives the same
+// syncFlush, and a single Close on either parent or child fully tears
+// the underlying stream down. Subsequent Close calls on the other are
+// no-ops via the shared closeOnce.
+func (l *Logger) With(kv ...any) *Logger {
+	if l == nil {
+		return nil
+	}
+	return &Logger{
+		level:     l.level,
+		handler:   l.handler,
+		writer:    l.writer,
+		slogger:   l.slogger.With(kv...),
+		closeOnce: l.closeOnce,
+		closeErr:  l.closeErr,
+	}
 }
 
 // Debug emits at LevelDebug. Sanitize user-controlled strings before
@@ -107,7 +158,7 @@ func (l *Logger) Debug(msg string, kv ...any) {
 	if l == nil {
 		return
 	}
-	l.slog.Debug(msg, kv...)
+	l.slogger.Debug(msg, kv...)
 }
 
 // Info emits at LevelInfo. Buffered until the 1 s tick or a Warn/Error
@@ -117,7 +168,7 @@ func (l *Logger) Info(msg string, kv ...any) {
 	if l == nil {
 		return
 	}
-	l.slog.Info(msg, kv...)
+	l.slogger.Info(msg, kv...)
 }
 
 // Warn emits at LevelWarn and synchronously flushes to disk so the line
@@ -129,7 +180,7 @@ func (l *Logger) Warn(msg string, kv ...any) {
 	if l == nil {
 		return
 	}
-	l.slog.Warn(msg, kv...)
+	l.slogger.Warn(msg, kv...)
 	l.writer.syncFlush()
 }
 
@@ -141,20 +192,23 @@ func (l *Logger) Error(msg string, kv ...any) {
 	if l == nil {
 		return
 	}
-	l.slog.Error(msg, kv...)
+	l.slogger.Error(msg, kv...)
 	l.writer.syncFlush()
 }
 
 // Close stops the background flush goroutine, drains the buffer, fsyncs,
-// and closes the underlying file. Idempotent.
+// and closes the underlying file. Idempotent across both the parent
+// Logger and any child derived via With (the closeOnce is shared by
+// pointer): the first Close on any of them tears the writer down; the
+// rest no-op and return the same error.
 func (l *Logger) Close() error {
 	if l == nil {
 		return nil
 	}
 	l.closeOnce.Do(func() {
-		l.closeErr = l.writer.Close()
+		*l.closeErr = l.writer.Close()
 	})
-	return l.closeErr
+	return *l.closeErr
 }
 
 // ResolveLevel picks the more verbose (lower-numeric) of the two named
@@ -197,6 +251,24 @@ func parseLevel(s string) (Level, bool) {
 		return LevelError, true
 	}
 	return 0, false
+}
+
+// LevelString returns the canonical lower-case name for a Level. The
+// inverse of parseLevel for known levels; unknown values fall through
+// to "info" to match levelToSlog's default. Used by the Lua plugin's
+// so the Lua plugin can mirror the binary's threshold.
+func LevelString(l Level) string {
+	switch l {
+	case LevelDebug:
+		return "debug"
+	case LevelInfo:
+		return "info"
+	case LevelWarn:
+		return "warn"
+	case LevelError:
+		return "error"
+	}
+	return "info"
 }
 
 func levelToSlog(l Level) slog.Level {

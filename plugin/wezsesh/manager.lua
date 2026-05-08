@@ -20,9 +20,10 @@
 -- (any future bg-spawn here would also need the
 -- `lua-bg-child-process-pcall` lint to keep enforcing pcall-wrap).
 
-local wezterm = require("wezterm")
-local globals = require("wezsesh.runtime.globals")
-local b64     = require("wezsesh.crypto.b64")
+local wezterm        = require("wezterm")
+local globals        = require("wezsesh.runtime.globals")
+local canonical_json = require("wezsesh.canonical_json")
+local dir_providers  = require("wezsesh.runtime.dir_providers")
 
 local M = {}
 
@@ -221,26 +222,16 @@ function M.validate_runtime_dir(opts)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- build_config_envvar
+-- build_bootstrap_body
 -- ────────────────────────────────────────────────────────────────────
 --
--- Builds the JSON config shape, base64-encodes it, and returns the
--- single string value that the binary picks up via the
--- WEZSESH_CONFIG_JSON_BASE64 env var. Pure on `opts`; no filesystem
--- writes. The previous `write_config_file` form is deleted entirely:
--- a tmp file with a predictable name and umask-defaulted mode (0644)
--- is a CVE-class TOCTOU surface on a multi-user host. Threading the
--- bytes through an env var inherits the process's standard env scoping
--- (visible to the spawn child, scrubbed from hooks at §13.5.1) without
--- crossing the filesystem.
---
--- Defensive size cap: if the base64 length exceeds 64 KiB, raise
--- `WEZSESH_CONFIG_TOO_LARGE`. ARG_MAX is 2 MB on Linux / 1 MB on
--- darwin so the envvar route has plenty of headroom for the < 4 KB
--- config we ship today; the cap is cheap insurance against an
--- accidental future field that balloons the body.
+-- Builds the resolved-config Lua table that the `bootstrap` IPC verb
+-- echoes back to the Go binary at TUI startup. Pure on `opts`; no
+-- filesystem writes. The previous `WEZSESH_CONFIG_JSON_BASE64`
+-- env-blob route is gone — config now flows over the canonical-JSON
+-- + HMAC IPC channel like every other verb-shaped data exchange.
 
--- Default keys table — copied here so build_config_envvar is a pure
+-- Default keys table — copied here so build_bootstrap_body is a pure
 -- function of `opts`. apply_to_config merges user overrides into this
 -- table before calling us.
 local DEFAULT_KEYS = {
@@ -254,6 +245,30 @@ local DEFAULT_KEYS = {
 local function copy_keys(t)
     local out = {}
     for k, v in pairs(t) do out[k] = v end
+    return out
+end
+
+-- Shallow-copy the stashed dir-provider config list. Each entry is
+-- itself shallow-copied (one extra level for argv / paths arrays)
+-- so build_bootstrap_body can tag the result with
+-- canonical_json.array without mutating the live runtime stash.
+local function copy_dir_providers()
+    local list = dir_providers.get()
+    local out = {}
+    for i = 1, #list do
+        local entry = list[i]
+        local e = {}
+        for k, v in pairs(entry) do
+            if type(v) == "table" then
+                local sub = {}
+                for kk, vv in pairs(v) do sub[kk] = vv end
+                e[k] = sub
+            else
+                e[k] = v
+            end
+        end
+        out[i] = e
+    end
     return out
 end
 
@@ -302,14 +317,21 @@ local function resolve_argv_allowlist(v)
     return v
 end
 
-function M.build_config_envvar(opts)
+-- Build the config body — the same shape that flows over the
+-- `bootstrap` IPC verb's reply and (until the C4 cutover) through
+-- `WEZSESH_CONFIG_JSON_BASE64`. Every top-level key the binary
+-- expects is emitted unconditionally so the binary's loader can rely
+-- on a stable shape even when the user hasn't set the field.
+--
+-- `preview.width` is an integer percent (0–100), not a float fraction.
+-- The wire is integer-only (canonical-JSON §4.1 rule 3 rejects
+-- floats); 40 means "preview pane gets 40% of total width."
+--
+-- `dir_providers` is a placeholder empty array in C1; the declarative
+-- provider configs land in C5 and ride the same field.
+function M.build_bootstrap_body(opts)
     opts = opts or {}
-
-    -- Build the config body. Every top-level key the binary expects is
-    -- emitted unconditionally so the binary's `config.Load` can rely
-    -- on a stable shape even when the user hasn't set the field.
-    local body = {
-        version          = 1,
+    return {
         snapshot_dir     = opts.snapshot_dir or "",
         state_dir        = opts.state_dir or "",
         runtime_dir      = opts.runtime_dir or "",
@@ -323,7 +345,7 @@ function M.build_config_envvar(opts)
         confirm_overwrite = opts.confirm_overwrite ~= false,
         exclude          = opts.exclude or { "^default$" },
         new_workspace_command = opts.new_workspace_command,
-        preview          = opts.preview or { enabled = true, width = 0.4 },
+        preview          = opts.preview or { enabled = true, width = 40 },
         markers          = opts.markers or {
             active = "▶", live = "●", marked = "✓",
             unsaved = "(unsaved)", pinned = "[pinned]",
@@ -346,15 +368,17 @@ function M.build_config_envvar(opts)
             opts.resurrect_argv_allowlist),
         keys             = opts.keys or copy_keys(DEFAULT_KEYS),
         plugin_version   = M.VERSION,
-        proto_version    = 1,
+        -- Pull the declarative dir-provider configs from the stash
+        -- populated at apply_to_config time. Shallow-copy the list
+        -- before tagging so canonical_json.array's setmetatable
+        -- doesn't mutate the live module-local store (the same store
+        -- the bootstrap dispatch reads on each request would
+        -- otherwise carry a stale array_mt across reloads). Each
+        -- per-entry config is a plain key/value Lua table; the
+        -- canonical encoder's deep_tag handles them in place when
+        -- the reply is encoded.
+        dir_providers    = canonical_json.array(copy_dir_providers()),
     }
-
-    local encoded = wezterm.json_encode(body)
-    local b64s = b64.encode(encoded)
-    if #b64s > 64 * 1024 then
-        error("WEZSESH_CONFIG_TOO_LARGE: encoded config exceeds 64 KiB", 0)
-    end
-    return b64s
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -362,12 +386,12 @@ end
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Builds the env vector EXACTLY:
---   WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_JSON_BASE64,
---   WEZSESH_PLUGIN_VERSION
--- — no more, no less. Dirs travel inside `WEZSESH_CONFIG_JSON_BASE64`
--- as a base64-encoded JSON document; no tmp file is involved on the
--- handoff path (the previous `WEZSESH_CONFIG_FILE` route was a
--- predictable-name TOCTOU surface and is gone).
+--   WEZSESH_HMAC_KEY, WEZSESH_PLUGIN_VERSION, WEZSESH_RUNTIME_DIR
+-- — plus PATH on macOS launchd contexts. The full config body flows
+-- over the `bootstrap` IPC verb at TUI startup; the env vector
+-- carries only what the binary needs BEFORE the bootstrap roundtrip
+-- (the HMAC key for IPC auth, the runtime_dir to find the socket
+-- dir, and the plugin version for fail-fast drift detection).
 --
 -- spawn_mode dispatch:
 --   "window" → wezterm.mux.spawn_window{ args=…, set_environment_variables=… }
@@ -393,14 +417,20 @@ function M.spawn(window, opts)
         return nil, "WEZSESH_SESSION_KEY_MISSING"
     end
 
-    local config_b64 = M.build_config_envvar(opts)
     local bin = M.resolve_binary(opts)
 
+    -- runtime_dir flows as an explicit env var so the binary can
+    -- reach the IPC socket dir BEFORE bootstrap returns (chicken/egg:
+    -- the bootstrap call needs the dispatcher up, the dispatcher
+    -- needs runtime_dir). The default mirrors `ipc.register` and
+    -- `globals.set_runtime_dir` below in init.lua.
+    local rt = opts.runtime_dir
+    if type(rt) ~= "string" or rt == "" then rt = "/tmp/wezsesh" end
+
     local env = {
-        WEZSESH_HMAC_KEY            = key,
-        WEZSESH_PROTO_VERSION       = "1",
-        WEZSESH_CONFIG_JSON_BASE64  = config_b64,
-        WEZSESH_PLUGIN_VERSION      = M.VERSION,
+        WEZSESH_HMAC_KEY        = key,
+        WEZSESH_PLUGIN_VERSION  = M.VERSION,
+        WEZSESH_RUNTIME_DIR     = rt,
     }
 
     -- macOS GUI launch contexts hand spawned children a minimal launchd

@@ -204,9 +204,16 @@ local bg_should_raise = false
 -- reproducible.
 local FIXTURE_KEY_HEX =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+-- Deterministic plugin_session_id for the v=2 envelope correlation
+-- assertions. Production mints this once per `apply_to_config` via
+-- runtime/crypto/ulid.lua; the spec stubs it via GLOBAL so the
+-- result.lua resolver picks it up the same way it does in production
+-- (through `globals.plugin_session_id()`).
+local FIXTURE_PLUGIN_SESSION_ID = "01JTESTPLUGIN_____________"
 local global_store = {
     wezsesh_bin_path = "/usr/local/bin/wezsesh",
     wezsesh_session_key = FIXTURE_KEY_HEX,
+    wezsesh_plugin_session_id = FIXTURE_PLUGIN_SESSION_ID,
 }
 
 local global_proxy = setmetatable({}, {
@@ -249,6 +256,7 @@ local function reset_state()
     bg_should_raise = false
     global_store.wezsesh_bin_path = "/usr/local/bin/wezsesh"
     global_store.wezsesh_session_key = FIXTURE_KEY_HEX
+    global_store.wezsesh_plugin_session_id = FIXTURE_PLUGIN_SESSION_ID
 end
 
 local function it(name, fn)
@@ -287,17 +295,49 @@ end
 -- table for shape assertions. Mirrors what `wezsesh reply` does on
 -- the binary side.
 local b64 = require("wezsesh.crypto.b64")
+
+-- The spawn argv shape depends on whether `payload.binary_session_id`
+-- is present (§3.3 v=2): with bsid we shell out via `/usr/bin/env
+-- WEZSESH_BINARY_SESSION_ID=<bsid> <bin> reply <sock> <b64>` so the
+-- spawned `wezsesh reply` child inherits the trace-correlation env
+-- var; without bsid we fall back to the bare-argv `<bin> reply <sock>
+-- <b64>` shape. parse_argv normalises both into a flat record so the
+-- assertions below don't have to repeat the shape detection.
+local function parse_argv(argv)
+    if argv[1] == "/usr/bin/env" then
+        local env_pair = argv[2]
+        local env_key, env_val = env_pair:match("^([^=]+)=(.*)$")
+        return {
+            env_form          = true,
+            env_key           = env_key,
+            env_val           = env_val,
+            bin               = argv[3],
+            verb              = argv[4],
+            reply_sock        = argv[5],
+            b64               = argv[6],
+        }
+    end
+    return {
+        env_form   = false,
+        bin        = argv[1],
+        verb       = argv[2],
+        reply_sock = argv[3],
+        b64        = argv[4],
+    }
+end
+
 local function last_envelope()
     assert_true(#bg_calls > 0,
         "expected at least one wezterm.background_child_process call")
     local argv = bg_calls[#bg_calls]
-    assert_eq(argv[1], "/usr/local/bin/wezsesh",
-        "argv[1] not the wezsesh binary path")
-    assert_eq(argv[2], "reply", "argv[2] not 'reply'")
-    assert_true(type(argv[3]) == "string" and #argv[3] > 0,
-        "argv[3] (reply_sock) missing")
-    local json = b64.decode(argv[4])
-    assert_true(json ~= nil, "argv[4] was not valid b64")
+    local p = parse_argv(argv)
+    assert_eq(p.bin, "/usr/local/bin/wezsesh",
+        "argv: bin not the wezsesh binary path")
+    assert_eq(p.verb, "reply", "argv: verb not 'reply'")
+    assert_true(type(p.reply_sock) == "string" and #p.reply_sock > 0,
+        "argv: reply_sock missing")
+    local json = b64.decode(p.b64)
+    assert_true(json ~= nil, "argv: b64 payload was not valid b64")
     return json_parse_shim(json), argv
 end
 
@@ -308,9 +348,10 @@ local function last_wire_json()
     assert_true(#bg_calls > 0,
         "expected at least one wezterm.background_child_process call")
     local argv = bg_calls[#bg_calls]
-    local json = b64.decode(argv[4])
+    local p = parse_argv(argv)
+    local json = b64.decode(p.b64)
     assert_true(type(json) == "string" and #json > 0,
-        "argv[4] did not decode to non-empty string")
+        "argv: b64 payload did not decode to non-empty string")
     return json
 end
 
@@ -333,15 +374,17 @@ local function assert_hmac_present(json)
 end
 
 -- A canonical "valid request payload" stub. Each reply_* takes a
--- payload and reads `v`, `id`, `reply_sock` from it. The verb-specific
--- tests below mutate `op` and the data shape per verb.
+-- payload and reads `v`, `id`, `reply_sock`, `binary_session_id` from
+-- it. The verb-specific tests below mutate `op` and the data shape
+-- per verb.
 local function fixture_payload(op)
     return {
-        v          = 1,
-        id         = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        ts         = 1700000000,
-        op         = op or "noop",
-        reply_sock = "/tmp/wezsesh-1000/abcdef01.sock",
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        ts                = 1700000000,
+        op                = op or "noop",
+        reply_sock        = "/tmp/wezsesh-1000/abcdef01.sock",
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
     }
 end
 
@@ -364,33 +407,103 @@ describe("module surface", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- every reply carries `v: 1`
+-- every reply echoes `v` from the request
 -- ────────────────────────────────────────────────────────────────────
 
-describe("every reply carries `v: 1`", function()
+describe("every reply echoes payload.v", function()
     it("reply_started echoes payload.v", function()
         result.reply_started(fixture_payload())
         local env = last_envelope()
-        assert_eq(env.v, 1, "started: v != 1")
+        assert_eq(env.v, 2, "started: v != 2")
     end)
 
     it("reply_completed echoes payload.v", function()
         result.reply_completed(fixture_payload(), { foo = "bar" })
         local env = last_envelope()
-        assert_eq(env.v, 1, "completed: v != 1")
+        assert_eq(env.v, 2, "completed: v != 2")
     end)
 
     it("reply_partial echoes payload.v", function()
         result.reply_partial(fixture_payload(), { foo = "bar" },
             {{ code = "RESURRECT_PARTIAL", message = "x", details = {} }})
         local env = last_envelope()
-        assert_eq(env.v, 1, "partial: v != 1")
+        assert_eq(env.v, 2, "partial: v != 2")
     end)
 
     it("reply_error echoes payload.v", function()
         result.reply_error(fixture_payload(), "UNKNOWN_VERB", "msg", {})
         local env = last_envelope()
-        assert_eq(env.v, 1, "error: v != 1")
+        assert_eq(env.v, 2, "error: v != 2")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- v=2 envelope correlation fields
+-- ────────────────────────────────────────────────────────────────────
+
+describe("session-id correlation fields (v=2)", function()
+    it("reply_started echoes binary_session_id and stamps "
+        .. "plugin_session_id", function()
+        result.reply_started(fixture_payload())
+        local env = last_envelope()
+        assert_eq(env.binary_session_id, "01JABCDEFGHJKMNPQRSTVWXYZB",
+            "binary_session_id not echoed")
+        -- plugin_session_id is read from globals.plugin_session_id();
+        -- the spec seeds wezsesh_plugin_session_id to a deterministic
+        -- fixture so the resolver returns it.
+        assert_eq(env.plugin_session_id, FIXTURE_PLUGIN_SESSION_ID,
+            "plugin_session_id should be the GLOBAL-seeded fixture")
+    end)
+
+    it("reply_completed echoes both session ids", function()
+        result.reply_completed(fixture_payload(), { foo = "bar" })
+        local env = last_envelope()
+        assert_eq(env.binary_session_id, "01JABCDEFGHJKMNPQRSTVWXYZB",
+            "completed: binary_session_id not echoed")
+        assert_eq(env.plugin_session_id, FIXTURE_PLUGIN_SESSION_ID,
+            "completed: plugin_session_id wrong")
+    end)
+
+    it("reply_partial echoes both session ids", function()
+        result.reply_partial(fixture_payload(), { foo = "bar" },
+            {{ code = "RESURRECT_PARTIAL", message = "x", details = {} }})
+        local env = last_envelope()
+        assert_eq(env.binary_session_id, "01JABCDEFGHJKMNPQRSTVWXYZB",
+            "partial: binary_session_id not echoed")
+        assert_eq(env.plugin_session_id, FIXTURE_PLUGIN_SESSION_ID,
+            "partial: plugin_session_id wrong")
+    end)
+
+    it("reply_error echoes both session ids", function()
+        result.reply_error(fixture_payload(), "UNKNOWN_VERB", "msg", {})
+        local env = last_envelope()
+        assert_eq(env.binary_session_id, "01JABCDEFGHJKMNPQRSTVWXYZB",
+            "error: binary_session_id not echoed")
+        assert_eq(env.plugin_session_id, FIXTURE_PLUGIN_SESSION_ID,
+            "error: plugin_session_id wrong")
+    end)
+
+    it("a payload missing binary_session_id falls back to '' "
+        .. "(degraded but signed)", function()
+        local p = fixture_payload()
+        p.binary_session_id = nil
+        result.reply_started(p)
+        local env = last_envelope()
+        assert_eq(env.binary_session_id, "",
+            "missing payload bsid did not degrade to empty string")
+    end)
+
+    it("absent plugin_session_id (mint hadn't run yet) degrades to ''",
+    function()
+        -- Pre-`apply_to_config` window: globals.plugin_session_id()
+        -- returns nil because init.lua hasn't minted yet. The reply
+        -- builder MUST still emit the field as "" so the canonical-
+        -- shape walker accepts the envelope.
+        global_store.wezsesh_plugin_session_id = nil
+        result.reply_started(fixture_payload())
+        local env = last_envelope()
+        assert_eq(env.plugin_session_id, "",
+            "nil plugin_session_id should degrade to empty string")
     end)
 end)
 
@@ -409,13 +522,15 @@ describe("started reply: invariants", function()
         assert_nil(env.error, "started must NOT carry error")
     end)
 
-    it("started carries id + v + hmac exactly, nothing else", function()
+    it("started carries v=2 envelope keys exactly, nothing else",
+    function()
         result.reply_started(fixture_payload())
         local env = last_envelope()
         local keys = {}
         for k in pairs(env) do keys[#keys + 1] = k end
         table.sort(keys)
-        assert_eq(table.concat(keys, ","), "hmac,id,ok,status,v",
+        assert_eq(table.concat(keys, ","),
+            "binary_session_id,hmac,id,ok,plugin_session_id,status,v",
             "started envelope has unexpected fields: "
             .. table.concat(keys, ","))
     end)
@@ -568,18 +683,43 @@ end)
 -- spawn argv shape — `wezsesh reply <sock> <b64>`
 -- ────────────────────────────────────────────────────────────────────
 
-describe("spawn argv: `wezsesh reply <sock> <b64>`",
+describe("spawn argv: `/usr/bin/env WEZSESH_BINARY_SESSION_ID=… wezsesh "
+    .. "reply <sock> <b64>`",
 function()
-    it("argv[1] is the bin path; argv[2] is 'reply'; argv[3] is the "
-        .. "sock; argv[4] is base64", function()
+    it("env-form argv: env, KEY=VAL, bin, 'reply', sock, b64 with "
+        .. "binary_session_id threaded into the spawn env", function()
         result.reply_started(fixture_payload())
         local _, argv = last_envelope()
-        assert_eq(#argv, 4, "argv must have exactly 4 elements")
-        assert_eq(argv[2], "reply", "argv[2] must be 'reply'")
-        assert_eq(argv[3], "/tmp/wezsesh-1000/abcdef01.sock",
-            "argv[3] must be the request's reply_sock")
-        -- argv[4] must be non-empty base64 (decoded above into env).
-        assert_true(#argv[4] > 0, "argv[4] (b64 payload) must be non-empty")
+        assert_eq(#argv, 6, "argv (env-form) must have exactly 6 elements")
+        assert_eq(argv[1], "/usr/bin/env",
+            "argv[1] must be /usr/bin/env (POSIX env(1))")
+        local p = parse_argv(argv)
+        assert_true(p.env_form, "expected env-form argv")
+        assert_eq(p.env_key, "WEZSESH_BINARY_SESSION_ID",
+            "env-pair key must be WEZSESH_BINARY_SESSION_ID")
+        assert_eq(p.env_val, fixture_payload().binary_session_id,
+            "env-pair value must echo payload.binary_session_id")
+        assert_eq(p.bin, "/usr/local/bin/wezsesh",
+            "bin path must be the wezsesh binary")
+        assert_eq(p.verb, "reply", "verb must be 'reply'")
+        assert_eq(p.reply_sock, "/tmp/wezsesh-1000/abcdef01.sock",
+            "reply_sock must be the request's reply_sock")
+        assert_true(#p.b64 > 0, "b64 payload must be non-empty")
+    end)
+
+    it("falls back to bare argv when payload.binary_session_id is "
+        .. "missing or malformed (legacy / fixture harness path)",
+    function()
+        local p = fixture_payload()
+        p.binary_session_id = nil
+        result.reply_started(p)
+        local _, argv = last_envelope()
+        assert_eq(#argv, 4, "argv (bare-form) must have exactly 4 elements")
+        local parsed = parse_argv(argv)
+        assert_false(parsed.env_form, "expected bare-form argv")
+        assert_eq(parsed.bin, "/usr/local/bin/wezsesh",
+            "bin path must be the wezsesh binary")
+        assert_eq(parsed.verb, "reply", "verb must be 'reply'")
     end)
 end)
 
@@ -787,7 +927,7 @@ function()
     it("noop's empty data is '{}', not '[]'", function()
         result.reply_completed(fixture_payload("noop"), nil)
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"data":{}', 1, true) ~= nil,
             "expected '\"data\":{}' in envelope, got: " .. json)
         assert_false(json:find('"data":[]', 1, true),
@@ -797,7 +937,7 @@ function()
     it("error's empty details is '{}', not '[]'", function()
         result.reply_error(fixture_payload(), "X", "msg", nil)
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"details":{}', 1, true) ~= nil,
             "expected '\"details\":{}' in envelope, got: " .. json)
         assert_false(json:find('"details":[]', 1, true),
@@ -807,7 +947,7 @@ function()
     it("partial's empty warnings is '[]', not '{}'", function()
         result.reply_partial(fixture_payload(), nil, nil)
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"warnings":%[%]') ~= nil,
             "expected '\"warnings\":[]' in envelope, got: " .. json)
         assert_false(json:find('"warnings":{}', 1, true),
@@ -817,7 +957,7 @@ function()
     it("partial's empty data is '{}', not '[]'", function()
         result.reply_partial(fixture_payload(), nil, nil)
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"data":{}', 1, true) ~= nil,
             "expected '\"data\":{}' in envelope, got: " .. json)
     end)
@@ -826,7 +966,7 @@ function()
         local p = fixture_payload("bogus")
         result.reply_error(p, "UNKNOWN_VERB", "unknown verb: bogus", nil)
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"details":{}', 1, true) ~= nil,
             "UNKNOWN_VERB must emit '\"details\":{}', got: " .. json)
     end)
@@ -901,16 +1041,17 @@ describe("M.toast", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- deep_tag covers verb-supplied untagged subtables — list_dirs hands
--- result a `{ dirs = { { name, path }, ... } }` shape with bare
--- subtables; the canonical encoder raises ENCODER_UNTAGGED_TABLE on
--- anything not pre-tagged, so the rebuilder MUST walk through nested
--- containers before encoding.
+-- deep_tag covers verb-supplied untagged subtables. Verbs that hand
+-- result.reply_completed a `{ outer = { { ...row... }, ... } }` shape
+-- with bare untagged subtables (e.g. bootstrap's `dir_providers =
+-- [{type, argv}, ...]`) trip the canonical encoder's
+-- ENCODER_UNTAGGED_TABLE check unless the rebuilder walks through
+-- nested containers and tags them first.
 -- ────────────────────────────────────────────────────────────────────
 
 describe("deep_tag covers nested untagged tables", function()
-    it("list_dirs-style nested rows encode without raising", function()
-        local p = fixture_payload("list_dirs")
+    it("bootstrap-style nested rows encode without raising", function()
+        local p = fixture_payload("bootstrap")
         local rows = {
             { name = "alpha", path = "/tmp/alpha" },
             { name = "beta",  path = "/tmp/beta"  },
@@ -919,11 +1060,11 @@ describe("deep_tag covers nested untagged tables", function()
         assert_true(ok,
             "nested untagged rows must not trip the canonical encoder")
         local env = last_envelope()
-        assert_eq(env.status, "completed", "list_dirs: status wrong")
+        assert_eq(env.status, "completed", "status wrong")
         assert_eq(env.data.dirs[1].name, "alpha",
-            "list_dirs: row 1 name lost")
+            "row 1 name lost")
         assert_eq(env.data.dirs[2].path, "/tmp/beta",
-            "list_dirs: row 2 path lost")
+            "row 2 path lost")
     end)
 
     it("deeply nested empty subtables default to object on the wire",
@@ -933,7 +1074,7 @@ describe("deep_tag covers nested untagged tables", function()
             { outer = { inner = {} } })
         assert_true(ok, "deep empty subtables must encode")
         local _, argv = last_envelope()
-        local json = b64.decode(argv[4])
+        local json = b64.decode(parse_argv(argv).b64)
         assert_true(json:find('"inner":{}', 1, true) ~= nil,
             "expected '\"inner\":{}' in envelope, got: " .. json)
     end)
@@ -969,7 +1110,7 @@ function()
             "fallback envelope: code wrong")
         -- v + id are echoed from the request so the binary's reply
         -- correlator can match it back to the in-flight call.
-        assert_eq(env.v, 1, "fallback envelope: v not echoed")
+        assert_eq(env.v, 2, "fallback envelope: v not echoed")
         assert_eq(env.id, p.id, "fallback envelope: id not echoed")
     end)
 

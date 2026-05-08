@@ -170,10 +170,10 @@ local function build_signed_payload(overrides)
     if args == nil then
         if op == "noop" then
             args = canonical_json.object{}
+        elseif op == "bootstrap" then
+            args = canonical_json.object{}
         elseif op == "switch" then
             args = canonical_json.object{ name = "main", cwd = "" }
-        elseif op == "list_dirs" then
-            args = canonical_json.object{ query = "" }
         elseif op == "load" then
             args = canonical_json.object{ name = "main" }
         elseif op == "new" then
@@ -192,14 +192,16 @@ local function build_signed_payload(overrides)
         end
     end
     local payload = {
-        v                = overrides.v or 1,
-        id               = overrides.id or valid_ulid(),
-        ts               = overrides.ts or DEFAULT_NOW,
-        target_window_id = overrides.target_window_id or DEFAULT_WINDOW_ID,
-        reply_sock       = overrides.reply_sock
-                          or "/tmp/wezsesh-fuzz/abcdef01.sock",
-        op               = op,
-        args             = args,
+        v                 = overrides.v or 2,
+        id                = overrides.id or valid_ulid(),
+        ts                = overrides.ts or DEFAULT_NOW,
+        target_window_id  = overrides.target_window_id or DEFAULT_WINDOW_ID,
+        reply_sock        = overrides.reply_sock
+                           or "/tmp/wezsesh-fuzz/abcdef01.sock",
+        op                = op,
+        args              = args,
+        binary_session_id = overrides.binary_session_id
+                           or "01JABCDEFGHJKMNPQRSTVWXYZB",
     }
     local shape = canonical_json.verb_args_shape[op]
     if shape == nil then return payload end
@@ -375,10 +377,11 @@ local function build_file_class(payload_table, want_id)
 end
 
 local function gen_field_missing(idx)
-    -- 7 required root fields (sans hmac which is 8th):
-    -- v, id, ts, target_window_id, reply_sock, op, args, hmac.
+    -- All required root fields at v=2: v, id, ts, target_window_id,
+    -- reply_sock, op, args, hmac, binary_session_id.
     local fields = { "v", "id", "ts", "target_window_id",
-                     "reply_sock", "op", "args", "hmac" }
+                     "reply_sock", "op", "args", "hmac",
+                     "binary_session_id" }
     local payload = build_signed_payload{ op = "noop" }
     local drop = fields[(idx - 1) % #fields + 1]
     payload[drop] = nil
@@ -474,7 +477,7 @@ local function gen_control_char_field()
     return build_file_class(payload, payload.id)
 end
 
-local VERBS = { "noop", "switch", "load", "save", "new", "list_dirs" }
+local VERBS = { "noop", "bootstrap", "switch", "load", "save", "new" }
 
 local function gen_hmac_corrupted()
     -- Properly signed payload, last hex char of payload.hmac flipped
@@ -522,10 +525,12 @@ local function gen_unknown_verb()
 end
 
 local function gen_v_field_swap(branch)
-    -- v="1" (string), v=2 (wrong int), v=null (nil after json_parse).
-    -- All three must reject at validate_payload (step (d)).
-    local cases = { "1", 2, "nil" }
-    local c = cases[((branch - 1) % 3) + 1]
+    -- v="2" (string), v=1 (skewed-down int), v=3 (skewed-up int),
+    -- v=null (nil after json_parse). All four must reject at
+    -- validate_payload (step (d)) — v=1 is the loud
+    -- WIRE_VERSION_MISMATCH after the v=1 → v=2 bump.
+    local cases = { "2", 1, 3, "nil" }
+    local c = cases[((branch - 1) % #cases) + 1]
     local payload = build_signed_payload{ op = "noop" }
     if c == "nil" then payload.v = nil
     else payload.v = c
@@ -726,10 +731,12 @@ function(_)
     return drive("control_char_field", v, fe, false)
 end)
 
--- 11. empty_args_per_verb — 10 × cycling all 5 verbs (so 2 sweeps).
--- Only `noop` legitimately dispatches (empty args satisfies its
--- shape); switch/load/save/new fail at tag_in_place because their
--- shapes require concrete fields on args.
+-- 11. empty_args_per_verb — sweeps every wire verb (cycle length =
+-- #VERBS).
+-- `noop` and `bootstrap` legitimately dispatch (their args_shape is
+-- `{ _shape = "object" }` with no required keys, so an empty args
+-- object satisfies the shape). switch/load/save/new/list_dirs fail
+-- at tag_in_place because their shapes require concrete args fields.
 run_class("empty_args_per_verb", plan("empty_args_per_verb", 10),
 function(i)
     -- Inline build (instead of gen_empty_args_per_verb) so we can
@@ -741,11 +748,7 @@ function(i)
     local v, fe, bytes = build_file_class(payload, payload.id)
     total_mutations = total_mutations + 1
     total_bytes = total_bytes + bytes
-    -- Only `noop` legitimately dispatches: its verb_args_shape is
-    -- `{ _shape = "object" }`, and an empty args object satisfies
-    -- it. switch/load/save/new have required keys so step (e)'s
-    -- tag_in_place raises CANONICAL_SHAPE_MISMATCH.
-    local must = (op == "noop")
+    local must = (op == "noop" or op == "bootstrap")
     return drive("empty_args_per_verb[" .. op .. "]", v, fe, must)
 end)
 

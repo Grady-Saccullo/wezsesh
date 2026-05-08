@@ -20,14 +20,23 @@ type Dispatcher interface {
 }
 
 // Reply mirrors the wire reply envelope.
+//
+// BinarySessionID echoes the request's binary_session_id (so a reply
+// observer doesn't need to hold request-side state to correlate).
+// PluginSessionID is minted on the plugin side at apply_to_config and
+// stamped on every reply; the dispatcher captures it the first time
+// it lands and uses it to augment the per-request trace logger so
+// follow-on records carry both ids.
 type Reply struct {
-	V        int
-	ID       string
-	Status   string
-	OK       bool
-	Data     map[string]any
-	Warnings []Warning
-	Error    *ReplyError
+	V               int
+	ID              string
+	Status          string
+	OK              bool
+	BinarySessionID string
+	PluginSessionID string
+	Data            map[string]any
+	Warnings        []Warning
+	Error           *ReplyError
 }
 
 // Warning mirrors a single reply warning entry.

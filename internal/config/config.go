@@ -4,17 +4,17 @@
 // resolution table in §11.4; auto-detection in §12.5 / §12.2.
 package config
 
-import "regexp"
+import (
+	"regexp"
 
-// Config is the binary-side configuration loaded from
-// $WEZSESH_CONFIG_JSON_BASE64. Field shapes follow §8.19; the JSON keys
-// match §10.7.
+	"github.com/Grady-Saccullo/wezsesh/internal/dirproviders"
+)
+
+// Config is the binary-side configuration. Loaded historically from
+// $WEZSESH_CONFIG_JSON_BASE64; under the bootstrap-verb migration it
+// also flows over the IPC reply shape via `LoadFromBootstrapData`.
+// Field shapes follow §8.19; the JSON keys match §10.7.
 type Config struct {
-	// Version is the §10.7 schema version (currently 1). Captured so a
-	// future migration can key off the file value; no runtime behaviour
-	// today.
-	Version int `json:"version"`
-
 	SnapshotDir string `json:"snapshot_dir"`
 	StateDir    string `json:"state_dir"`
 	RuntimeDir  string `json:"runtime_dir"`
@@ -46,8 +46,12 @@ type Config struct {
 	NewWorkspaceCommand string `json:"new_workspace_command"`
 
 	Preview struct {
-		Enabled bool    `json:"enabled"`
-		Width   float64 `json:"width"`
+		Enabled bool `json:"enabled"`
+		// Width is an integer percent (0–100) of the total pane width
+		// to allocate to the preview pane. The wire is integer-only —
+		// canonical-JSON §4.1 rule 3 rejects floats — so a fractional
+		// "0.4" becomes the integer "40". Defaults to 40.
+		Width int `json:"width"`
 	} `json:"preview"`
 
 	Markers      Markers  `json:"markers"`
@@ -67,7 +71,13 @@ type Config struct {
 	Keys KeyMap `json:"keys"`
 
 	PluginVersion string `json:"plugin_version"`
-	ProtoVersion  int    `json:"proto_version"`
+
+	// DirProviders carries the user's declarative directory-row
+	// providers (command / directory / static). Populated only on the
+	// bootstrap-IPC path (LoadFromBootstrapData); LoadFromEnv (the
+	// non-TUI subcommands) leaves it nil since those subcommands
+	// never enumerate dir-provider rows.
+	DirProviders []dirproviders.Config `json:"dir_providers,omitempty"`
 }
 
 // Markers mirrors the §10.7 markers object; defaults per §11 / §10.7.

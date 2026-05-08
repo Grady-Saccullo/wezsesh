@@ -78,14 +78,47 @@ var errMissingPaneID = errors.New("WEZTERM_PANE not set; pass --pane-id <int> wh
 // errBadHMACKey is the validate-hmac-key gate on the TUI path.
 var errBadHMACKey = errors.New("WEZSESH_HMAC_KEY is not 64 lowercase hex chars")
 
+// errMissingRuntimeDir surfaces when WEZSESH_RUNTIME_DIR is unset on
+// the TUI path. The plugin sets it explicitly at spawn so the binary
+// can reach the IPC socket dir BEFORE the bootstrap-verb roundtrip
+// lands the rest of the config.
+var errMissingRuntimeDir = errors.New("WEZSESH_RUNTIME_DIR not set; the TUI requires the plugin to set it at spawn")
+
+// bootstrapFetcher is the seam tests use to bypass the live
+// IPC-bootstrap roundtrip. Production wires `defaultBootstrapFetch`,
+// which calls `ipc.AwaitTerminal` against the real dispatcher; tests
+// substitute a fake that returns a synthesised *config.Config.
+type bootstrapFetcher func(ctx context.Context, disp ipc.Dispatcher) (*config.Config, error)
+
+// defaultBootstrapFetch is the production bootstrap fetch. Calls the
+// `bootstrap` IPC verb, validates the reply, and decodes the data
+// map into a *config.Config via config.LoadFromBootstrapData.
+func defaultBootstrapFetch(ctx context.Context, disp ipc.Dispatcher) (*config.Config, error) {
+	reply, err := ipc.AwaitTerminal(ctx, disp, "bootstrap", map[string]any{})
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+	if !reply.OK {
+		if reply.Error != nil {
+			return nil, fmt.Errorf("bootstrap: %s: %s", reply.Error.Code, reply.Error.Message)
+		}
+		return nil, errors.New("bootstrap: ok=false with no error object")
+	}
+	cfg, err := config.LoadFromBootstrapData(ctx, reply.Data)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap decode: %w", err)
+	}
+	return cfg, nil
+}
+
 // hookEnvScrub is the §13.5.1 set of env var names dropped before
-// invoking any user hook. WEZSESH_LOG / WEZSESH_NO_HOOKS /
-// WEZSESH_NERDFONT survive intentionally (§17.3 row "Hook env:
-// WEZSESH_LOG survives").
+// invoking any user hook. Post-bootstrap-cutover the only sensitive
+// var is WEZSESH_HMAC_KEY; WEZSESH_RUNTIME_DIR is a path (not a
+// secret) and WEZSESH_PLUGIN_VERSION is plain metadata. WEZSESH_LOG /
+// WEZSESH_NO_HOOKS / WEZSESH_NERDFONT survive intentionally (§17.3
+// row "Hook env: WEZSESH_LOG survives").
 var hookEnvScrub = []string{
 	"WEZSESH_HMAC_KEY",
-	"WEZSESH_PROTO_VERSION",
-	"WEZSESH_CONFIG_JSON_BASE64",
 }
 
 // runtimeEnv bundles every dependency main.go's helpers consume.
@@ -125,18 +158,44 @@ type runtimeEnv struct {
 var runTUIPanicHook func()
 
 func main() {
+	// Mint a per-process ULID for use as the binary_session_id on every
+	// log record (CLAUDE.md "Tracing & correlation"). Done before any
+	// subcommand dispatch so even keygen / doctor / tail records carry
+	// the id. Re-uses the dispatcher's existing ULID encoder rather
+	// than pulling in github.com/oklog/ulid for one value (§3.3 ULID
+	// shape is the same).
+	binarySessionID, _, err := ipcdispatcher.NewULID()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wezsesh: ulid: %v\n", err)
+		os.Exit(exitInitFailed)
+	}
+	// Propagate to child processes (e.g. wezsesh reply spawned by the
+	// plugin) so they can stamp the same id into their own records.
+	// Setenv on the process, not Setenv on a per-cmd Env: the binary's
+	// own subcommand handlers and any goroutines they spawn share this
+	// process env, and downstream exec.Cmd defaults to os.Environ().
+	if err := os.Setenv("WEZSESH_BINARY_SESSION_ID", binarySessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "wezsesh: setenv: %v\n", err)
+		os.Exit(exitInitFailed)
+	}
+
 	args := os.Args[1:]
-	code := run(args, os.Stdout, os.Stderr)
+	code := run(args, os.Stdout, os.Stderr, binarySessionID)
 	os.Exit(code)
 }
 
 // run is the testable entry point: pure on os.Args, returns the
 // requested exit code. main() wraps it with os.Exit.
 //
+// binarySessionID is the per-process ULID minted in main(); production
+// callers pass the value, tests synthesise their own. It is threaded
+// through to logger.New and ipcdispatcher.Deps so every Go-side log
+// record and every outgoing request envelope carries it.
+//
 // The top-level recover for the TUI path is installed inside runTUI;
 // non-TUI subcommands have their own §13.14 panic handlers (each
 // subcommand body installs its own when it lands).
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdout, stderr io.Writer, binarySessionID string) int {
 	flags, sub, rest, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "wezsesh: %v\n", err)
@@ -150,7 +209,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch sub {
 	case "":
-		return runTUI(flags, stdout, stderr)
+		return runTUI(flags, stdout, stderr, binarySessionID)
 	case "keygen":
 		return subcmdKeygen(rest, stdout, stderr)
 	case "reply":
@@ -169,6 +228,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// §8.20 / §0.1 row 8: deprecated alias for reset; the toast is
 		// emitted from subcmdReset when invokedAs == "nuke".
 		return subcmdReset("nuke", rest, stdout, stderr)
+	case "tail":
+		return subcmdTail(rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "wezsesh: unknown subcommand %q\n", sub)
 		return exitDoctorOrSubcmd
@@ -204,7 +265,7 @@ func parseArgs(args []string) (parsedFlags, string, []string, error) {
 // runTUI executes the §8.20.1 step-4 startup sequence and hands control
 // to bubbletea. The top-level defer recover() is registered first so it
 // catches every panic in the setup tail.
-func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
+func runTUI(flags parsedFlags, _, stderr io.Writer, binarySessionID string) (rc int) {
 	rc = exitOK
 	// §8.20.1 step 5 / §13.1 panic path: top-level recover. The
 	// dispatcher reference is captured into a closure so a panic in
@@ -226,7 +287,7 @@ func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
 		hook()
 	}
 
-	env, err := tuiSetup(flags, os.Getenv)
+	env, err := tuiSetup(flags, os.Getenv, binarySessionID, defaultBootstrapFetch)
 	if err != nil {
 		fmt.Fprintf(stderr, "wezsesh: %v\n", err)
 		// SUN_PATH overflow + every other init failure share the
@@ -309,8 +370,37 @@ func runTUI(flags parsedFlags, _, stderr io.Writer) (rc int) {
 // tuiSetup realises §8.20.1 step 4 substeps (1)–(11). Returned
 // runtimeEnv wraps every constructed dependency plus a cleanup closure
 // the caller defers.
-func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error) {
-	// Sub-step (1): WEZTERM_PANE + HMAC key validation.
+//
+// binarySessionID is threaded into logger.New so every log record
+// carries it and into the dispatcher's Deps so every outgoing request
+// envelope carries it.
+//
+// fetchBootstrap is the IPC-side config-fetch seam: production wires
+// `defaultBootstrapFetch`; tests substitute a fake to bypass the live
+// IPC roundtrip. Must not be nil — callers always provide a fetcher.
+//
+// Phase order (post-bootstrap rework):
+//
+//	(1)  WEZTERM_PANE + WEZSESH_HMAC_KEY + WEZSESH_RUNTIME_DIR
+//	(2)  Resolve windowID via wezcli.List (no cfg needed)
+//	(3)  uservar Writer + HMAC signer
+//	(4)  Bootstrap-time logger (writes to autodetect StateDir at
+//	     ResolveLevel("info", $WEZSESH_LOG)). Used by the dispatcher
+//	     for its own warn/error path during the bootstrap window.
+//	(5)  Construct the dispatcher with the real windowID
+//	(6)  fetchBootstrap → *config.Config
+//	(7)  Re-create logger with cfg.StateDir + ResolveLevel(cfg.LogLevel,
+//	     $WEZSESH_LOG); the bootstrap-time logger is closed.
+//	(8)  Sweeps
+//	(9)  symlink-refuse all dirs + mkdir-enforce data/allow
+//	(10) snapshots / state / trust open
+//	(11) buildTUIData
+func tuiSetup(flags parsedFlags, getEnv func(string) string, binarySessionID string, fetchBootstrap bootstrapFetcher) (*runtimeEnv, error) {
+	if fetchBootstrap == nil {
+		return nil, errors.New("tuiSetup: fetchBootstrap is nil")
+	}
+
+	// Sub-step (1): WEZTERM_PANE + HMAC key + runtime_dir validation.
 	paneID, err := resolvePaneID(flags, getEnv)
 	if err != nil {
 		return nil, err
@@ -319,180 +409,255 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error
 	if !hexKey64.MatchString(hexKey) {
 		return nil, errBadHMACKey
 	}
-
-	// Sub-step (2): config from env. The TUI startup path requires the
-	// plugin to have set $WEZSESH_CONFIG_JSON_BASE64 (the post-fix-#3
-	// handoff — base64-encoded JSON in an env var, no tmp file). The
-	// doctor / list / find / trust / reset subcommands run a different
-	// loader (LoadFromEnv) that falls back to AutoDetect when the env
-	// var is absent.
-	if getEnv("WEZSESH_CONFIG_JSON_BASE64") == "" {
-		return nil, errors.New("WEZSESH_CONFIG_JSON_BASE64 not set; the TUI requires the plugin's config env var")
+	runtimeDir := getEnv("WEZSESH_RUNTIME_DIR")
+	if runtimeDir == "" {
+		return nil, errMissingRuntimeDir
 	}
 	ctx, cancelCtx := context.WithCancel(context.Background())
-	cfg, err := config.LoadFromEnvJSONBase64(ctx)
+
+	// Sub-step (2): signer + uservar Writer. wezcli + windowID
+	// resolution is deferred to sub-step (10) so the symlink-refuse
+	// gate in sub-step (8) runs BEFORE the wezterm CLI subprocess —
+	// otherwise an attacker-planted symlink at a managed dir would be
+	// observed only after a successful wezcli call, which is
+	// unfriendly to test environments without wezterm available.
+	signer, err := whmac.NewSigner(hexKey)
 	if err != nil {
 		cancelCtx()
-		return nil, fmt.Errorf("config: %w", err)
+		return nil, fmt.Errorf("hmac: %w", err)
+	}
+	uvw, err := uservar.New()
+	if err != nil {
+		cancelCtx()
+		return nil, fmt.Errorf("uservar: %w", err)
 	}
 
-	// Sub-step (3): logger. §11.4 row "log_level" + §13.5.1 list
-	// WEZSESH_LOG as the env override; logger.ResolveLevel picks the
-	// more verbose of the two so a user-set WEZSESH_LOG=debug surfaces
-	// even when the on-disk config carries the default "info".
-	level := logger.ResolveLevel(cfg.LogLevel, getEnv("WEZSESH_LOG"))
-	log, err := logger.New(cfg.StateDir, level)
+	// Sub-step (4): bootstrap-time logger. Writes to the autodetected
+	// StateDir at level=ResolveLevel("info", $WEZSESH_LOG). Used by
+	// the dispatcher during the bootstrap window; replaced after
+	// bootstrap with a logger pointing at cfg.StateDir.
+	autoCfg, err := config.AutoDetect()
 	if err != nil {
+		_ = uvw.Close()
+		cancelCtx()
+		return nil, fmt.Errorf("autodetect: %w", err)
+	}
+	bootLevel := logger.ResolveLevel("info", getEnv("WEZSESH_LOG"))
+	bootLog, err := logger.New(autoCfg.StateDir, bootLevel, binarySessionID)
+	if err != nil {
+		_ = uvw.Close()
+		cancelCtx()
+		return nil, fmt.Errorf("bootstrap logger: %w", err)
+	}
+
+	// Sub-step (5): dispatcher. TargetWindowID starts at the §3.3
+	// "any window" sentinel (-1); the plugin accepts -1 for the
+	// bootstrap dispatch. SetTargetWindowID is called in sub-step
+	// (10) once wcli.List resolves the real id.
+	disp, dispCleanup, err := ipcdispatcher.New(ipcdispatcher.Deps{
+		Writer:          uvw,
+		Signer:          signer,
+		RuntimeDir:      runtimeDir,
+		TargetWindowID:  -1,
+		Logger:          bootLog,
+		BinarySessionID: binarySessionID,
+	})
+	if err != nil {
+		_ = bootLog.Close()
+		_ = uvw.Close()
+		cancelCtx()
+		return nil, fmt.Errorf("ipc init: %w", err)
+	}
+
+	// Sub-step (6): bootstrap fetch. The bootstrap dispatch has its
+	// own deadline so a slow / wedged plugin doesn't leave the binary
+	// hung indefinitely; aligns with the existing 30 s reply budget.
+	bootCtx, bootCancel := context.WithTimeout(ctx, 10*time.Second)
+	cfg, err := fetchBootstrap(bootCtx, disp)
+	bootCancel()
+	if err != nil {
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = bootLog.Close()
+		_ = uvw.Close()
+		cancelCtx()
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+	if cfg.RuntimeDir != runtimeDir {
+		// Defensive: the plugin sets WEZSESH_RUNTIME_DIR and
+		// opts.runtime_dir from the same source, so they must agree.
+		// A mismatch would mean the dispatcher's req/ + reply socket
+		// dir live somewhere different from where the rest of the
+		// binary looks. Fail loudly rather than silently splitting.
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = bootLog.Close()
+		_ = uvw.Close()
+		cancelCtx()
+		return nil, fmt.Errorf("bootstrap: WEZSESH_RUNTIME_DIR=%q disagrees with bootstrap cfg.RuntimeDir=%q", runtimeDir, cfg.RuntimeDir)
+	}
+
+	// Sub-step (7): real logger. Closes the bootstrap-time logger.
+	level := logger.ResolveLevel(cfg.LogLevel, getEnv("WEZSESH_LOG"))
+	log, err := logger.New(cfg.StateDir, level, binarySessionID)
+	if err != nil {
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = bootLog.Close()
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("logger: %w", err)
 	}
+	_ = bootLog.Close()
 
-	// Sub-step (4): sweep stale reply sockets and stale request files.
-	// The req-file sweep mirrors the ipcsock sweep and shares its
-	// best-effort discipline. Threshold is owned by `doctor.ReqOrphanThreshold`.
+	// Sub-step (8): sweeps + plugin.log rotation.
 	if err := ipcsock.SweepStale(cfg.RuntimeDir, log); err != nil {
 		log.Warn("ipcsock sweep failed", "err", err.Error())
 	}
 	if err := reqsweep.SweepStale(filepath.Join(cfg.RuntimeDir, "req"), log); err != nil {
 		log.Warn("reqsweep failed", "err", err.Error())
 	}
+	if err := safefs.RotateSingleDeep(cfg.RuntimeDir, "plugin.log", 1<<20); err != nil {
+		log.Warn("plugin.log rotate failed", "err", err.Error())
+	}
+	// Log level no longer flows through a sidecar — the Lua plugin
+	// resolves it locally at apply_to_config via the same algorithm
+	// (`logger.ResolveLevel(opts.log_level, $WEZSESH_LOG)`) so the
+	// two sides agree without disk coordination. Both see the same
+	// parent env at wezterm-launch time.
 
-	// Sub-step (5): symlink-refuse top-level managed dirs and their
-	// security-sensitive children. The data dir + its allow/ child + the
-	// runtime req/ child are pre-created via safefs.MkdirEnforce so the
-	// startup-to-first-use symlink-plant window is closed (per-use
-	// enforcement in trust.go and dispatcher.go remains as
-	// defense-in-depth).
-	//
-	// Order: Enforce(SymlinkRefuse) on every top-level dir first (missing
-	// dirs pass through ok=true), then os.MkdirAll on the parents that
-	// MkdirEnforce needs, then MkdirEnforce on the leaf children.
+	// Sub-step (9): symlink-refuse all top-level dirs (runtime/req
+	// already enforced by ipcdispatcher.New). data/allow gets the
+	// MkdirEnforce treatment.
 	for _, d := range []string{cfg.SnapshotDir, cfg.StateDir, cfg.RuntimeDir, cfg.DataDir} {
 		if d == "" {
 			continue
 		}
 		if ok, err := safefs.Enforce(d, safefs.SymlinkRefuse, log); err != nil {
 			_ = log.Close()
+			if dispCleanup != nil {
+				dispCleanup()
+			}
+			_ = uvw.Close()
 			cancelCtx()
 			return nil, fmt.Errorf("safefs enforce %s: %w", d, err)
 		} else if !ok {
 			_ = log.Close()
+			if dispCleanup != nil {
+				dispCleanup()
+			}
+			_ = uvw.Close()
 			cancelCtx()
 			return nil, fmt.Errorf("safefs enforce %s: refusing symlink", d)
 		}
 	}
-	mkdirEnforcePairs := []struct{ parent, name string }{
-		{cfg.DataDir, "allow"},
-		{cfg.RuntimeDir, "req"},
-	}
-	for _, p := range mkdirEnforcePairs {
-		if p.parent == "" {
-			continue
-		}
-		// MkdirAll the parent so MkdirEnforce's VerifyDir does not
-		// ENOENT on a fresh install. MkdirAll is happy if the path
-		// already exists; the subsequent Enforce above plus
-		// MkdirEnforce's own fstatat catch every symlink shape.
-		if err := os.MkdirAll(p.parent, 0o700); err != nil {
+	if cfg.DataDir != "" {
+		if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 			_ = log.Close()
+			if dispCleanup != nil {
+				dispCleanup()
+			}
+			_ = uvw.Close()
 			cancelCtx()
-			return nil, fmt.Errorf("mkdir %s: %w", p.parent, err)
+			return nil, fmt.Errorf("mkdir %s: %w", cfg.DataDir, err)
 		}
-		if err := safefs.MkdirEnforce(p.parent, p.name, 0o700); err != nil {
+		if err := safefs.MkdirEnforce(cfg.DataDir, "allow", 0o700); err != nil {
 			_ = log.Close()
+			if dispCleanup != nil {
+				dispCleanup()
+			}
+			_ = uvw.Close()
 			cancelCtx()
-			return nil, fmt.Errorf("safefs enforce %s/%s: %w", p.parent, p.name, err)
+			return nil, fmt.Errorf("safefs enforce %s/allow: %w", cfg.DataDir, err)
 		}
 	}
 
-	// Sub-step (6): wezcli. The List call below resolves paneID →
-	// windowID — §3.3 `target_window_id` is the wezterm WINDOW id, not
-	// the pane id. Without this lookup every dispatch fails the
-	// plugin's §9.3.1 step (g) window-match check.
+	// Sub-step (10): wezcli + List + windowID resolution. Deferred
+	// from earlier (see sub-step (2) comment) so the symlink-refuse
+	// gate in sub-step (9) runs first. Once windowID is resolved,
+	// swap it onto the dispatcher so subsequent dispatches stamp
+	// the real wezterm window id (the bootstrap dispatch already
+	// completed using the -1 sentinel).
 	wcli, err := wezcli.NewClient(log)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("wezcli: %w", err)
 	}
 	panes, err := wcli.List(ctx)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("wezcli list: %w", err)
 	}
 	windowID, err := resolveWindowID(panes, paneID)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("resolve window id: %w", err)
 	}
+	if d, ok := disp.(*ipcdispatcher.Dispatcher); ok {
+		d.SetTargetWindowID(windowID)
+	}
 
-	// Sub-step (7): snapshots.NewRepo + state.Open.
+	// Sub-step (11): snapshots / state / trust.
 	repo, err := snapshots.NewRepo(cfg.SnapshotDir, log)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("snapshots: %w", err)
 	}
 	repoHas := func(name string) bool {
-		ok, _ := repo.Has(ctx, name) // intentionally swallow err per §8.20.1
+		ok, _ := repo.Has(ctx, name)
 		return ok
 	}
 	store, err := state.Open(ctx, cfg.StateDir, log, repoHas)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("state: %w", err)
 	}
-	// §8.19 / §12.1 path table: the trust store lives at
-	// `<data_dir>/allow/`. cfg.TrustDir is populated by config.Load /
-	// AutoDetect as filepath.Join(DataDir, "allow") — see §8.19 prose.
 	trustStore, err := trust.Open(ctx, cfg.TrustDir, log)
 	if err != nil {
 		_ = log.Close()
+		if dispCleanup != nil {
+			dispCleanup()
+		}
+		_ = uvw.Close()
 		cancelCtx()
 		return nil, fmt.Errorf("trust: %w", err)
 	}
 
-	// Sub-step (8): initial TUI Data — built BEFORE dispatcher init so
-	// the §8.20.1 canonical step order (8) → (9) → (10) holds. `panes`
-	// is the same wcli.List slice used by resolveWindowID above; the
-	// reconciliation contract (§8.16) consumes it to (a) seed live
-	// workspace rows and (b) resolve the active workspace marker for
-	// the current pane.
+	// Sub-step (12): initial TUI Data.
 	initialData := buildTUIData(ctx, store, repo, panes, paneID, log)
-
-	// Sub-step (9): dispatcher.
-	signer, err := whmac.NewSigner(hexKey)
-	if err != nil {
-		_ = log.Close()
-		cancelCtx()
-		return nil, fmt.Errorf("hmac: %w", err)
-	}
-	uvw, err := uservar.New()
-	if err != nil {
-		_ = log.Close()
-		cancelCtx()
-		return nil, fmt.Errorf("uservar: %w", err)
-	}
-	disp, dispCleanup, err := ipcdispatcher.New(ipcdispatcher.Deps{
-		Writer:         uvw,
-		Signer:         signer,
-		RuntimeDir:     cfg.RuntimeDir,
-		TargetWindowID: windowID,
-		Logger:         log,
-	})
-	if err != nil {
-		_ = uvw.Close()
-		_ = log.Close()
-		cancelCtx()
-		// SUN_PATH overflow surfaces here as ipcsock.ErrSunPathOverflow
-		// wrapped in dispatcher's start-listener path; the §17.3 row
-		// "SUN_PATH overflow (Go)" maps to IPC_INIT_FAILED — the
-		// caller (runTUI) returns exitInitFailed from this branch.
-		return nil, fmt.Errorf("ipc init: %w", err)
-	}
+	// DirProviders flow via cfg from the bootstrap reply; the TUI's
+	// Init() fires a tea.Cmd that runs dirproviders.RunAll on these
+	// configs and merges the resulting rows into the picker. Empty /
+	// nil disables the path.
+	initialData.DirProviders = cfg.DirProviders
 
 	wgFn := func() {}
 	if d, ok := disp.(*ipcdispatcher.Dispatcher); ok {
