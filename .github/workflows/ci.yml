@@ -8,9 +8,12 @@
 #
 # Tool pins:
 #   - actions/checkout@v4, actions/setup-go@v5 (major-version tags).
-#   - go-version-file: go.mod (tracks the `go 1.26.2` directive).
+#   - go-version-file: go.mod (tracks the `go 1.26.3` directive — bumped
+#     from 1.26.2 to clear GO-2026-4971; the only call sites are in our
+#     unix-socket reply path and the advisory is Windows-only, but
+#     govulncheck has no OS filter, so we ride the patched stdlib).
 #   - staticcheck @2025.1.1 — honnef.co/go/tools v0.5.x (the 2024.1.x
-#     release) does not compile under Go 1.26.2 (`tokeninternal.go:64:
+#     release) does not compile under Go 1.26.x (`tokeninternal.go:64:
 #     invalid array length -delta * delta`); 2025.1.1 (v0.6.1) is the
 #     lowest tag that builds. §16.4 specifies only `staticcheck ./...`
 #     with no version pin, so this is a tooling choice, not spec drift.
@@ -56,6 +59,14 @@ jobs:
           "$(go env GOPATH)/bin/staticcheck" ./...
 
       - name: govulncheck
+        # Advisory-only: govulncheck findings surface as a red X on the
+        # step but do NOT gate the job. Most findings are stdlib
+        # advisories whose fix is "wait for nixpkgs / actions/setup-go to
+        # ship the patched Go release" — gating on them blocks every
+        # other CI check in the meantime. Treat the step as a signal,
+        # not a gate; bump go.mod's `go` directive when a finding lands
+        # on a call site we actually reach.
+        continue-on-error: true
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
