@@ -179,14 +179,16 @@ local function build_payload(overrides)
     -- but the production path expects an args TABLE; for noop the shape
     -- is `{ _shape = "object" }` (empty), so the empty object suffices.
     local payload = {
-        v                = 1,
-        id               = id,
-        ts               = overrides.ts or 1700000000,
-        target_window_id = overrides.target_window_id or DEFAULT_WINDOW_ID,
-        reply_sock       = overrides.reply_sock
-                          or "/tmp/wezsesh-1000/abcdef01.sock",
-        op               = overrides.op or "noop",
-        args             = args,
+        v                 = 2,
+        id                = id,
+        ts                = overrides.ts or 1700000000,
+        target_window_id  = overrides.target_window_id or DEFAULT_WINDOW_ID,
+        reply_sock        = overrides.reply_sock
+                           or "/tmp/wezsesh-1000/abcdef01.sock",
+        op                = overrides.op or "noop",
+        args              = args,
+        binary_session_id = overrides.binary_session_id
+                           or "01JABCDEFGHJKMNPQRSTVWXYZB",
     }
 
     -- Signer: tag the full (with-hmac) payload, then
@@ -439,9 +441,10 @@ end)
 describe("validate_payload", function()
     local function base()
         return {
-            v = 1, id = valid_ulid(), ts = 1700000000,
+            v = 2, id = valid_ulid(), ts = 1700000000,
             target_window_id = 1, reply_sock = "/tmp/x.sock",
             op = "noop", args = {}, hmac = string.rep("a", 64),
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
         }
     end
     it("accepts the canonical envelope shape", function()
@@ -464,13 +467,36 @@ describe("validate_payload", function()
         local p = base(); p.hmac = string.rep("a", 63)
         assert_false(ipc.validate_payload(p), "short hmac accepted")
     end)
-    it("rejects v != 1", function()
-        local p = base(); p.v = 2
-        assert_false(ipc.validate_payload(p), "v=2 accepted")
+    it("rejects v != 2 (wire-version skew)", function()
+        local p = base(); p.v = 1
+        assert_false(ipc.validate_payload(p), "v=1 accepted")
+        p.v = 3
+        assert_false(ipc.validate_payload(p), "v=3 accepted")
     end)
     it("rejects non-string id", function()
         local p = base(); p.id = 12345
         assert_false(ipc.validate_payload(p), "numeric id accepted")
+    end)
+    it("rejects missing binary_session_id", function()
+        local p = base(); p.binary_session_id = nil
+        assert_false(ipc.validate_payload(p),
+            "payload missing binary_session_id accepted")
+    end)
+    it("rejects binary_session_id with wrong length", function()
+        local p = base(); p.binary_session_id = "short"
+        assert_false(ipc.validate_payload(p),
+            "5-char binary_session_id accepted")
+        p.binary_session_id = string.rep("x", 25)
+        assert_false(ipc.validate_payload(p),
+            "25-char binary_session_id accepted")
+        p.binary_session_id = string.rep("x", 27)
+        assert_false(ipc.validate_payload(p),
+            "27-char binary_session_id accepted")
+    end)
+    it("rejects non-string binary_session_id", function()
+        local p = base(); p.binary_session_id = 12345
+        assert_false(ipc.validate_payload(p),
+            "numeric binary_session_id accepted")
     end)
 end)
 
@@ -956,13 +982,14 @@ describe("happy path", function()
         -- have to invert the in-place tagging build_payload did to the
         -- shared static args object).
         local payload = {
-            v                = 1,
-            id               = valid_ulid(),
-            ts               = 1700000000,
-            target_window_id = DEFAULT_WINDOW_ID,
-            reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
-            op               = "switch",
-            args             = canonical_json.object{
+            v                 = 2,
+            id                = valid_ulid(),
+            ts                = 1700000000,
+            target_window_id  = DEFAULT_WINDOW_ID,
+            reply_sock        = "/tmp/wezsesh-1000/abcdef01.sock",
+            op                = "switch",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+            args              = canonical_json.object{
                 name = "main",
                 cwd  = "",
             },
@@ -999,13 +1026,14 @@ describe("happy path", function()
         -- with expected_hash = cj.NULL. canonical_json.encode emits
         -- `"expected_hash":null` for the sentinel.
         local payload = {
-            v                = 1,
-            id               = valid_ulid(),
-            ts               = 1700000000,
-            target_window_id = DEFAULT_WINDOW_ID,
-            reply_sock       = "/tmp/wezsesh-1000/abcdef01.sock",
-            op               = "save",
-            args             = canonical_json.object{
+            v                 = 2,
+            id                = valid_ulid(),
+            ts                = 1700000000,
+            target_window_id  = DEFAULT_WINDOW_ID,
+            reply_sock        = "/tmp/wezsesh-1000/abcdef01.sock",
+            op                = "save",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+            args              = canonical_json.object{
                 name          = "work",
                 overwrite     = false,
                 expected_hash = canonical_json.NULL,
@@ -1084,6 +1112,95 @@ describe("happy path", function()
         assert_true(ok, "dispatch raise propagated out of handler")
         assert_true(log_contains("dispatch raised"),
             "expected log_warn 'dispatch raised'")
+    end)
+
+    it("active-trace bucket is set during dispatch and cleared after",
+    function()
+        seed_session()
+        local payload = build_payload()
+
+        -- During dispatch, runtime/state.set_active_trace(pane_id, …)
+        -- has fired and the bucket should report the request's
+        -- trace_id + binary_session_id. After dispatch returns the
+        -- bucket MUST be cleared so a stale entry doesn't leak across
+        -- into the next dispatch on the same pane.
+        --
+        -- Invoke `handle_user_var` directly (bypassing `drive_handler`,
+        -- which installs its own `dispatch` recorder) so we can probe
+        -- the bucket from inside the dispatch closure.
+        local pointer_value, payload_json, pointer = build_pointer(payload)
+        local entries = {
+            [pointer.path] = { stat = ok_stat(), body = payload_json },
+        }
+        local restore = install_fs_seams(entries)
+
+        local during_trace_id, during_bsid
+        local dispatch_count = 0
+        ipc._set_deps{
+            stat_path = function(p)
+                local e = entries[p]; return e and e.stat or nil
+            end,
+            now      = function() return 1700000000 end,
+            dispatch = function(_p, _w, _pn)
+                dispatch_count = dispatch_count + 1
+                local ctx = state.get_active_trace(DEFAULT_PANE_ID)
+                if type(ctx) == "table" then
+                    during_trace_id = ctx.trace_id
+                    during_bsid     = ctx.binary_session_id
+                end
+            end,
+        }
+
+        ipc.handle_user_var(fake_window(), fake_pane(),
+            ipc.USER_VAR_NAME, pointer_value,
+            { req_dir_prefix = DEFAULT_REQ_PREFIX,
+              target_window_id = DEFAULT_WINDOW_ID })
+        restore()
+
+        assert_eq(dispatch_count, 1, "dispatch should fire on happy path")
+        assert_eq(during_trace_id, payload.id,
+            "active-trace bucket missing trace_id during dispatch")
+        assert_eq(during_bsid, payload.binary_session_id,
+            "active-trace bucket missing binary_session_id during dispatch")
+
+        -- Post-dispatch: bucket cleared.
+        local after = state.get_active_trace(DEFAULT_PANE_ID)
+        assert_true(after == nil,
+            "active-trace bucket leaked after dispatch returned")
+    end)
+
+    it("active-trace bucket is cleared even when dispatch raises",
+    function()
+        seed_session()
+        local payload = build_payload()
+
+        local pointer_value, payload_json, pointer = build_pointer(payload)
+        local entries = {
+            [pointer.path] = { stat = ok_stat(), body = payload_json },
+        }
+        local restore = install_fs_seams(entries)
+
+        ipc._set_deps{
+            stat_path = function(path)
+                local e = entries[path]; return e and e.stat or nil
+            end,
+            now = function() return 1700000000 end,
+            dispatch = function() error("synthetic dispatch raise", 0) end,
+        }
+
+        local ok = pcall(ipc.handle_user_var,
+            fake_window(), fake_pane(), ipc.USER_VAR_NAME, pointer_value,
+            { req_dir_prefix = DEFAULT_REQ_PREFIX,
+              target_window_id = DEFAULT_WINDOW_ID })
+        restore()
+        assert_true(ok, "dispatch raise propagated out of handler")
+
+        -- The bucket MUST be cleared even on the error path; the
+        -- ipc.lua wrapper calls state.clear_active_trace before
+        -- inspecting the pcall result.
+        local after = state.get_active_trace(DEFAULT_PANE_ID)
+        assert_true(after == nil,
+            "active-trace bucket leaked after dispatch raised")
     end)
 end)
 

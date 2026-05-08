@@ -314,9 +314,9 @@ func (m *Model) renderModal() string {
 }
 
 // pickerWidth is the column budget the picker should consume. Honours
-// the preview pane: when shown, the picker takes (1 - PreviewWidth) of
-// total. width=0 (pre-WindowSizeMsg) ⇒ 80 as a fallback so initial Init
-// renders something useful.
+// the preview pane: when shown, the picker takes (100 - PreviewWidth)%
+// of total. width=0 (pre-WindowSizeMsg) ⇒ 80 as a fallback so initial
+// Init renders something useful. PreviewWidth is integer percent.
 func (m *Model) pickerWidth() int {
 	w := m.width
 	if w <= 0 {
@@ -325,7 +325,7 @@ func (m *Model) pickerWidth() int {
 	if !m.previewShown {
 		return w
 	}
-	pw := int(float64(w) * (1.0 - m.cfg.PreviewWidth))
+	pw := w * (100 - m.cfg.PreviewWidth) / 100
 	if pw < 20 {
 		pw = 20
 	}

@@ -183,9 +183,12 @@ func TestResolve_CommandFailed(t *testing.T) {
 
 func TestResolve_EnvFilter_DropsSensitive_KeepsOthers(t *testing.T) {
 	t.Setenv("WEZSESH_HMAC_KEY", "should-be-dropped")
-	t.Setenv("WEZSESH_PROTO_VERSION", "should-be-dropped")
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "should-be-dropped")
 	t.Setenv("WEZSESH_LOG", "should-survive")
+	// Non-sensitive vars (WEZSESH_RUNTIME_DIR / WEZSESH_PLUGIN_VERSION
+	// after C4) MUST flow through to the hook child — they're paths /
+	// metadata, not secrets.
+	t.Setenv("WEZSESH_RUNTIME_DIR", "/tmp/wezsesh-test")
+	t.Setenv("WEZSESH_PLUGIN_VERSION", "0.1.0")
 
 	tmp := t.TempDir()
 	envOut := filepath.Join(tmp, "env.txt")
@@ -210,13 +213,17 @@ func TestResolve_EnvFilter_DropsSensitive_KeepsOthers(t *testing.T) {
 	}
 	envStr := string(envBytes)
 
-	for _, k := range []string{"WEZSESH_HMAC_KEY", "WEZSESH_PROTO_VERSION", "WEZSESH_CONFIG_JSON_BASE64"} {
-		if strings.Contains(envStr, k+"=") {
-			t.Fatalf("sensitive key %s leaked into child env:\n%s", k, envStr)
-		}
+	if strings.Contains(envStr, "WEZSESH_HMAC_KEY=") {
+		t.Fatalf("sensitive key WEZSESH_HMAC_KEY leaked into child env:\n%s", envStr)
 	}
-	if !strings.Contains(envStr, "WEZSESH_LOG=should-survive") {
-		t.Fatalf("non-sensitive WEZSESH_LOG was dropped; env dump:\n%s", envStr)
+	for _, want := range []string{
+		"WEZSESH_LOG=should-survive",
+		"WEZSESH_RUNTIME_DIR=/tmp/wezsesh-test",
+		"WEZSESH_PLUGIN_VERSION=0.1.0",
+	} {
+		if !strings.Contains(envStr, want) {
+			t.Fatalf("expected non-sensitive %q in child env; env dump:\n%s", want, envStr)
+		}
 	}
 }
 

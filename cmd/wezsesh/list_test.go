@@ -307,7 +307,7 @@ func TestSubcmdList_UnknownFormat(t *testing.T) {
 // only needs to confirm the subcommand is dispatched).
 func TestRun_ListRoute_UnknownFormat(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"list", "--format", "xml"}, &stdout, &stderr)
+	rc := run([]string{"list", "--format", "xml"}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitDoctorOrSubcmd {
 		t.Fatalf("rc = %d, want %d", rc, exitDoctorOrSubcmd)
 	}

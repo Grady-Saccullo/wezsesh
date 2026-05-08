@@ -40,15 +40,23 @@ end
 -- Root payload envelope. Used by ipc.lua step (e):
 --   tag_in_place(payload, ROOT_PAYLOAD_SHAPE, verb_args_shape[op]).
 -- The args subspec is filled in dynamically by the caller per op.
+--
+-- Wire version: every key declared here is REQUIRED by tag_in_place
+-- (the walker raises CANONICAL_SHAPE_MISMATCH on a missing key).
+-- `binary_session_id` was added at v=2 alongside the wire version
+-- bump from 1 to 2; an old binary speaking v=1 cannot satisfy this
+-- shape and is rejected loudly by ipc.validate_payload before the
+-- tagger ever sees it.
 M.ROOT_PAYLOAD_SHAPE = {
-    _shape           = "object",
-    v                = "int",
-    id               = "string",
-    ts               = "int",
-    target_window_id = "int",
-    reply_sock       = "string",
-    op               = "string",
-    hmac             = "string",
+    _shape            = "object",
+    v                 = "int",
+    id                = "string",
+    ts                = "int",
+    target_window_id  = "int",
+    reply_sock        = "string",
+    op                = "string",
+    hmac              = "string",
+    binary_session_id = "string",
     -- args is not declared here; the verifier merges in the verb-keyed
     -- subspec when calling tag_in_place.
 }

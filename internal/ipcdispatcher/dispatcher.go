@@ -54,8 +54,12 @@ import (
 )
 
 // protoVersion is the wire schema version echoed in `v` on every request
-// and reply (§3.3 / §3.4).
-const protoVersion = 1
+// and reply (§3.3 / §3.4). Bumped from 1 to 2 alongside the
+// `binary_session_id` (request + reply) and `plugin_session_id` (reply)
+// envelope fields. Skew between an old and new participant now surfaces
+// as a loud WIRE_VERSION_MISMATCH on the plugin side instead of a
+// silent canonical-shape mismatch / IPC timeout.
+const protoVersion = 2
 
 // reqDirName is the §3.1 / §12.1 sidecar dir under runtimeDir.
 const reqDirName = "req"
@@ -132,6 +136,14 @@ type Deps struct {
 	TargetWindowID int
 	// Logger is required; ipcsock surfaces accept-loop warnings through it.
 	Logger *logger.Logger
+	// BinarySessionID is the 26-char ULID minted at wezsesh process
+	// startup and stamped onto every request envelope as
+	// `binary_session_id` (§3.3, v=2). Empty string is permitted at
+	// construction time so this field can land before the
+	// `cmd/wezsesh/main.go` mint (step 2 of the trace/correlation
+	// rollout); once main.go is wired, every production New() call
+	// must pass a real ULID.
+	BinarySessionID string
 }
 
 // New constructs a Dispatcher backed by Deps. It creates
@@ -175,19 +187,20 @@ func New(deps Deps) (ipc.Dispatcher, func(), error) {
 	}
 
 	d := &Dispatcher{
-		osc:            deps.Writer,
-		signer:         deps.Signer,
-		runtimeDir:     deps.RuntimeDir,
-		reqDir:         reqDir,
-		replyDir:       deps.RuntimeDir,
-		targetWindowID: deps.TargetWindowID,
-		log:            deps.Logger,
-		startListener:  ipcsock.StartListener,
-		now:            time.Now,
-		newID:          newULID,
-		dialReply:      dialReplyUnix,
-		nameMutexes:    make(map[string]*sync.Mutex),
-		outstanding:    make(map[string]outstandingDispatch),
+		osc:             deps.Writer,
+		signer:          deps.Signer,
+		runtimeDir:      deps.RuntimeDir,
+		reqDir:          reqDir,
+		replyDir:        deps.RuntimeDir,
+		targetWindowID:  deps.TargetWindowID,
+		binarySessionID: deps.BinarySessionID,
+		log:             deps.Logger,
+		startListener:   ipcsock.StartListener,
+		now:             time.Now,
+		newID:           newULID,
+		dialReply:       dialReplyUnix,
+		nameMutexes:     make(map[string]*sync.Mutex),
+		outstanding:     make(map[string]outstandingDispatch),
 	}
 	d.parseReply = func(raw []byte) (ipc.Reply, error) {
 		return parseReply(raw, d.signer)
@@ -200,13 +213,25 @@ func New(deps Deps) (ipc.Dispatcher, func(), error) {
 // concurrent use across distinct (verb, args) pairs; same-name save
 // flows must hold NameLock(name) for the Phase A → Phase C unit (§13.4).
 type Dispatcher struct {
-	osc            OSCWriter
-	signer         *whmac.Signer
-	runtimeDir     string
-	reqDir         string
-	replyDir       string
-	targetWindowID int
-	log            *logger.Logger
+	osc        OSCWriter
+	signer     *whmac.Signer
+	runtimeDir string
+	reqDir     string
+	replyDir   string
+	// targetWindowID is read on every Dispatch via buildPayload. The
+	// bootstrap-fetch flow constructs the dispatcher with the §3.3
+	// "any window" sentinel (-1) — the plugin accepts it for a
+	// single round-trip — then calls SetTargetWindowID once
+	// wcli.List has resolved the real id. Guarded by targetWindowIDMu
+	// so the SetTargetWindowID swap doesn't race buildPayload.
+	targetWindowIDMu sync.RWMutex
+	targetWindowID   int
+	// binarySessionID is the §3.3 (v=2) `binary_session_id` field
+	// stamped onto every outgoing request and onto the synthesised
+	// UNEXPECTED_EXIT panic-path reply. Minted once at process startup
+	// in `cmd/wezsesh/main.go` and threaded through Deps.
+	binarySessionID string
+	log             *logger.Logger
 
 	startListener listenerStarter
 	now           nowFunc
@@ -291,8 +316,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, verb string, args map[string]
 		return nil, fmt.Errorf("ipcdispatcher: ulid: %w", err)
 	}
 
+	// Per-request child logger: every record emitted by drain (and by
+	// any future Dispatch-side log call) carries trace_id=id alongside
+	// the binary_session_id sticky attr the parent already supplies.
+	// Augmented again on first reply with plugin_session_id once it
+	// arrives off the wire.
+	traceLog := d.log.With("trace_id", id)
+
 	sockPath := filepath.Join(d.replyDir, prefix8+".sock")
-	rawReplies, listenerCleanup, err := d.startListener(sockPath, d.log)
+	rawReplies, listenerCleanup, err := d.startListener(sockPath, traceLog)
 	if err != nil {
 		return nil, fmt.Errorf("ipcdispatcher: start listener: %w", err)
 	}
@@ -346,7 +378,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, verb string, args map[string]
 	// registered inside drain → runs LAST in the LIFO chain, so it
 	// fires even if the recover defer itself panics.
 	d.wg.Add(1)
-	go d.drain(ctx, id, rawReplies, listenerCleanup, out)
+	go d.drain(ctx, id, traceLog, rawReplies, listenerCleanup, out)
 	return out, nil
 }
 
@@ -398,17 +430,24 @@ func (d *Dispatcher) EmergencyReply() {
 	d.outstandingMu.Unlock()
 
 	for _, o := range pending {
-		payload, err := buildUnexpectedExitReply(o.id, d.signer)
+		// trace_id is the request's ULID; we don't know plugin_session_id
+		// at recover time (the panic-path synthesis precedes any reply),
+		// so the attr is intentionally absent here per CLAUDE.md guidance.
+		var traceLog *logger.Logger
+		if d.log != nil {
+			traceLog = d.log.With("trace_id", o.id)
+		}
+		payload, err := buildUnexpectedExitReply(o.id, d.binarySessionID, d.signer)
 		if err != nil {
-			if d.log != nil {
-				d.log.Warn("ipcdispatcher: emergency reply encode",
+			if traceLog != nil {
+				traceLog.Warn("ipcdispatcher: emergency reply encode",
 					"id", o.id, "err", err.Error())
 			}
 			continue
 		}
 		if err := d.dialReply(o.sockPath, payload); err != nil {
-			if d.log != nil {
-				d.log.Warn("ipcdispatcher: emergency reply dial",
+			if traceLog != nil {
+				traceLog.Warn("ipcdispatcher: emergency reply dial",
 					"id", o.id, "sock", o.sockPath, "err", err.Error())
 			}
 		}
@@ -416,8 +455,9 @@ func (d *Dispatcher) EmergencyReply() {
 }
 
 // buildUnexpectedExitReply encodes the §13.1 sentinel reply envelope.
-// Field set: {v:1, id, status:"completed", ok:false,
+// Field set: {v:2, id, status:"completed", ok:false,
 //
+//	binary_session_id, plugin_session_id:"",
 //	error:{code:"UNEXPECTED_EXIT", message:""}}
 //
 // `error.message` is required by §3.4 (it's the error envelope's
@@ -425,18 +465,26 @@ func (d *Dispatcher) EmergencyReply() {
 // used when no human-facing detail is available — the recover path
 // has none.
 //
+// `plugin_session_id` is `""` here because this reply is synthesised
+// on the binary side at panic-recover time; the plugin-minted id is
+// not in the binary's hand at that point. The TUI's `wezsesh tail`
+// joiner treats empty `plugin_session_id` as "unknown".
+//
 // The sentinel is HMAC-signed via the same field-removal sequence as
 // every other reply (Signer.Sign drops `hmac`, canonical-encodes the
 // rest, returns the digest). The recovering TUI's parseReply rejects
 // any reply whose HMAC does not verify, so an unsigned sentinel would
 // be silently dropped; signing it keeps the panic-path delivery
 // reliable.
-func buildUnexpectedExitReply(id string, signer *whmac.Signer) ([]byte, error) {
+func buildUnexpectedExitReply(id, binarySessionID string, signer *whmac.Signer) ([]byte, error) {
 	envelope := map[string]any{
-		"v":      int64(protoVersion),
-		"id":     id,
-		"status": "completed",
-		"ok":     false,
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"status":            "completed",
+		"ok":                false,
+		"binary_session_id": binarySessionID,
+		// panic-path: plugin id unknown at the point of synthesis.
+		"plugin_session_id": "",
 		"error": map[string]any{
 			"code":    "UNEXPECTED_EXIT",
 			"message": "",
@@ -475,9 +523,16 @@ func dialReplyUnix(sockPath string, payload []byte) error {
 // drain consumes raw reply bytes, parses each into an ipc.Reply, and
 // forwards on out. Closes out on first terminal reply, ctx cancellation,
 // or listener-channel close. Top-level defer recover() per §8.20 / §13.2.
+//
+// traceLog is the per-request child logger derived in Dispatch with
+// trace_id stamped as a sticky attr. On the first parsed reply, drain
+// extends it with plugin_session_id so subsequent records carry both
+// ids (the dispatcher and the plugin can then be filtered down to a
+// single dispatch in `wezsesh tail`).
 func (d *Dispatcher) drain(
 	ctx context.Context,
 	requestID string,
+	traceLog *logger.Logger,
 	rawReplies <-chan []byte,
 	listenerCleanup func(),
 	out chan<- ipc.Reply,
@@ -492,12 +547,13 @@ func (d *Dispatcher) drain(
 	// re-fire onto a socket whose drain already terminated.
 	defer d.deregisterOutstanding(requestID)
 	defer func() {
-		if r := recover(); r != nil && d.log != nil {
-			d.log.Warn("ipcdispatcher: drain panic", "panic", fmt.Sprint(r))
+		if r := recover(); r != nil && traceLog != nil {
+			traceLog.Warn("ipcdispatcher: drain panic", "panic", fmt.Sprint(r))
 		}
 		close(out)
 		listenerCleanup()
 	}()
+	pluginSessionStamped := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -515,24 +571,31 @@ func (d *Dispatcher) drain(
 					// Error.Code="REPLY_HMAC_MISMATCH" — the drain
 					// forwards it like any other terminal reply and
 					// closes the channel below.
-					if d.log != nil {
-						d.log.Warn("ipcdispatcher: reply hmac mismatch",
+					if traceLog != nil {
+						traceLog.Warn("ipcdispatcher: reply hmac mismatch",
 							"id", requestID)
 					}
 				} else {
-					if d.log != nil {
-						d.log.Warn("ipcdispatcher: parse reply",
+					if traceLog != nil {
+						traceLog.Warn("ipcdispatcher: parse reply",
 							"id", requestID, "err", err.Error())
 					}
 					continue
 				}
 			}
 			if reply.ID != "" && reply.ID != requestID {
-				if d.log != nil {
-					d.log.Warn("ipcdispatcher: reply id mismatch",
+				if traceLog != nil {
+					traceLog.Warn("ipcdispatcher: reply id mismatch",
 						"want", requestID, "got", reply.ID)
 				}
 				continue
+			}
+			// First time we see a plugin_session_id on the wire,
+			// extend traceLog so any follow-up record (e.g. a parse
+			// error on a partial follow-up reply) carries both ids.
+			if !pluginSessionStamped && reply.PluginSessionID != "" && traceLog != nil {
+				traceLog = traceLog.With("plugin_session_id", reply.PluginSessionID)
+				pluginSessionStamped = true
 			}
 			select {
 			case out <- reply:
@@ -553,15 +616,41 @@ func (d *Dispatcher) buildPayload(id, verb string, args map[string]any, sockPath
 	if args == nil {
 		args = map[string]any{}
 	}
+	d.targetWindowIDMu.RLock()
+	twid := d.targetWindowID
+	d.targetWindowIDMu.RUnlock()
 	return map[string]any{
-		"v":                int64(protoVersion),
-		"id":               id,
-		"ts":               d.now().Unix(),
-		"target_window_id": int64(d.targetWindowID),
-		"reply_sock":       sockPath,
-		"op":               verb,
-		"args":             args,
+		"v":                 int64(protoVersion),
+		"id":                id,
+		"ts":                d.now().Unix(),
+		"target_window_id":  int64(twid),
+		"reply_sock":        sockPath,
+		"op":                verb,
+		"args":              args,
+		"binary_session_id": d.binarySessionID,
 	}
+}
+
+// SetTargetWindowID swaps the wezterm window id stamped onto every
+// outgoing request envelope. The bootstrap fetch flow constructs the
+// dispatcher with the "any window" sentinel (-1) so the plugin
+// accepts the bootstrap dispatch before pane→window state is known;
+// once wcli.List resolves the real id, the caller swaps via this
+// method so subsequent dispatches stamp the correct value. Calling
+// with id < -1 panics — the value range matches the New() validation.
+//
+// Concurrent with Dispatch: the swap takes a write lock on
+// targetWindowIDMu; buildPayload takes a read lock. A swap mid-flight
+// affects only payloads built AFTER the swap; in-flight dispatches
+// have already serialised their target_window_id into the canonical
+// envelope.
+func (d *Dispatcher) SetTargetWindowID(id int) {
+	if id < -1 {
+		panic(fmt.Sprintf("ipcdispatcher: SetTargetWindowID id=%d (must be >= -1)", id))
+	}
+	d.targetWindowIDMu.Lock()
+	d.targetWindowID = id
+	d.targetWindowIDMu.Unlock()
 }
 
 // ensureDir is os.MkdirAll with the strict perm we want for §12.1
@@ -580,6 +669,17 @@ func ensureDir(path string, perm fs.FileMode) error {
 
 // crockford is the §3.3 ULID alphabet (Crockford base32, sans I L O U).
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// NewULID is the exported entry point for callers outside this package
+// that need a §3.3-shaped ULID — currently `cmd/wezsesh/main.go`'s
+// per-process binary_session_id mint. Wraps the internal newULID so
+// the dispatcher's encoder is the single source of truth for the
+// 26-char Crockford-base32 form. Returns the canonical id; the 8-hex
+// prefix that newULID also returns is preserved on the wrapper for
+// future callers (the binary session id mint discards it).
+func NewULID() (id, prefix8 string, err error) {
+	return newULID()
+}
 
 // newULID emits a 26-char Crockford-base32 ULID per §3.3 plus the
 // 8-hex prefix used by §3.2 (reply socket) and §3.1 (request file).
@@ -689,11 +789,15 @@ func parseReply(raw []byte, signer *whmac.Signer) (ipc.Reply, error) {
 		ok, vErr := signer.Verify(intMap)
 		if vErr != nil || !ok {
 			id, _ := raw1["id"].(string)
+			binSID, _ := raw1["binary_session_id"].(string)
+			plgSID, _ := raw1["plugin_session_id"].(string)
 			synth := ipc.Reply{
-				V:      protoVersion,
-				ID:     id,
-				Status: "completed",
-				OK:     false,
+				V:               protoVersion,
+				ID:              id,
+				Status:          "completed",
+				OK:              false,
+				BinarySessionID: binSID,
+				PluginSessionID: plgSID,
 				Error: &ipc.ReplyError{
 					Code:    "REPLY_HMAC_MISMATCH",
 					Message: id,
@@ -707,11 +811,13 @@ func parseReply(raw []byte, signer *whmac.Signer) (ipc.Reply, error) {
 		return ipc.Reply{}, fmt.Errorf("ipcdispatcher: decode reply (typed): %w", err)
 	}
 	out := ipc.Reply{
-		V:      w.V,
-		ID:     w.ID,
-		Status: w.Status,
-		OK:     w.OK,
-		Data:   w.Data,
+		V:               w.V,
+		ID:              w.ID,
+		Status:          w.Status,
+		OK:              w.OK,
+		BinarySessionID: w.BinarySessionID,
+		PluginSessionID: w.PluginSessionID,
+		Data:            w.Data,
 	}
 	if w.Error != nil {
 		out.Error = &ipc.ReplyError{
@@ -782,14 +888,16 @@ func numbersToInt64(v any) (any, error) {
 // here for documentation and so encoding/json round-trips don't drop
 // the wire field.
 type wireReply struct {
-	V        int             `json:"v"`
-	ID       string          `json:"id"`
-	Status   string          `json:"status"`
-	OK       bool            `json:"ok"`
-	Hmac     string          `json:"hmac"`
-	Data     map[string]any  `json:"data,omitempty"`
-	Warnings []wireWarning   `json:"warnings,omitempty"`
-	Error    *wireReplyError `json:"error,omitempty"`
+	V               int             `json:"v"`
+	ID              string          `json:"id"`
+	Status          string          `json:"status"`
+	OK              bool            `json:"ok"`
+	Hmac            string          `json:"hmac"`
+	BinarySessionID string          `json:"binary_session_id,omitempty"`
+	PluginSessionID string          `json:"plugin_session_id,omitempty"`
+	Data            map[string]any  `json:"data,omitempty"`
+	Warnings        []wireWarning   `json:"warnings,omitempty"`
+	Error           *wireReplyError `json:"error,omitempty"`
 }
 
 type wireWarning struct {

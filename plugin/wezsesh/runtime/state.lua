@@ -285,6 +285,44 @@ function M.prune_requests(now, ttl_seconds)
 end
 
 -- ────────────────────────────────────────────────────────────────────
+-- wezsesh_active_trace_<pane_id> : JSON-encoded
+--                                       {trace_id, binary_session_id}
+-- ────────────────────────────────────────────────────────────────────
+--
+-- Per-pane "active dispatch" trace context. Set by `ipc.lua` step (h)
+-- just before `verbs.dispatch` runs and cleared after. `runtime/log.lua`
+-- looks it up at emit time when callers thread `pane_id` through
+-- structured fields, so the existing 19-ish synchronous log call sites
+-- in `ipc.lua` automatically pick up `trace_id` / `binary_session_id`
+-- without each callsite re-threading them.
+--
+-- One key per pane (`wezsesh_active_trace_<pane_id_str>`) instead of a
+-- single bucket: avoids the read-modify-write sequence on a hot dispatch
+-- path. The pane_id is stringified per the same rule as the other
+-- buckets (mlua's GLOBAL Object node rejects integer keys).
+
+local function active_trace_key(pane_id)
+    return "wezsesh_active_trace_" .. key_str(pane_id)
+end
+
+function M.set_active_trace(pane_id, ctx)
+    if type(ctx) ~= "table" then return end
+    local enc = encode_struct(ctx)
+    if enc == nil then return end
+    wezterm.GLOBAL[active_trace_key(pane_id)] = enc
+end
+
+function M.get_active_trace(pane_id)
+    local v = wezterm.GLOBAL[active_trace_key(pane_id)]
+    if type(v) ~= "string" or #v == 0 then return nil end
+    return decode_struct(v)
+end
+
+function M.clear_active_trace(pane_id)
+    wezterm.GLOBAL[active_trace_key(pane_id)] = nil
+end
+
+-- ────────────────────────────────────────────────────────────────────
 -- wipe_all: reset every bucket this module owns. Used by
 -- `wezsesh reset` callbacks and by config-reload teardown.
 -- ────────────────────────────────────────────────────────────────────
@@ -294,6 +332,13 @@ function M.wipe_all()
     write_bucket(KEY_SEEN_IDS, {})
     write_bucket(KEY_REQUESTS, {})
     write_bucket(KEY_WRITING,  {})
+    -- Active-trace keys are per-pane (`wezsesh_active_trace_<pid>`); we
+    -- don't enumerate them here because wipe_all runs on coarse resets
+    -- (reset CLI, config-reload teardown) and the GLOBAL wipe-on-
+    -- version-mismatch loop in runtime/globals already nukes every
+    -- `wezsesh_*` key on a real version-changing reload. A leftover
+    -- `wezsesh_active_trace_42` for a since-closed pane is harmless —
+    -- the value is only consulted while a dispatch is in flight.
 end
 
 return M

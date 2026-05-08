@@ -193,25 +193,53 @@ local function assert_nil(v, msg)
     end
 end
 
+-- The reply spawn argv is shaped as either:
+--   bare-form: { bin, "reply", reply_sock, b64 }  (4 elements)
+--   env-form:  { "/usr/bin/env", "WEZSESH_BINARY_SESSION_ID=<bsid>",
+--                bin, "reply", reply_sock, b64 }  (6 elements)
+-- env-form is used when payload.binary_session_id is present (§3.3 v=2).
+-- Normalise both into a flat record so the existing assertions don't
+-- have to care about the shape.
+local function parse_argv(argv)
+    if argv[1] == "/usr/bin/env" then
+        return {
+            env_form   = true,
+            bin        = argv[3],
+            verb       = argv[4],
+            reply_sock = argv[5],
+            b64        = argv[6],
+        }
+    end
+    return {
+        env_form   = false,
+        bin        = argv[1],
+        verb       = argv[2],
+        reply_sock = argv[3],
+        b64        = argv[4],
+    }
+end
+
 local function decode_envelope(idx)
     idx = idx or #bg_calls
     assert_true(#bg_calls >= idx,
         "expected at least " .. idx .. " spawn calls, got " .. #bg_calls)
     local argv = bg_calls[idx]
-    assert_eq(argv[2], "reply", "argv[2] not 'reply'")
-    local json = b64.decode(argv[4])
-    assert_true(json ~= nil, "argv[4] was not valid b64")
+    local p = parse_argv(argv)
+    assert_eq(p.verb, "reply", "argv: verb not 'reply'")
+    local json = b64.decode(p.b64)
+    assert_true(json ~= nil, "argv: b64 payload was not valid b64")
     return json_parse_shim(json), argv
 end
 
 local function fixture_payload(op, args)
     return {
-        v          = 1,
-        id         = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        ts         = 1700000000,
-        op         = op or "noop",
-        reply_sock = "/tmp/wezsesh-1000/abcdef01.sock",
-        args       = args or {},
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        ts                = 1700000000,
+        op                = op or "noop",
+        reply_sock        = "/tmp/wezsesh-1000/abcdef01.sock",
+        args              = args or {},
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
     }
 end
 
@@ -234,7 +262,7 @@ describe("module surface", function()
 
     it("dispatch_table has exactly the registered wire verbs", function()
         local want = {
-            "list_dirs", "load", "new", "noop", "save", "switch",
+            "bootstrap", "load", "new", "noop", "save", "switch",
         }
         local keys = {}
         for k in pairs(ops.dispatch_table) do keys[#keys + 1] = k end

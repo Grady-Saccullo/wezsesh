@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"go.uber.org/goleak"
 
+	"github.com/Grady-Saccullo/wezsesh/internal/dirproviders"
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
 )
 
@@ -646,70 +647,30 @@ func TestDispatchErrorClearsInFlight(t *testing.T) {
 	close(d.repliesC)
 }
 
-// TestInitDispatchesListDirs asserts that the model's Init() returns a
-// startup dispatch Cmd whose body fires the list_dirs verb. The reply
-// path is exercised by TestListDirsReplyMergesExternalRows; this test
-// only confirms the wiring at startup time.
-func TestInitDispatchesListDirs(t *testing.T) {
+// TestInit_NoDirProviders_ReturnsNil asserts that with no
+// DirProviders configured Init() returns nil — the picker still
+// renders live + saved entries via initialData.
+func TestInit_NoDirProviders_ReturnsNil(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
+	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
+	if cmd := m.Init(); cmd != nil {
+		t.Fatalf("Init() returned non-nil cmd with no DirProviders")
+	}
+	close(d.repliesC)
+}
+
+// TestDirProvidersResultMsg_MergesExternalRows feeds a synthetic
+// dirProvidersResultMsg through Update and asserts the rows are
+// merged into m.rows as SourceExternal entries with their CWD
+// carried through. (Replaces the prior list_dirs IPC reply test.)
+func TestDirProvidersResultMsg_MergesExternalRows(t *testing.T) {
 	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
 	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
 
-	cmd := m.Init()
-	if cmd == nil {
-		t.Fatalf("Init() returned nil cmd; expected list_dirs dispatch")
-	}
-	msg := cmd()
-	started, ok := msg.(dispatchStartedMsg)
-	if !ok {
-		t.Fatalf("Init cmd produced %T, want dispatchStartedMsg", msg)
-	}
-	if started.verb != "list_dirs" {
-		t.Fatalf("Init dispatched verb %q, want list_dirs", started.verb)
-	}
-	// Drain the channel so the waitForReply Cmd (if any) terminates.
-	close(d.repliesC)
-
-	// Confirm the dispatcher recorded the call with the empty-query arg
-	// shape.
-	if d.callCount() != 1 {
-		t.Fatalf("expected 1 dispatch call, got %d", d.callCount())
-	}
-	d.mu.Lock()
-	args := d.calls[0].args
-	d.mu.Unlock()
-	if got, _ := args["query"].(string); got != "" {
-		t.Fatalf("list_dirs args.query = %q, want \"\"", got)
-	}
-}
-
-// TestListDirsReplyMergesExternalRows feeds a synthetic list_dirs
-// terminal reply through Update and asserts the dirs are merged into
-// m.rows as SourceExternal entries with their CWD carried through.
-func TestListDirsReplyMergesExternalRows(t *testing.T) {
-	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 2)}
-	m := newTestModel(t, []WorkspaceRow{{Name: "alpha", Source: SourceLive}}, d)
-
-	// Drive the startup list_dirs dispatch.
-	cmd := m.Init()
-	if cmd == nil {
-		t.Fatalf("Init() returned nil cmd")
-	}
-	startedMsg := cmd().(dispatchStartedMsg)
-	m.Update(startedMsg)
-
-	// Synthesise a terminal reply carrying two dirs.
-	reply := ipc.Reply{
-		ID:     "x",
-		Status: "completed",
-		OK:     true,
-		Data: map[string]any{
-			"dirs": []any{
-				map[string]any{"path": "/srv/proj", "name": "proj"},
-				map[string]any{"path": "/home/u/repos/widget", "name": "widget"},
-			},
-		},
-	}
-	m.Update(replyMsg{dispatchID: m.dispatchSeq, reply: reply})
+	m.Update(dirProvidersResultMsg{rows: []dirproviders.ExternalRow{
+		{Path: "/srv/proj", Name: "proj"},
+		{Path: "/home/u/repos/widget", Name: "widget"},
+	}})
 
 	byName := map[string]WorkspaceRow{}
 	for _, r := range m.rows {
@@ -733,28 +694,16 @@ func TestListDirsReplyMergesExternalRows(t *testing.T) {
 	close(d.repliesC)
 }
 
-// TestListDirsReplyDedupesAgainstLive: a live row named "foo" plus a
-// list_dirs entry with name "foo" must yield a single row — the live
-// row wins (richer state, real workspace).
-func TestListDirsReplyDedupesAgainstLive(t *testing.T) {
-	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 2)}
+// TestDirProvidersResultMsg_DedupesAgainstLive: a live row named
+// "foo" plus a dir-provider row named "foo" must yield a single row
+// — the live row wins (richer state, real workspace).
+func TestDirProvidersResultMsg_DedupesAgainstLive(t *testing.T) {
+	d := &fakeDispatcher{repliesC: make(chan ipc.Reply, 1)}
 	m := newTestModel(t, []WorkspaceRow{{Name: "foo", Source: SourceLive}}, d)
 
-	cmd := m.Init()
-	startedMsg := cmd().(dispatchStartedMsg)
-	m.Update(startedMsg)
-
-	reply := ipc.Reply{
-		ID:     "y",
-		Status: "completed",
-		OK:     true,
-		Data: map[string]any{
-			"dirs": []any{
-				map[string]any{"path": "/somewhere/foo", "name": "foo"},
-			},
-		},
-	}
-	m.Update(replyMsg{dispatchID: m.dispatchSeq, reply: reply})
+	m.Update(dirProvidersResultMsg{rows: []dirproviders.ExternalRow{
+		{Path: "/somewhere/foo", Name: "foo"},
+	}})
 
 	if len(m.rows) != 1 {
 		t.Fatalf("expected dedupe to yield 1 row, got %d (%+v)", len(m.rows), m.rows)

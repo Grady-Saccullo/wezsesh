@@ -386,7 +386,7 @@ end
 describe("module surface", function()
     it("exposes the public API and a VERSION constant", function()
         local want = {
-            "VERSION", "build_config_envvar", "compatible",
+            "VERSION", "build_bootstrap_body", "compatible",
             "detect_version", "ensure_session_key",
             "register_keybinding", "resolve_binary", "spawn",
             "validate_runtime_dir",
@@ -671,193 +671,108 @@ describe("validate_runtime_dir", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- build_config_envvar
+-- build_bootstrap_body
 -- ────────────────────────────────────────────────────────────────────
 --
--- The previous `write_config_file` route wrote a tmp file with a
--- predictable name; that's a CVE-class TOCTOU surface and is gone.
--- The new contract: build_config_envvar(opts) returns a base64 string
--- that the binary picks up from WEZSESH_CONFIG_JSON_BASE64. Decode +
--- parse and assert on the resulting JSON shape, never on a path.
+-- Builds the resolved-config Lua table that the `bootstrap` IPC verb
+-- echoes back to the binary. Pure on `opts`. The previous
+-- `build_config_envvar` (base64 + WEZSESH_CONFIG_JSON_BASE64 env
+-- transport) is gone; config now flows over the canonical-JSON + HMAC
+-- IPC channel like every other verb-shaped data exchange.
 
--- Decode a base64 string back to bytes for the spec's assertions. We
--- use the project's b64 module — same code path that runs in
--- production — so a regression in either the encoder or decoder
--- surfaces here.
-local b64_for_spec = require("crypto.b64")
-
-describe("build_config_envvar", function()
-    it("returns a base64 string that decodes to JSON containing the "
-        .. "dirs and version fields", function()
-        local b64s = manager.build_config_envvar({
+describe("build_bootstrap_body", function()
+    it("returns a table with the dirs and plugin_version", function()
+        local body = manager.build_bootstrap_body({
             snapshot_dir = "/sd",
             state_dir    = "/st",
             runtime_dir  = "/rd",
             data_dir     = "/dd",
         })
-        assert_true(type(b64s) == "string" and b64s ~= "",
-            "no base64 string returned")
-        local body = b64_for_spec.decode(b64s)
-        assert_true(body ~= nil and body ~= "",
-            "base64 decode failed for build_config_envvar output")
-        local parsed = json_parse_shim(body)
-        assert_eq(parsed.version, 1, "version not 1")
-        assert_eq(parsed.proto_version, 1, "proto_version not 1")
-        assert_eq(parsed.plugin_version, manager.VERSION,
+        assert_eq(type(body), "table", "body not a table")
+        assert_eq(body.plugin_version, manager.VERSION,
             "plugin_version mismatch")
-        assert_eq(parsed.snapshot_dir, "/sd", "snapshot_dir wrong")
-        assert_eq(parsed.state_dir, "/st", "state_dir wrong")
-        assert_eq(parsed.runtime_dir, "/rd", "runtime_dir wrong")
-        assert_eq(parsed.data_dir, "/dd", "data_dir wrong")
-    end)
-
-    it("returns RFC 4648 standard base64 (alphabet + optional pad)",
-    function()
-        local b64s = manager.build_config_envvar({})
-        assert_true(type(b64s) == "string" and b64s ~= "",
-            "no base64 string returned")
-        -- The base64 alphabet is [A-Za-z0-9+/=]. Reject any other byte
-        -- so a future regression that returns raw JSON or smuggles a
-        -- newline through gets caught here.
-        assert_true(b64s:match("^[A-Za-z0-9+/=]+$") ~= nil,
-            "build_config_envvar output is not pure base64: "
-            .. b64s:sub(1, 64))
-        -- Length MUST be a multiple of 4 (RFC 4648 framing).
-        assert_eq(#b64s % 4, 0,
-            "build_config_envvar output length not multiple of 4")
+        assert_eq(body.snapshot_dir, "/sd", "snapshot_dir wrong")
+        assert_eq(body.state_dir, "/st", "state_dir wrong")
+        assert_eq(body.runtime_dir, "/rd", "runtime_dir wrong")
+        assert_eq(body.data_dir, "/dd", "data_dir wrong")
     end)
 
     it("emits ALL config-schema top-level keys", function()
-        local b64s = manager.build_config_envvar({})
-        local body = b64_for_spec.decode(b64s)
-        local parsed = json_parse_shim(body)
+        local body = manager.build_bootstrap_body({})
         local want_keys = {
-            "version", "snapshot_dir", "state_dir", "runtime_dir",
+            "snapshot_dir", "state_dir", "runtime_dir",
             "data_dir", "log_level", "sort", "default_action",
             "default_action_load_no_prompt", "confirm_delete",
             "confirm_overwrite", "exclude",
-            -- new_workspace_command is nil-by-default → omitted by
-            -- json_encode (the binary's parser accepts null here).
+            -- new_workspace_command is nil-by-default → omitted from
+            -- the body table; the binary's loader accepts the absent
+            -- field as the empty/null value.
             "preview", "markers", "columns", "name_truncate",
             "colors", "hooks", "resurrect_argv_allowlist",
-            "keys", "plugin_version", "proto_version",
+            "keys", "plugin_version", "dir_providers",
         }
         for _, k in ipairs(want_keys) do
-            assert_true(parsed[k] ~= nil,
-                "config body missing schema key: " .. k)
+            assert_true(body[k] ~= nil,
+                "body missing schema key: " .. k)
         end
     end)
 
     it("honours user overrides for log_level / sort / hooks", function()
-        local b64s = manager.build_config_envvar({
+        local body = manager.build_bootstrap_body({
             log_level = "debug",
             sort      = "alphabetical",
             hooks     = { run_hooks = false,
                           prompt_on_untrusted = true,
                           timeout_seconds = 30 },
         })
-        local body = b64_for_spec.decode(b64s)
-        local parsed = json_parse_shim(body)
-        assert_eq(parsed.log_level, "debug", "log_level not honoured")
-        assert_eq(parsed.sort, "alphabetical", "sort not honoured")
-        assert_eq(parsed.hooks.run_hooks, false,
+        assert_eq(body.log_level, "debug", "log_level not honoured")
+        assert_eq(body.sort, "alphabetical", "sort not honoured")
+        assert_eq(body.hooks.run_hooks, false,
             "hooks.run_hooks not honoured")
-        assert_eq(parsed.hooks.timeout_seconds, 30,
+        assert_eq(body.hooks.timeout_seconds, 30,
             "hooks.timeout_seconds not honoured")
     end)
 
-    -- T-903 case 1: nil opts.resurrect_argv_allowlist falls back to the
-    -- default_allowlist module so the `[]string` schema receives a
-    -- non-empty array (avoiding wezterm's empty-Lua-table → `{}` quirk).
+    -- nil opts.resurrect_argv_allowlist falls back to the
+    -- default_allowlist module so the binary's `[]string` schema
+    -- receives a non-empty array.
     it("nil resurrect_argv_allowlist falls back to default_allowlist",
     function()
         local default_list = require("default_allowlist")
         assert_true(#default_list > 0,
             "default_allowlist module is empty — fixture broken")
-        local b64s = manager.build_config_envvar({})
-        local body = b64_for_spec.decode(b64s)
-        local parsed = json_parse_shim(body)
-        assert_eq(type(parsed.resurrect_argv_allowlist), "table",
+        local body = manager.build_bootstrap_body({})
+        assert_eq(type(body.resurrect_argv_allowlist), "table",
             "resurrect_argv_allowlist not a table")
-        assert_true(#parsed.resurrect_argv_allowlist > 0,
-            "resurrect_argv_allowlist empty (would emit {} on wire)")
-        -- Sanity: the first element matches the first default entry.
-        assert_eq(parsed.resurrect_argv_allowlist[1], default_list[1],
-            "default_allowlist contents not echoed in config body")
+        assert_true(#body.resurrect_argv_allowlist > 0,
+            "resurrect_argv_allowlist empty")
+        assert_eq(body.resurrect_argv_allowlist[1], default_list[1],
+            "default_allowlist contents not echoed in body")
     end)
 
-    -- T-903 case 2: explicit non-empty array round-trips as a JSON array.
-    -- Asserts the body literally contains `["sh"]` (not `{...}`),
-    -- not just that the parsed form is correct.
-    it("explicit one-element array emits JSON array form", function()
-        local b64s = manager.build_config_envvar({
+    -- Explicit one-element array round-trips with the same content.
+    it("explicit one-element array round-trips", function()
+        local body = manager.build_bootstrap_body({
             resurrect_argv_allowlist = { "sh" },
         })
-        local body = b64_for_spec.decode(b64s)
-        assert_match(body,
-            '"resurrect_argv_allowlist":%[%s*"sh"%s*%]',
-            "explicit { 'sh' } not emitted as JSON array")
-        local parsed = json_parse_shim(body)
-        assert_eq(type(parsed.resurrect_argv_allowlist), "table",
-            "parsed allowlist not a table")
-        assert_eq(#parsed.resurrect_argv_allowlist, 1,
-            "parsed allowlist not length 1")
-        assert_eq(parsed.resurrect_argv_allowlist[1], "sh",
-            "parsed allowlist[1] not 'sh'")
+        assert_eq(type(body.resurrect_argv_allowlist), "table",
+            "allowlist not a table")
+        assert_eq(#body.resurrect_argv_allowlist, 1,
+            "allowlist not length 1")
+        assert_eq(body.resurrect_argv_allowlist[1], "sh",
+            "allowlist[1] not 'sh'")
     end)
 
-    -- T-903 case 3 (load-bearing): explicit empty `{}` emits `[]` via
-    -- the json_array_metatable tag path — mirroring production wezterm
-    -- where the metatable accessor is installed. The shim's
-    -- `wezterm.json_array_metatable` sentinel is reset by the harness
-    -- before each test, so this exercise hits the round-2 fix.
-    it("explicit empty {} emits JSON `[]` via json_array_metatable",
-    function()
-        local b64s = manager.build_config_envvar({
-            resurrect_argv_allowlist = {},
-        })
-        local body = b64_for_spec.decode(b64s)
-        assert_match(body,
-            '"resurrect_argv_allowlist":%[%s*%]',
-            "empty {} not emitted as JSON `[]` (would break config schema)")
-    end)
-
-    -- T-903 fallback: when the wezterm build does NOT expose
-    -- `json_array_metatable` (older wezterm; the spec shim with the
-    -- accessor stripped), an explicitly-empty `{}` must NOT round-trip
-    -- as `{}` — manager.lua substitutes the non-empty default_allowlist
-    -- so the config schema still receives a JSON array.
-    it("empty {} substitutes default_allowlist when accessor absent",
-    function()
-        wezterm_shim.json_array_metatable = nil
-        local b64s = manager.build_config_envvar({
-            resurrect_argv_allowlist = {},
-        })
-        local body = b64_for_spec.decode(b64s)
-        assert_true(body:find('"resurrect_argv_allowlist":{}', 1, true)
-            == nil,
-            "empty allowlist leaked through as `{}` — schema violation")
-        local parsed = json_parse_shim(body)
-        assert_eq(type(parsed.resurrect_argv_allowlist), "table",
-            "fallback allowlist not a table")
-        assert_true(#parsed.resurrect_argv_allowlist > 0,
-            "fallback allowlist empty (would emit {} on wire)")
-    end)
-
-    -- Defensive size cap. The plain JSON output today is a few KB, well
-    -- under the 64 KiB ceiling. To exercise the rejection path we feed
-    -- an oversized payload through the only field that lifts a
-    -- caller-provided string verbatim into the body, so a future
-    -- ARG_MAX-bumping field doesn't silently round-trip.
-    it("raises WEZSESH_CONFIG_TOO_LARGE when the encoded body exceeds "
-        .. "64 KiB", function()
-        local oversize = string.rep("X", 64 * 1024)
-        local ok, err = pcall(manager.build_config_envvar, {
-            new_workspace_command = oversize,
-        })
-        assert_false(ok, "expected raise on oversized config body")
-        assert_match(tostring(err), "WEZSESH_CONFIG_TOO_LARGE",
-            "wrong sentinel for oversized body")
+    -- preview.width default is integer 40 (percent), not a float.
+    -- Canonical-JSON §4.1 rejects floats, so the bootstrap-reply
+    -- encoder requires integer-only.
+    it("preview.width defaults to integer 40 (percent)", function()
+        local body = manager.build_bootstrap_body({})
+        assert_eq(type(body.preview), "table", "preview not a table")
+        assert_eq(body.preview.width, 40,
+            "preview.width default not 40")
+        assert_eq(math.type(body.preview.width), "integer",
+            "preview.width not integer-typed")
     end)
 end)
 
@@ -865,18 +780,18 @@ end)
 -- spawn
 -- ────────────────────────────────────────────────────────────────────
 --
--- Acceptance gate: env vector contains EXACTLY the four contract
--- keys (WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION,
--- WEZSESH_CONFIG_JSON_BASE64, WEZSESH_PLUGIN_VERSION) — no extras, no
--- missing. The dirs travel inside WEZSESH_CONFIG_JSON_BASE64 as a
--- base64-encoded JSON document; no tmp file is involved.
+-- Acceptance gate: env vector contains EXACTLY the contract keys
+-- (WEZSESH_HMAC_KEY, WEZSESH_PLUGIN_VERSION, WEZSESH_RUNTIME_DIR) —
+-- plus PATH on macOS launchd contexts. The full config flows over
+-- the `bootstrap` IPC verb at TUI startup; the spawn vector carries
+-- only what the binary needs BEFORE the bootstrap roundtrip.
 
 describe("spawn", function()
     local function seed_session_key()
         gctrl.set("wezsesh_session_key", string.rep("b", 64))
     end
 
-    it("constructs the env vector with the four contract keys (PATH "
+    it("constructs the env vector with the contract keys (PATH "
         .. "permitted per T-906 launchd workaround)",
     function()
         seed_session_key()
@@ -887,23 +802,23 @@ describe("spawn", function()
         -- exact value checks.
         assert_eq(env.WEZSESH_HMAC_KEY, string.rep("b", 64),
             "HMAC key not threaded from GLOBAL")
-        assert_eq(env.WEZSESH_PROTO_VERSION, "1",
-            "PROTO_VERSION not '1'")
         assert_eq(env.WEZSESH_PLUGIN_VERSION, manager.VERSION,
             "PLUGIN_VERSION not M.VERSION")
-        assert_true(type(env.WEZSESH_CONFIG_JSON_BASE64) == "string"
-            and env.WEZSESH_CONFIG_JSON_BASE64 ~= "",
-            "CONFIG_JSON_BASE64 empty / wrong type")
-        -- The four contract keys MUST be present. We also inject
-        -- PATH on macOS launchd children (documented choice in
-        -- manager.lua); permit it but reject any other keys.
-        -- Critically WEZSESH_CONFIG_FILE MUST NOT be present —
-        -- the tmp-file route is gone.
+        assert_eq(env.WEZSESH_RUNTIME_DIR, "/tmp/wezsesh",
+            "WEZSESH_RUNTIME_DIR default not '/tmp/wezsesh'")
+        -- WEZSESH_CONFIG_JSON_BASE64 and WEZSESH_PROTO_VERSION MUST
+        -- NOT be present — the env-blob transport is retired.
+        assert_nil(env.WEZSESH_CONFIG_JSON_BASE64,
+            "WEZSESH_CONFIG_JSON_BASE64 leaked into spawn env (should be retired)")
+        assert_nil(env.WEZSESH_PROTO_VERSION,
+            "WEZSESH_PROTO_VERSION leaked into spawn env (should be retired)")
+        -- All contract keys MUST be present. We also inject PATH on
+        -- macOS launchd children (documented choice in manager.lua);
+        -- permit it but reject any other keys.
         local allowed = {
             WEZSESH_HMAC_KEY = true,
-            WEZSESH_PROTO_VERSION = true,
-            WEZSESH_CONFIG_JSON_BASE64 = true,
             WEZSESH_PLUGIN_VERSION = true,
+            WEZSESH_RUNTIME_DIR = true,
             PATH = true,
         }
         for k in pairs(env) do
@@ -918,8 +833,7 @@ describe("spawn", function()
             .. "TOCTOU surface should be retired)")
     end)
 
-    it("WEZSESH_CONFIG_JSON_BASE64 decodes back to the plugin's "
-        .. "config JSON", function()
+    it("WEZSESH_RUNTIME_DIR carries opts.runtime_dir verbatim", function()
         seed_session_key()
         local win = make_window_stub()
         manager.spawn(win, { spawn_mode = "tab",
@@ -928,17 +842,10 @@ describe("spawn", function()
                              runtime_dir  = "/rd",
                              data_dir     = "/dd" })
         local env = spawn_calls[1].arg.set_environment_variables
-        local decoded = b64_for_spec.decode(env.WEZSESH_CONFIG_JSON_BASE64)
-        assert_true(decoded ~= nil and decoded ~= "",
-            "WEZSESH_CONFIG_JSON_BASE64 did not decode")
-        local parsed = json_parse_shim(decoded)
-        assert_eq(parsed.snapshot_dir, "/sd", "snapshot_dir wrong")
-        assert_eq(parsed.state_dir, "/st", "state_dir wrong")
-        assert_eq(parsed.runtime_dir, "/rd", "runtime_dir wrong")
-        assert_eq(parsed.data_dir, "/dd", "data_dir wrong")
-        assert_eq(parsed.proto_version, 1, "proto_version not 1")
-        assert_eq(parsed.plugin_version, manager.VERSION,
-            "plugin_version mismatch")
+        -- Only WEZSESH_RUNTIME_DIR flows through the env vector for
+        -- dirs; snapshot/state/data come from the bootstrap reply.
+        assert_eq(env.WEZSESH_RUNTIME_DIR, "/rd",
+            "WEZSESH_RUNTIME_DIR did not carry opts.runtime_dir")
     end)
 
     it("does NOT write a config tmp file (the tmp-file TOCTOU surface "

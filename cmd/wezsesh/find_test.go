@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,15 +54,18 @@ func installFindHooks(t *testing.T, search findSearcher, inside *findInsideConte
 	}
 }
 
-// withMinimalEnv pins WEZSESH_CONFIG_JSON_BASE64 to a base64-encoded
-// JSON config so config.LoadFromEnv resolves without scanning the
-// user's real home. The body is JSON-empty (defaults across the
-// board) — find itself only consults the search + inside-wezterm
-// seams.
+// withMinimalEnv seeds WEZSESH_*_DIR overrides so config.LoadFromEnv
+// (which now goes through AutoDetect + applyEnvOverrides for non-TUI
+// subcommands) resolves to test-temp paths without touching the
+// user's real home. find itself only consults the search +
+// inside-wezterm seams.
 func withMinimalEnv(t *testing.T) {
 	t.Helper()
-	body := []byte(`{"version":1,"snapshot_dir":"/tmp/snap","state_dir":"/tmp/state","runtime_dir":"/tmp/rt","data_dir":"/tmp/data"}`)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
+	tmp := t.TempDir()
+	t.Setenv("WEZSESH_SNAPSHOT_DIR", filepath.Join(tmp, "snap"))
+	t.Setenv("WEZSESH_STATE_DIR", filepath.Join(tmp, "state"))
+	t.Setenv("WEZSESH_RUNTIME_DIR", filepath.Join(tmp, "rt"))
+	t.Setenv("WEZSESH_DATA_DIR", filepath.Join(tmp, "data"))
 	// WEZTERM_PANE intentionally unset — each test sets it explicitly
 	// when it wants the inside-wezterm branch.
 	t.Setenv("WEZTERM_PANE", "")
@@ -499,7 +502,7 @@ func TestRun_FindRoute(t *testing.T) {
 	installFindHooks(t, search, nil, nil)
 
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"find", "x"}, &stdout, &stderr)
+	rc := run([]string{"find", "x"}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitOK, stderr.String())
 	}

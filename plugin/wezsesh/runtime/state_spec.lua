@@ -289,10 +289,11 @@ end
 describe("module surface", function()
     it("exposes the public API and nothing more", function()
         local want = {
-            "delete_request", "delete_state", "get_request", "get_state",
+            "clear_active_trace", "delete_request", "delete_state",
+            "get_active_trace", "get_request", "get_state",
             "is_writing", "mark_seen", "prune_requests", "prune_seen_ids",
-            "prune_states", "seen", "set_request", "set_state",
-            "set_writing", "wipe_all",
+            "prune_states", "seen", "set_active_trace", "set_request",
+            "set_state", "set_writing", "wipe_all",
         }
         local keys = {}
         for k in pairs(state) do keys[#keys + 1] = k end
@@ -657,6 +658,104 @@ describe("prune_requests", function()
         state.prune_requests(os.time(), 60)
         local raw = control.get_raw_bucket("wezsesh_requests")
         assert_nil(raw["01JBAD"], "malformed request not swept")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- active-trace bucket — per-pane key wezsesh_active_trace_<pid>.
+-- Set by ipc.lua step (h) just before verbs.dispatch; read by
+-- runtime/log.lua at emit time when a log call threads pane_id
+-- through `fields`. Storage is a JSON-encoded scalar string so the
+-- value-shape rule (no nested-table values in GLOBAL) holds.
+-- ────────────────────────────────────────────────────────────────────
+
+describe("set_active_trace / get_active_trace / clear_active_trace",
+function()
+    it("round-trips a {trace_id, binary_session_id} record", function()
+        state.set_active_trace(42, {
+            trace_id = "01JTRACE0000000000000000AA",
+            binary_session_id = "01JBSESS0000000000000000BB",
+        })
+        local got = state.get_active_trace(42)
+        assert_true(got ~= nil, "get_active_trace returned nil")
+        assert_eq(got.trace_id, "01JTRACE0000000000000000AA",
+            "trace_id round-trip lost")
+        assert_eq(got.binary_session_id, "01JBSESS0000000000000000BB",
+            "binary_session_id round-trip lost")
+    end)
+
+    it("coerces integer pane ids to string keys (per-pane key shape)",
+    function()
+        state.set_active_trace(7, { trace_id = "T", binary_session_id = "B" })
+        -- The per-pane key is wezsesh_active_trace_<pid_str>. Read the
+        -- raw store via the harness escape hatch; the bucket name is
+        -- the literal key on the store, not a sub-bucket.
+        local store = control.get_raw_bucket("wezsesh_active_trace_7")
+        assert_true(store ~= nil,
+            "expected key wezsesh_active_trace_7 in the GLOBAL store")
+        assert_eq(type(store), "string",
+            "active-trace value must be a JSON string scalar, got "
+            .. type(store))
+    end)
+
+    it("returns nil when the pane has no active trace", function()
+        assert_nil(state.get_active_trace(999),
+            "expected nil on miss")
+    end)
+
+    it("returns nil when the stored value is corrupt (non-JSON)",
+    function()
+        -- The active-trace key is a TOP-LEVEL scalar string per pane,
+        -- not a nested bucket — overwrite the proxy directly. The
+        -- decoder must degrade to nil rather than raising;
+        -- runtime/log.lua calls this on every log emit and a raise
+        -- would wedge the event loop.
+        global.wezsesh_active_trace_88 = "this is not json"
+        local got = state.get_active_trace(88)
+        assert_nil(got, "corrupt value did not decode to nil")
+    end)
+
+    it("returns nil when the stored value is missing entirely",
+    function()
+        global.wezsesh_active_trace_77 = nil
+        assert_nil(state.get_active_trace(77),
+            "missing key did not return nil")
+    end)
+
+    it("clear_active_trace removes the entry", function()
+        state.set_active_trace(11, {
+            trace_id = "T", binary_session_id = "B",
+        })
+        assert_true(state.get_active_trace(11) ~= nil,
+            "set didn't land")
+        state.clear_active_trace(11)
+        assert_nil(state.get_active_trace(11),
+            "clear didn't take")
+    end)
+
+    it("set_active_trace ignores non-table ctx", function()
+        state.set_active_trace(33, "not a table")
+        assert_nil(state.get_active_trace(33),
+            "non-table ctx leaked into the store")
+        state.set_active_trace(33, nil)
+        assert_nil(state.get_active_trace(33),
+            "nil ctx leaked into the store")
+    end)
+
+    it("two panes have independent buckets (per-pane key shape)",
+    function()
+        state.set_active_trace("a",
+            { trace_id = "T_A", binary_session_id = "B" })
+        state.set_active_trace("b",
+            { trace_id = "T_B", binary_session_id = "B" })
+        assert_eq(state.get_active_trace("a").trace_id, "T_A",
+            "pane a trace lost")
+        assert_eq(state.get_active_trace("b").trace_id, "T_B",
+            "pane b trace lost — bucket bleed?")
+        state.clear_active_trace("a")
+        assert_nil(state.get_active_trace("a"), "clear a leaked")
+        assert_eq(state.get_active_trace("b").trace_id, "T_B",
+            "clear a wiped pane b's trace")
     end)
 end)
 

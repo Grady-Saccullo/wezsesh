@@ -39,13 +39,16 @@ const (
 	maxAcceptedLines  = 10_000
 )
 
-// sensitiveEnvKeys are the §13.5.1 keys filtered out of the child process
-// environment. Every other key from os.Environ() (including WEZSESH_LOG,
-// WEZSESH_NO_HOOKS, WEZSESH_NERDFONT) is preserved verbatim.
+// sensitiveEnvKeys are the §13.5.1 keys filtered out of the child
+// process environment. Post-bootstrap-cutover the only sensitive var
+// is WEZSESH_HMAC_KEY; the env-blob (WEZSESH_CONFIG_JSON_BASE64) and
+// the wire-version stamp (WEZSESH_PROTO_VERSION) have been retired,
+// and WEZSESH_RUNTIME_DIR / WEZSESH_PLUGIN_VERSION are non-secret
+// path / metadata respectively. Every other key from os.Environ()
+// (including WEZSESH_LOG, WEZSESH_NO_HOOKS, WEZSESH_NERDFONT) is
+// preserved verbatim.
 var sensitiveEnvKeys = map[string]struct{}{
-	"WEZSESH_HMAC_KEY":           {},
-	"WEZSESH_PROTO_VERSION":      {},
-	"WEZSESH_CONFIG_JSON_BASE64": {},
+	"WEZSESH_HMAC_KEY": {},
 }
 
 // Resolve runs the configured (or auto-detected) path provider and returns

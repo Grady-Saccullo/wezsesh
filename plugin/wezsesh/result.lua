@@ -138,17 +138,31 @@ local function bin_path()
     return nil
 end
 
+-- Resolve the plugin-side session id stamped onto every reply.
+-- `init.lua`'s apply_to_config mints the id and stashes it via
+-- `globals.set_plugin_session_id`; on a brief window before that runs
+-- (or in a stripped-down spec harness) the accessor returns nil and
+-- we fall back to "" so the field is still present on the wire (the
+-- canonical-JSON shape walker treats it as required).
+local function plugin_session_id()
+    local id = globals.plugin_session_id()
+    if type(id) == "string" and #id > 0 then return id end
+    return ""
+end
+
 -- Build the recovery envelope used when the primary encode raises.
 -- Guaranteed-clean ASCII so the recovery encode itself can't fail
 -- under normal conditions; a sanitised error message lets the TUI
 -- surface what actually went wrong instead of silently hanging.
 local function build_recovery_envelope(payload, err_text)
     return canonical_json.object{
-        v      = payload.v,
-        id     = payload.id,
-        status = "completed",
-        ok     = false,
-        error  = canonical_json.object{
+        v                 = payload.v,
+        id                = payload.id,
+        status            = "completed",
+        ok                = false,
+        binary_session_id = payload.binary_session_id or "",
+        plugin_session_id = plugin_session_id(),
+        error             = canonical_json.object{
             code    = "REPLY_ENCODE_FAILED",
             message = sanitize_utf8(tostring(err_text or "")),
             details = canonical_json.object{},
@@ -199,6 +213,21 @@ end
 -- TUI sees a structured error instead of waiting for the IPC
 -- timeout; both primary and recovery envelopes are HMAC-signed via
 -- sign_envelope so the TUI accepts them at parseReply.
+--
+-- §3.3 v=2 trace correlation: the binary_session_id from the
+-- originating request envelope is propagated into the spawned
+-- `wezsesh reply` child via `WEZSESH_BINARY_SESSION_ID`. Wezterm's
+-- public `background_child_process(argv)` API takes only an argv
+-- list — there is no `set_environment_variables` option on the
+-- background variant — so the env var is injected via `/usr/bin/env`,
+-- which is in POSIX and present at the same path on Linux and Darwin.
+-- The bsid is a 26-char Crockford-base32 ULID (alphabet `[0-9A-HJKMNP-TV-Z]`),
+-- so it never contains shell-meta or `=` and is safe to splice
+-- inline into env's `KEY=VALUE` token. We still defensively replace
+-- any non-conforming character with the empty string before splicing,
+-- and skip the env-prefix entirely when the bsid is missing — better
+-- to spawn without trace correlation than to hand env(1) a malformed
+-- token and have the spawn ENOENT.
 local function spawn_reply(reply_sock, payload, envelope)
     local bin = bin_path()
     if bin == nil then return false end
@@ -218,8 +247,29 @@ local function spawn_reply(reply_sock, payload, envelope)
 
     local b64s = b64.encode(json)
 
-    local ok = pcall(wezterm.background_child_process,
-                     { bin, "reply", reply_sock, b64s })
+    local argv
+    local bsid = payload and payload.binary_session_id
+    if type(bsid) == "string" and #bsid == 26
+       and bsid:match("^[0-9A-Z]+$") ~= nil
+    then
+        -- env(1) form: env -i would clear the inherited environment;
+        -- we want the child to inherit wezterm's env (PATH, HOME, etc.)
+        -- and just add WEZSESH_BINARY_SESSION_ID on top. Plain
+        -- `env KEY=VALUE prog args...` is exactly that.
+        argv = {
+            "/usr/bin/env",
+            "WEZSESH_BINARY_SESSION_ID=" .. bsid,
+            bin, "reply", reply_sock, b64s,
+        }
+    else
+        -- bsid missing or malformed (legacy v=1 fallback / fixture
+        -- harness without payload.binary_session_id). Fall back to the
+        -- bare argv shape so the reply still ships; the spawned
+        -- `wezsesh reply` simply has no bsid in its env.
+        argv = { bin, "reply", reply_sock, b64s }
+    end
+
+    local ok = pcall(wezterm.background_child_process, argv)
     return ok
 end
 
@@ -235,10 +285,12 @@ end
 -- via the spec.
 function M.reply_started(payload)
     return spawn_reply(payload.reply_sock, payload, canonical_json.object{
-        v      = payload.v,
-        id     = payload.id,
-        status = "started",
-        ok     = true,
+        v                 = payload.v,
+        id                = payload.id,
+        status            = "started",
+        ok                = true,
+        binary_session_id = payload.binary_session_id or "",
+        plugin_session_id = plugin_session_id(),
     })
 end
 
@@ -248,11 +300,13 @@ end
 -- `data` be present (may be `{}`) for completed+ok=true.
 function M.reply_completed(payload, data)
     return spawn_reply(payload.reply_sock, payload, canonical_json.object{
-        v      = payload.v,
-        id     = payload.id,
-        status = "completed",
-        ok     = true,
-        data   = deep_tag(data or {}),
+        v                 = payload.v,
+        id                = payload.id,
+        status            = "completed",
+        ok                = true,
+        data              = deep_tag(data or {}),
+        binary_session_id = payload.binary_session_id or "",
+        plugin_session_id = plugin_session_id(),
     })
 end
 
@@ -275,12 +329,14 @@ function M.reply_partial(payload, data, warnings)
         end
     end
     return spawn_reply(payload.reply_sock, payload, canonical_json.object{
-        v        = payload.v,
-        id       = payload.id,
-        status   = "partial",
-        ok       = true,
-        data     = deep_tag(data or {}),
-        warnings = canonical_json.array(rebuilt),
+        v                 = payload.v,
+        id                = payload.id,
+        status            = "partial",
+        ok                = true,
+        data              = deep_tag(data or {}),
+        warnings          = canonical_json.array(rebuilt),
+        binary_session_id = payload.binary_session_id or "",
+        plugin_session_id = plugin_session_id(),
     })
 end
 
@@ -291,11 +347,13 @@ end
 -- SAVE_FAILED).
 function M.reply_error(payload, code, message, details)
     return spawn_reply(payload.reply_sock, payload, canonical_json.object{
-        v      = payload.v,
-        id     = payload.id,
-        status = "completed",
-        ok     = false,
-        error  = canonical_json.object{
+        v                 = payload.v,
+        id                = payload.id,
+        status            = "completed",
+        ok                = false,
+        binary_session_id = payload.binary_session_id or "",
+        plugin_session_id = plugin_session_id(),
+        error             = canonical_json.object{
             code    = tostring(code or "UNKNOWN"),
             message = sanitize_utf8(tostring(message or "")),
             details = deep_tag(details or {}),

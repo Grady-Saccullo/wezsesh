@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"time"
 )
 
@@ -63,6 +64,16 @@ func subcmdReply(rest []string, _, stderr io.Writer) (rc int) {
 			rc = exitDoctorOrSubcmd
 		}
 	}()
+
+	// §3.3 v=2 trace correlation: the spawning plugin (result.lua) sets
+	// WEZSESH_BINARY_SESSION_ID on the spawn env to the originating
+	// dispatcher's id (echoed off the reply envelope). reply.go does not
+	// currently construct a structured logger — `wezsesh reply` is a
+	// minimal short-lived process per §8.20.1 step 3 — so this read is
+	// future-proofing for a logger.New(stateDir, level, binarySessionID)
+	// wiring in a later phase. Keeping the read here documents the
+	// contract surface so a future reader sees the env var is consumed.
+	_ = os.Getenv("WEZSESH_BINARY_SESSION_ID")
 
 	if len(rest) != 2 {
 		fmt.Fprintf(stderr, "wezsesh reply: usage: wezsesh reply <sock> <b64json>\n")
@@ -150,14 +161,16 @@ func validateReplyShape(decoded []byte) error {
 	}
 
 	allowed := map[string]struct{}{
-		"v":        {},
-		"id":       {},
-		"status":   {},
-		"ok":       {},
-		"hmac":     {},
-		"data":     {},
-		"warnings": {},
-		"error":    {},
+		"v":                 {},
+		"id":                {},
+		"status":            {},
+		"ok":                {},
+		"hmac":              {},
+		"data":              {},
+		"warnings":          {},
+		"error":             {},
+		"binary_session_id": {},
+		"plugin_session_id": {},
 	}
 	for k := range raw {
 		if _, ok := allowed[k]; !ok {

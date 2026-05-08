@@ -155,53 +155,152 @@ local golden_inputs = {
         name = "~/code", cwd = "/home/user/code",
     },
     verb_noop_args       = cj.object{},
-    verb_list_dirs_args  = cj.object{ query = "" },
-    verb_list_dirs_reply_data = cj.object{
-        dirs = cj.array{
-            cj.object{ name = "code", path = "/home/user/code" },
-            cj.object{ name = "srv",  path = "/srv" },
+    verb_bootstrap_args  = cj.object{},
+    verb_bootstrap_reply_data = cj.object{
+        colors = cj.object{
+            accent   = "#ff8800",
+            focus_bg = "#222222",
+            muted    = "#888888",
         },
+        columns                       = cj.array{
+            "marker", "name", "tabs", "age", "tags",
+        },
+        confirm_delete                = true,
+        confirm_overwrite             = false,
+        data_dir                      = "/var/data",
+        default_action                = "switch",
+        default_action_load_no_prompt = true,
+        dir_providers = cj.array{
+            cj.object{
+                type       = "command",
+                argv       = cj.array{ "zoxide", "query", "-l" },
+                limit      = 200,
+                timeout_ms = 5000,
+            },
+            cj.object{
+                type           = "directory",
+                path           = "/home/user/code",
+                depth          = 2,
+                limit          = 200,
+                include_hidden = false,
+            },
+            cj.object{
+                type  = "static",
+                paths = cj.array{ "/tmp", "/etc" },
+            },
+        },
+        exclude                       = cj.array{ "^default$", "^skip$" },
+        hooks = cj.object{
+            prompt_on_untrusted = false,
+            run_hooks           = true,
+            timeout_seconds     = 600,
+        },
+        keys = cj.object{
+            bottom = "G", clear_marks = "c", delete = "d",
+            down = "j", filter = "/", help = "?",
+            load = "l", mark = "Tab", mark_alt = "Space",
+            ["new"] = "n", pin = "p", quit = "q",
+            rename = "r", save = "S", switch = "s",
+            tag = "t", top = "gg", up = "k",
+        },
+        log_level = "info",
+        markers = cj.object{
+            active  = "▶",
+            live    = "●",
+            marked  = "✓",
+            pinned  = "[pinned]",
+            unsaved = "(unsaved)",
+        },
+        name_truncate         = "middle",
+        new_workspace_command = "tmux new",
+        plugin_version        = "0.1.0",
+        preview = cj.object{
+            enabled = true,
+            width   = 40,
+        },
+        resurrect_argv_allowlist = cj.array{ "bash", "zsh", "nvim" },
+        runtime_dir              = "/tmp/wezsesh",
+        snapshot_dir             = "/var/snap",
+        sort                     = "live_first",
+        state_dir                = "/var/state",
     },
-    verb_list_dirs_reply_data_empty = cj.object{
-        dirs = cj.array{},
+    verb_bootstrap_reply_data_empty = cj.object{
+        colors                        = cj.object{},
+        columns                       = cj.array{},
+        confirm_delete                = false,
+        confirm_overwrite             = false,
+        data_dir                      = "",
+        default_action                = "",
+        default_action_load_no_prompt = false,
+        dir_providers                 = cj.array{},
+        exclude                       = cj.array{},
+        hooks = cj.object{
+            prompt_on_untrusted = false,
+            run_hooks           = false,
+            timeout_seconds     = 0,
+        },
+        keys                     = cj.object{},
+        log_level                = "",
+        markers                  = cj.object{},
+        name_truncate            = "",
+        new_workspace_command    = cj.NULL,
+        plugin_version           = "",
+        preview = cj.object{
+            enabled = false,
+            width   = 0,
+        },
+        resurrect_argv_allowlist = cj.array{},
+        runtime_dir              = "",
+        snapshot_dir             = "",
+        sort                     = "",
+        state_dir                = "",
     },
-
     -- Reply-shape fixtures. The `hmac` field is a stable 64-zero string;
     -- the corpus tests encoder byte-equality for the reply shapes the
-    -- Lua-side signer emits.
+    -- Lua-side signer emits. `binary_session_id` and
+    -- `plugin_session_id` were added at v=2 (top-level, signed,
+    -- 26-char ULID — same length contract as `id`).
     reply_started = cj.object{
-        v      = 1,
-        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        status = "started",
-        ok     = true,
-        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status            = "started",
+        ok                = true,
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+        plugin_session_id = "01JABCDEFGHJKMNPQRSTVWXYZC",
+        hmac              = "0000000000000000000000000000000000000000000000000000000000000000",
     },
     reply_completed_ok = cj.object{
-        v      = 1,
-        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        status = "completed",
-        ok     = true,
-        data   = cj.object{ active_workspace = "main" },
-        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status            = "completed",
+        ok                = true,
+        data              = cj.object{ active_workspace = "main" },
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+        plugin_session_id = "01JABCDEFGHJKMNPQRSTVWXYZC",
+        hmac              = "0000000000000000000000000000000000000000000000000000000000000000",
     },
     reply_completed_error = cj.object{
-        v      = 1,
-        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        status = "completed",
-        ok     = false,
-        error  = cj.object{
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status            = "completed",
+        ok                = false,
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+        plugin_session_id = "01JABCDEFGHJKMNPQRSTVWXYZC",
+        error             = cj.object{
             code    = "SAVE_FAILED",
             message = "disk full",
             details = cj.object{ raw_error = "ENOSPC" },
         },
-        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+        hmac              = "0000000000000000000000000000000000000000000000000000000000000000",
     },
     reply_partial = cj.object{
-        v      = 1,
-        id     = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        status = "partial",
-        ok     = true,
-        data   = cj.object{ name = "snap-1" },
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        status            = "partial",
+        ok                = true,
+        data              = cj.object{ name = "snap-1" },
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+        plugin_session_id = "01JABCDEFGHJKMNPQRSTVWXYZC",
         warnings = cj.array{
             cj.object{
                 code    = "RESURRECT_PARTIAL",
@@ -209,7 +308,23 @@ local golden_inputs = {
                 details = cj.object{ raw_error = "spawn failed" },
             },
         },
-        hmac   = "0000000000000000000000000000000000000000000000000000000000000000",
+        hmac              = "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+
+    -- Full request envelope fixture (mirrors the Go-side
+    -- `request_full` golden). Pins the v=2 sorted-key shape end to end
+    -- so the byte-equality gate covers the request side with the same
+    -- fidelity it covers the reply side.
+    request_full = cj.object{
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        ts                = 1700000000,
+        target_window_id  = 1,
+        reply_sock        = "/tmp/x.sock",
+        op                = "noop",
+        args              = cj.object{},
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
+        hmac              = "0000000000000000000000000000000000000000000000000000000000000000",
     },
 }
 
@@ -301,29 +416,32 @@ describe("verb-aware tagging round-trip", function()
     function()
         -- Simulate wezterm.json_parse output: plain (untagged) tables.
         local payload = {
-            v                = 1,
-            id               = "01JABCDEFGHJKMNPQRSTVWXYZA",
-            ts               = 1700000000,
-            target_window_id = 1,
-            reply_sock       = "/tmp/x.sock",
-            op               = "noop",
-            hmac             = "deadbeef",  -- present; would be removed
-                                            -- before re-encode in real
-                                            -- verifier flow, but the
-                                            -- canonical-WITH-hmac form
-                                            -- is what the round-trip
-                                            -- fixture documents.
-            args             = {},
+            v                 = 2,
+            id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            ts                = 1700000000,
+            target_window_id  = 1,
+            reply_sock        = "/tmp/x.sock",
+            op                = "noop",
+            hmac              = "deadbeef",  -- present; would be removed
+                                             -- before re-encode in real
+                                             -- verifier flow, but the
+                                             -- canonical-WITH-hmac form
+                                             -- is what the round-trip
+                                             -- fixture documents.
+            args              = {},
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
         }
 
         cj.tag_in_place(payload, cj.ROOT_PAYLOAD_SHAPE,
             cj.verb_args_shape.noop)
 
         local got = cj.encode(payload)
-        local want_with_hmac = '{"args":{},"hmac":"deadbeef",'
+        local want_with_hmac = '{"args":{},'
+            .. '"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB",'
+            .. '"hmac":"deadbeef",'
             .. '"id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop",'
             .. '"reply_sock":"/tmp/x.sock","target_window_id":1,'
-            .. '"ts":1700000000,"v":1}'
+            .. '"ts":1700000000,"v":2}'
         assert_eq(got, want_with_hmac,
             "tagged-payload encode (with hmac) wrong")
 
@@ -331,22 +449,24 @@ describe("verb-aware tagging round-trip", function()
         local sans = cj.copy_without(payload, "hmac")
         local got_sans = cj.encode(sans)
         local want_sans = '{"args":{},'
+            .. '"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB",'
             .. '"id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop",'
             .. '"reply_sock":"/tmp/x.sock","target_window_id":1,'
-            .. '"ts":1700000000,"v":1}'
+            .. '"ts":1700000000,"v":2}'
         assert_eq(got_sans, want_sans,
             "canonical sans-hmac form mismatch")
     end)
 
     it("save: full envelope tags correctly with verb args", function()
         local payload = {
-            v                = 1,
-            id               = "01JABCDEFGHJKMNPQRSTVWXYZA",
-            ts               = 1700000000,
-            target_window_id = 1,
-            reply_sock       = "/tmp/x.sock",
-            op               = "save",
-            hmac             = "deadbeef",
+            v                 = 2,
+            id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            ts                = 1700000000,
+            target_window_id  = 1,
+            reply_sock        = "/tmp/x.sock",
+            op                = "save",
+            hmac              = "deadbeef",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
             args = {
                 name = "work", overwrite = false,
                 expected_hash = "sha256:dead",
@@ -358,17 +478,19 @@ describe("verb-aware tagging round-trip", function()
         -- args order: expected_hash < name < overwrite (byte order).
         assert_eq(got,
             '{"args":{"expected_hash":"sha256:dead","name":"work","overwrite":false},'
+            .. '"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB",'
             .. '"hmac":"deadbeef","id":"01JABCDEFGHJKMNPQRSTVWXYZA",'
             .. '"op":"save","reply_sock":"/tmp/x.sock",'
-            .. '"target_window_id":1,"ts":1700000000,"v":1}')
+            .. '"target_window_id":1,"ts":1700000000,"v":2}')
     end)
 
     it("save: NULL expected_hash round-trips", function()
         local payload = {
-            v = 1, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            v = 2, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
             ts = 1700000000, target_window_id = 1,
             reply_sock = "/tmp/x.sock", op = "save",
             hmac = "deadbeef",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
             args = {
                 name = "work", overwrite = false,
                 expected_hash = cj.NULL,  -- already a sentinel
@@ -383,10 +505,11 @@ describe("verb-aware tagging round-trip", function()
 
     it("rejects shape mismatch on leaf (name = 42)", function()
         local payload = {
-            v = 1, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            v = 2, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
             ts = 1700000000, target_window_id = 1,
             reply_sock = "/tmp/x.sock", op = "switch",
             hmac = "deadbeef",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
             args = { name = 42 },  -- wrong type
         }
         assert_raises(function()
@@ -397,15 +520,37 @@ describe("verb-aware tagging round-trip", function()
 
     it("rejects missing required key", function()
         local payload = {
-            v = 1, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            v = 2, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
             ts = 1700000000, target_window_id = 1,
             reply_sock = "/tmp/x.sock", op = "switch",
             hmac = "deadbeef",
+            binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
             args = {},  -- missing name
         }
         assert_raises(function()
             cj.tag_in_place(payload, cj.ROOT_PAYLOAD_SHAPE,
                 cj.verb_args_shape.switch)
+        end, "CANONICAL_SHAPE_MISMATCH")
+    end)
+
+    it("rejects missing binary_session_id (v=2 required field)",
+    function()
+        -- Sentinel: an old binary speaking v=1 envelope shape would
+        -- omit binary_session_id; the tag walker raises
+        -- CANONICAL_SHAPE_MISMATCH so the wire-version skew surfaces
+        -- loudly instead of silently signing different bytes than the
+        -- binary did.
+        local payload = {
+            v = 2, id = "01JABCDEFGHJKMNPQRSTVWXYZA",
+            ts = 1700000000, target_window_id = 1,
+            reply_sock = "/tmp/x.sock", op = "noop",
+            hmac = "deadbeef",
+            -- binary_session_id intentionally absent.
+            args = {},
+        }
+        assert_raises(function()
+            cj.tag_in_place(payload, cj.ROOT_PAYLOAD_SHAPE,
+                cj.verb_args_shape.noop)
         end, "CANONICAL_SHAPE_MISMATCH")
     end)
 end)

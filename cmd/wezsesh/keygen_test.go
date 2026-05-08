@@ -216,7 +216,7 @@ func TestRun_KeygenRoute(t *testing.T) {
 	withKeygenRand(t, bytes.NewReader(seed))
 
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"keygen"}, &stdout, &stderr)
+	rc := run([]string{"keygen"}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitOK {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitOK, stderr.String())
 	}
@@ -235,7 +235,7 @@ func TestRun_KeygenRoute(t *testing.T) {
 // the unit-tested function body.
 func TestRun_KeygenRoute_TrailingArgs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	rc := run([]string{"keygen", "foo"}, &stdout, &stderr)
+	rc := run([]string{"keygen", "foo"}, &stdout, &stderr, testBinarySessionID)
 	if rc != exitKeygen {
 		t.Fatalf("rc = %d, want %d (stderr=%q)", rc, exitKeygen, stderr.String())
 	}

@@ -32,6 +32,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Grady-Saccullo/wezsesh/internal/dirproviders"
 	"github.com/Grady-Saccullo/wezsesh/internal/ipc"
 	"github.com/Grady-Saccullo/wezsesh/internal/logger"
 	"github.com/Grady-Saccullo/wezsesh/internal/nameval"
@@ -152,7 +153,8 @@ type Config struct {
 	DefaultAction             Action
 	DefaultActionLoadNoPrompt bool
 	PreviewEnabled            bool
-	PreviewWidth              float64
+	// PreviewWidth is integer percent (0–100); see config.Config.Preview.Width.
+	PreviewWidth              int
 	Markers                   Markers
 	Columns                   []Column
 	NameTruncate              string // "middle" only in v0.1 (§15.5)
@@ -170,6 +172,12 @@ type Data struct {
 	State           *state.Store // may be nil in tests; LastSwitched / SwitchCount fall through
 	ActiveWorkspace string
 	ActiveWindowID  int
+	// DirProviders carries the user's declarative directory-row
+	// providers (`command` / `directory` / `static`). The TUI's
+	// Init() fires a tea.Cmd that calls
+	// internal/dirproviders.RunAll on these and merges the
+	// resulting rows via applyExternalDirs. nil/empty disables.
+	DirProviders []dirproviders.Config
 }
 
 // Source classifies where a picker row came from. The value drives
@@ -389,7 +397,7 @@ func newModel(cfg Config, initial Data, d ipc.Dispatcher, opts ...Option) *Model
 		cfg.NameTruncate = "middle"
 	}
 	if cfg.PreviewWidth <= 0 {
-		cfg.PreviewWidth = 0.4
+		cfg.PreviewWidth = 40
 	}
 	rows := sanitiseRows(initial.Workspaces)
 	sortRows(rows, cfg.Sort, initial.State)

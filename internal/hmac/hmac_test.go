@@ -4,13 +4,13 @@
 //
 // openssl cross-check (the canonical sans-hmac bytes go on stdin):
 //
-//	printf '%s' '{"args":{},"id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop","reply_sock":"/tmp/x.sock","target_window_id":1,"ts":1700000000,"v":1}' \
+//	printf '%s' '{"args":{},"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB","id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop","reply_sock":"/tmp/x.sock","target_window_id":1,"ts":1700000000,"v":2}' \
 //	  | openssl dgst -sha256 -mac HMAC \
 //	      -macopt hexkey:a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1
 //
 // Expected output:
 //
-//	HMAC-SHA2-256(stdin)= 52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5
+//	HMAC-SHA2-256(stdin)= 21607557a30c79f540fffc8ba3496711108dbdf1f47282ccc7b3593ffb52abe4
 //
 // (older openssl: "HMAC-SHA256(stdin)= ..."). The hex digest is the
 // expected_hmac in testdata/roundtrip.json and §17.2.

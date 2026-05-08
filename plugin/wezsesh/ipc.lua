@@ -127,7 +127,10 @@ end
 
 function M.validate_payload(payload)
     if type(payload) ~= "table" then return false end
-    if type(payload.v) ~= "number" or payload.v ~= 1 then return false end
+    -- Wire version pinned to 2. An old binary speaking v=1 fails this
+    -- check loudly (logged as WIRE_VERSION_MISMATCH at the call site)
+    -- instead of producing a silent canonical-shape mismatch downstream.
+    if type(payload.v) ~= "number" or payload.v ~= 2 then return false end
     if type(payload.id) ~= "string" or #payload.id ~= 26 then
         return false
     end
@@ -145,6 +148,12 @@ function M.validate_payload(payload)
     end
     if type(payload.target_window_id) ~= "number" then return false end
     if type(payload.hmac) ~= "string" or #payload.hmac ~= 64 then
+        return false
+    end
+    -- §3.3 v=2 field. Same length contract as `id` (26-char ULID).
+    if type(payload.binary_session_id) ~= "string"
+       or #payload.binary_session_id ~= 26
+    then
         return false
     end
     return true
@@ -276,53 +285,75 @@ function M.handle_user_var(window, pane, name, value, opts)
     local req_dir_prefix   = opts.req_dir_prefix
     local target_window_id = opts.target_window_id
 
+    -- Compute pane_id eagerly. `pane:pane_id()` is a synchronous
+    -- userdata accessor (no async wezterm primitive in CLAUDE.md
+    -- invariant 3's forbidden set), so reading it here keeps the (a)–(h)
+    -- sync invariant intact. Threading `pane_id` into every structured
+    -- log record below tags those records with the originating pane,
+    -- and once step (h) sets the active-trace bucket (just before
+    -- `verbs.dispatch`), `runtime/log.lua`'s lazy
+    -- `state.get_active_trace(pane_id)` lookup attaches `trace_id` /
+    -- `binary_session_id` automatically. Until step (h) runs the bucket
+    -- is empty and the lookup returns nil — pre-dispatch records carry
+    -- only `pane_id` + `plugin_session_id`, which is the documented
+    -- "no trace context handy" fallback.
+    local pane_id = pane and pane:pane_id()
+
     -- ── Pre-step (1): JSON-parse → pointer ───────────────────────────
     -- wezterm's SetUserVar parser base64-decodes the OSC value before
     -- firing `user-var-changed`, so `value` here is already the raw
     -- pointer JSON bytes. A separate b64.decode would (and historically
     -- did) double-decode and reject every live pointer.
     if type(value) ~= "string" or #value == 0 then
-        log.warn("REQ_POINTER_REJECTED: empty or non-string value")
+        log.warn("REQ_POINTER_REJECTED: empty or non-string value",
+            { pane_id = pane_id })
         return
     end
 
     local ok_p, pointer = pcall(wezterm.json_parse, value)
     if not ok_p or type(pointer) ~= "table" then
-        log.warn("REQ_POINTER_REJECTED: pointer JSON parse failed")
+        log.warn("REQ_POINTER_REJECTED: pointer JSON parse failed",
+            { pane_id = pane_id })
         return
     end
 
     -- ── Pre-step (2): pointer field-shape validate ───────────────────
     if not M.validate_pointer(pointer, req_dir_prefix) then
-        log.warn("REQ_POINTER_REJECTED: pointer shape invalid")
+        log.warn("REQ_POINTER_REJECTED: pointer shape invalid",
+            { pane_id = pane_id })
         return
     end
 
     -- ── Pre-step (3): stat (regular, 0600, non-symlink, owner-self) ──
     if not stat_guard_ok(pointer.path) then
-        log.warn("REQ_POINTER_REJECTED: file stat guard failed")
+        log.warn("REQ_POINTER_REJECTED: file stat guard failed",
+            { pane_id = pane_id })
         return
     end
 
     -- ── Pre-step (4): read + parse + cross-check id ──────────────────
     local file_bytes, read_err = read_request_file(pointer.path)
     if file_bytes == nil then
-        log.warn("REQ_POINTER_REJECTED: read failed: " .. tostring(read_err))
+        log.warn("REQ_POINTER_REJECTED: read failed: " .. tostring(read_err),
+            { pane_id = pane_id })
         return
     end
     if #file_bytes == 0 then
-        log.warn("REQ_POINTER_REJECTED: empty request file")
+        log.warn("REQ_POINTER_REJECTED: empty request file",
+            { pane_id = pane_id })
         return
     end
 
     local ok_pl, payload = pcall(wezterm.json_parse, file_bytes)
     if not ok_pl or type(payload) ~= "table" then
-        log.warn("REQ_POINTER_REJECTED: payload JSON parse failed")
+        log.warn("REQ_POINTER_REJECTED: payload JSON parse failed",
+            { pane_id = pane_id })
         return
     end
 
     if payload.id ~= pointer.id then
-        log.warn("REQ_POINTER_REJECTED: pointer.id != payload.id")
+        log.warn("REQ_POINTER_REJECTED: pointer.id != payload.id",
+            { pane_id = pane_id })
         return
     end
 
@@ -332,7 +363,6 @@ function M.handle_user_var(window, pane, name, value, opts)
     -- spawned_at} association via `state.set_state(pane_id, …)` at
     -- spawn time. Foreign panes (another plugin emitting `wezsesh_op`)
     -- fall out here; the cost is one stringify + one GLOBAL read.
-    local pane_id = pane and pane:pane_id()
     if pane_id == nil then
         log.warn("ipc: handler received nil pane")
         return
@@ -358,7 +388,19 @@ function M.handle_user_var(window, pane, name, value, opts)
     -- ── Step (c) is folded into pre-step (4) — payload already parsed.
     -- ── Step (d): payload field-shape validate ───────────────────────
     if not M.validate_payload(payload) then
-        log.warn("ipc: payload shape invalid")
+        -- Distinguish wire-version skew from other shape failures so
+        -- "old binary, new plugin" surfaces loudly instead of looking
+        -- like a generic shape-mismatch drop. Skew is the most likely
+        -- shape-validate miss after the v=1 → v=2 bump.
+        if type(payload) == "table" and payload.v ~= 2 then
+            log.warn(string.format(
+                "ipc: WIRE_VERSION_MISMATCH (got v=%s, want v=2)",
+                tostring(payload.v)),
+                { pane_id = pane_id })
+        else
+            log.warn("ipc: payload shape invalid",
+                { pane_id = pane_id })
+        end
         return
     end
 
@@ -375,7 +417,8 @@ function M.handle_user_var(window, pane, name, value, opts)
         -- requires a verb-keyed args spec. Skipping the HMAC check
         -- would be a security bug, so we silently drop and log instead
         -- of falling through to ops.dispatch.
-        log.warn("ipc: no shape registered for op=" .. tostring(payload.op))
+        log.warn("ipc: no shape registered for op=" .. tostring(payload.op),
+            { pane_id = pane_id })
         return
     end
 
@@ -403,14 +446,16 @@ function M.handle_user_var(window, pane, name, value, opts)
                          verb_args_shape)
     if not ok_tag then
         log.warn("ipc: canonical tag failed (op=" .. tostring(payload.op)
-                 .. "): " .. tostring(tag_err))
+                 .. "): " .. tostring(tag_err),
+            { pane_id = pane_id })
         return
     end
 
     local sans_hmac = canonical_json.copy_without(payload, "hmac")
     local ok_enc, payload_bytes = pcall(canonical_json.encode, sans_hmac)
     if not ok_enc or type(payload_bytes) ~= "string" then
-        log.warn("ipc: canonical encode failed")
+        log.warn("ipc: canonical encode failed",
+            { pane_id = pane_id })
         return
     end
 
@@ -425,7 +470,7 @@ function M.handle_user_var(window, pane, name, value, opts)
     if not ct_eq.eq(payload.hmac, computed) then
         -- HMAC mismatch is silent on the wire; the binary observes
         -- IPC_TIMEOUT. Logging is INTERNAL only.
-        log.warn("ipc: HMAC mismatch")
+        log.warn("ipc: HMAC mismatch", { pane_id = pane_id })
         return
     end
 
@@ -436,7 +481,8 @@ function M.handle_user_var(window, pane, name, value, opts)
     if skew > M.FRESHNESS_WINDOW_SECONDS then
         log.warn(string.format(
             "ipc: STALE_PAYLOAD (skew=%ds, ts=%d, now=%d)",
-            skew, payload.ts, now))
+            skew, payload.ts, now),
+            { pane_id = pane_id })
         return
     end
 
@@ -488,16 +534,50 @@ function M.handle_user_var(window, pane, name, value, opts)
         end
     end
     if type(dispatch_fn) ~= "function" then
-        log.warn("ipc: verbs.dispatch unavailable")
+        log.warn("ipc: verbs.dispatch unavailable",
+            { pane_id = pane_id })
         return
     end
 
+    -- Stamp the per-pane active-trace bucket so synchronous log calls
+    -- inside `verbs.dispatch` (and any helper this dispatch invokes
+    -- before it returns) automatically pick up `trace_id` /
+    -- `binary_session_id` via runtime/log.lua's lazy
+    -- `state.get_active_trace(pane_id)` lookup. The bucket is cleared
+    -- unconditionally below, BEFORE this function returns, so a stale
+    -- entry can't bleed across into the next dispatch on the same pane.
+    -- Async callsites that fire AFTER this function returns (resurrect
+    -- callbacks, the reply-spawn child) must thread `trace_id` /
+    -- `binary_session_id` explicitly via `log.warn(msg, {trace_id =
+    -- captured, binary_session_id = captured})` — the bucket is gone by
+    -- the time those run.
+    state.set_active_trace(pane_id, {
+        trace_id          = payload.id,
+        binary_session_id = payload.binary_session_id,
+    })
+
     local ok_d, err_d = pcall(dispatch_fn, payload, window, pane)
+
+    -- Clear unconditionally. The bucket lifetime is bounded by the
+    -- synchronous portion of this handler; releasing it on every return
+    -- path keeps the GLOBAL footprint bounded to the in-flight set.
+    state.clear_active_trace(pane_id)
+
     if not ok_d then
         -- Verbs raising out of pcall is a programmer error; we still
         -- swallow it — CLAUDE.md invariant 1 (uncaught raise wedges the
         -- event loop). Logging gives the next operator a thread to pull.
-        log.warn("ipc: dispatch raised: " .. tostring(err_d))
+        --
+        -- We pass `pane_id` so the record is tagged with the pane, and
+        -- `trace_id` / `binary_session_id` explicitly because the
+        -- active-trace bucket has just been cleared (the lazy lookup
+        -- via pane_id won't fire). This matches the documented async-
+        -- callsite pattern even though the call is still synchronous.
+        log.warn("ipc: dispatch raised: " .. tostring(err_d), {
+            pane_id           = pane_id,
+            trace_id          = payload.id,
+            binary_session_id = payload.binary_session_id,
+        })
     end
 end
 
@@ -558,7 +638,19 @@ function M.register(opts)
             -- inside handle_user_var, a programmer error in this file
             -- (e.g. a typo causing a nil-deref) MUST NOT wedge the
             -- wezterm event loop. CLAUDE.md invariant 1.
-            log.warn("ipc: handler raised: " .. tostring(err))
+            --
+            -- Best-effort pane_id tagging: if `pane` is non-nil and
+            -- responds to `:pane_id()`, we surface it on the record;
+            -- the active-trace bucket may or may not still be set
+            -- depending on which step inside handle_user_var raised, so
+            -- we don't fabricate trace context here.
+            local pane_id
+            if pane ~= nil then
+                local ok_pid, pid = pcall(function() return pane:pane_id() end)
+                if ok_pid then pane_id = pid end
+            end
+            log.warn("ipc: handler raised: " .. tostring(err),
+                { pane_id = pane_id })
         end
     end)
     _G._wezsesh_user_var_listener_installed = true

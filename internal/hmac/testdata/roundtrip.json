@@ -2,14 +2,15 @@
   "key_hex": "a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1",
   "payload": {
     "args": {},
+    "binary_session_id": "01JABCDEFGHJKMNPQRSTVWXYZB",
     "id": "01JABCDEFGHJKMNPQRSTVWXYZA",
     "op": "noop",
     "reply_sock": "/tmp/x.sock",
     "target_window_id": 1,
     "ts": 1700000000,
-    "v": 1
+    "v": 2
   },
-  "canonical_sans_hmac": "{\"args\":{},\"id\":\"01JABCDEFGHJKMNPQRSTVWXYZA\",\"op\":\"noop\",\"reply_sock\":\"/tmp/x.sock\",\"target_window_id\":1,\"ts\":1700000000,\"v\":1}",
-  "canonical_sans_hmac_sha256": "f23dc13717d2c992a06d216528f9a0fb62ffd0d2b896ddf66e5dd3931911f616",
-  "expected_hmac": "52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5"
+  "canonical_sans_hmac": "{\"args\":{},\"binary_session_id\":\"01JABCDEFGHJKMNPQRSTVWXYZB\",\"id\":\"01JABCDEFGHJKMNPQRSTVWXYZA\",\"op\":\"noop\",\"reply_sock\":\"/tmp/x.sock\",\"target_window_id\":1,\"ts\":1700000000,\"v\":2}",
+  "canonical_sans_hmac_sha256": "762383e8ad4da10b6be41a4bd2bb2af39a982f8124e8726b1f3b8949b9f750b6",
+  "expected_hmac": "21607557a30c79f540fffc8ba3496711108dbdf1f47282ccc7b3593ffb52abe4"
 }

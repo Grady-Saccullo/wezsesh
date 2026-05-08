@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,9 +10,10 @@ import (
 )
 
 // doctorTestEnv builds a self-contained config tree under t.TempDir()
-// and pins WEZSESH_CONFIG_JSON_BASE64 so subcmdDoctor's
-// config.LoadFromEnv path resolves to it. Mirrors resetTestEnv in
-// style.
+// and points the WEZSESH_*_DIR env overrides at it so subcmdDoctor's
+// config.LoadFromEnv (which now goes through AutoDetect +
+// applyEnvOverrides for non-TUI subcommands) resolves to the test's
+// scratch tree. Mirrors resetTestEnv in style.
 type doctorTestEnv struct {
 	dir         string
 	stateDir    string
@@ -39,14 +39,10 @@ func newDoctorTestEnv(t *testing.T) *doctorTestEnv {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
-	body := []byte(`{
-"version":1,
-"snapshot_dir":"` + env.snapshotDir + `",
-"state_dir":"` + env.stateDir + `",
-"runtime_dir":"` + env.runtimeDir + `",
-"data_dir":"` + env.dataDir + `"
-}`)
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
+	t.Setenv("WEZSESH_SNAPSHOT_DIR", env.snapshotDir)
+	t.Setenv("WEZSESH_STATE_DIR", env.stateDir)
+	t.Setenv("WEZSESH_RUNTIME_DIR", env.runtimeDir)
+	t.Setenv("WEZSESH_DATA_DIR", env.dataDir)
 	return env
 }
 
@@ -111,22 +107,6 @@ func TestSubcmdDoctor_UnknownFormat(t *testing.T) {
 	}
 }
 
-// TestSubcmdDoctor_ConfigLoadFails asserts that a malformed
-// WEZSESH_CONFIG_JSON_BASE64 returns a non-zero exit code with a clear
-// stderr message — doctor is a diagnostic, so config resolution
-// failure is reported rather than silently coerced into a synthetic
-// empty Env.
-func TestSubcmdDoctor_ConfigLoadFails(t *testing.T) {
-	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
-	var stdout, stderr bytes.Buffer
-	rc := subcmdDoctor(nil, &stdout, &stderr)
-	if rc != exitDoctorOrSubcmd {
-		t.Fatalf("rc = %d, want %d", rc, exitDoctorOrSubcmd)
-	}
-	if !strings.Contains(stderr.String(), "wezsesh doctor: config:") {
-		t.Fatalf("stderr missing config-error marker: %q", stderr.String())
-	}
-}
 
 // TestSubcmdDoctor_JSONParseable asserts that --format json produces
 // JSON that parses back into the doctor.Report shape (Checks,

@@ -1,6 +1,7 @@
 package logger_test
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/Grady-Saccullo/wezsesh/internal/logger"
 )
+
+// testBinarySessionID is the deterministic 26-char ULID stamped onto
+// every record by the tests below. Matches the dispatcher-side test
+// fixture so a future cross-package fixture-share is straightforward.
+const testBinarySessionID = "01JABCDEFGHJKMNPQRSTVWXYZB"
 
 // envHelperKey selects which sub-process helper body to run when this test
 // binary is re-invoked. The parent test sets this; the helper Test* funcs
@@ -47,7 +53,7 @@ func TestMain(m *testing.M) {
 
 func runHelperWarnAndExit() {
 	dir := os.Getenv(envHelperDir)
-	lg, err := logger.New(dir, logger.LevelDebug)
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
 	if err != nil {
 		// Use exit code 2 so the parent can distinguish helper-setup
 		// failure from the intended exit-1 crash. We deliberately do not
@@ -63,7 +69,7 @@ func runHelperWarnAndExit() {
 
 func runHelperInfoAndExit() {
 	dir := os.Getenv(envHelperDir)
-	lg, err := logger.New(dir, logger.LevelDebug)
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
 	if err != nil {
 		os.Exit(2)
 	}
@@ -146,7 +152,7 @@ func TestLoggerInfoNotSyncFlushed(t *testing.T) {
 // Warn/Error" — pairs with TestLoggerInfoNotSyncFlushed (out-of-process).
 func TestLoggerWarnIsFlushedInProcess(t *testing.T) {
 	dir := t.TempDir()
-	lg, err := logger.New(dir, logger.LevelDebug)
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
 	if err != nil {
 		t.Fatalf("logger.New: %v", err)
 	}
@@ -198,6 +204,24 @@ func TestResolveLevel(t *testing.T) {
 	}
 }
 
+func TestLevelString(t *testing.T) {
+	cases := []struct {
+		l    logger.Level
+		want string
+	}{
+		{logger.LevelDebug, "debug"},
+		{logger.LevelInfo, "info"},
+		{logger.LevelWarn, "warn"},
+		{logger.LevelError, "error"},
+		{logger.Level(99), "info"},
+	}
+	for _, tc := range cases {
+		if got := logger.LevelString(tc.l); got != tc.want {
+			t.Errorf("LevelString(%d) = %q, want %q", tc.l, got, tc.want)
+		}
+	}
+}
+
 // TestNewRefusesSymlinkAtFile verifies the safefs.OpenAppendOnly
 // O_NOFOLLOW defense at the log file leaf.
 func TestNewRefusesSymlinkAtFile(t *testing.T) {
@@ -212,7 +236,7 @@ func TestNewRefusesSymlinkAtFile(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(dir, "wezsesh.log")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	if _, err := logger.New(dir, logger.LevelInfo); err == nil {
+	if _, err := logger.New(dir, logger.LevelInfo, testBinarySessionID); err == nil {
 		t.Fatal("logger.New should refuse symlink at log path, got nil error")
 	}
 }
@@ -233,7 +257,7 @@ func TestNewRefusesSymlinkAtStateDir(t *testing.T) {
 	if err := os.Symlink(real, sym); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	if _, err := logger.New(sym, logger.LevelInfo); err == nil {
+	if _, err := logger.New(sym, logger.LevelInfo, testBinarySessionID); err == nil {
 		t.Fatal("logger.New should refuse symlink at state dir, got nil error")
 	}
 }
@@ -246,7 +270,7 @@ func TestNewLogFileMode0600(t *testing.T) {
 		t.Skip("Unix mode bits not meaningful on Windows")
 	}
 	dir := t.TempDir()
-	lg, err := logger.New(dir, logger.LevelInfo)
+	lg, err := logger.New(dir, logger.LevelInfo, testBinarySessionID)
 	if err != nil {
 		t.Fatalf("logger.New: %v", err)
 	}
@@ -264,7 +288,7 @@ func TestNewLogFileMode0600(t *testing.T) {
 // the sync.Once gate.
 func TestCloseIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	lg, err := logger.New(dir, logger.LevelInfo)
+	lg, err := logger.New(dir, logger.LevelInfo, testBinarySessionID)
 	if err != nil {
 		t.Fatalf("logger.New: %v", err)
 	}
@@ -286,7 +310,7 @@ func TestTickGoroutineExitsOnClose(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	before := runtime.NumGoroutine()
 	for i := 0; i < 5; i++ {
-		lg, err := logger.New(dir, logger.LevelInfo)
+		lg, err := logger.New(dir, logger.LevelInfo, testBinarySessionID)
 		if err != nil {
 			t.Fatalf("logger.New: %v", err)
 		}
@@ -310,7 +334,7 @@ func TestTickGoroutineExitsOnClose(t *testing.T) {
 // depending on real disk pressure.
 func TestRotation(t *testing.T) {
 	dir := t.TempDir()
-	lg, err := logger.New(dir, logger.LevelDebug)
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
 	if err != nil {
 		t.Fatalf("logger.New: %v", err)
 	}
@@ -342,4 +366,163 @@ func TestRotation(t *testing.T) {
 	if stActive.Size() > st.Size() {
 		t.Fatalf("active log %d bytes > rotated %d; rotation did not reset counter", stActive.Size(), st.Size())
 	}
+}
+
+// readLogRecords returns each newline-delimited JSON record from
+// <dir>/wezsesh.log decoded into a generic map. The logger emits one
+// JSON object per record; helpers below assert sticky-attr presence by
+// inspecting the resulting maps.
+func readLogRecords(t *testing.T, dir string) []map[string]any {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(dir, "wezsesh.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimRight(string(body), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("decode record %q: %v", line, err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// TestBinarySessionIDOnEveryRecord asserts the binary_session_id sticky
+// attribute is attached to every record at every level — Debug, Info,
+// Warn, Error. The trace/correlation rollout (CLAUDE.md) relies on
+// every Go-side log line carrying this without each callsite spelling
+// it out.
+func TestBinarySessionIDOnEveryRecord(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+
+	lg.Debug("dbg-line")
+	lg.Info("info-line")
+	lg.Warn("warn-line")
+	lg.Error("err-line")
+
+	// Warn/Error sync-flush; Info/Debug ride the bufio buffer until the
+	// next tick or another sync-flush. The Warn already flushed both
+	// the Info and the Debug ahead of it (bufio is FIFO), so all four
+	// are on disk by the time Error returns.
+	records := readLogRecords(t, dir)
+	if len(records) != 4 {
+		t.Fatalf("got %d records, want 4: %v", len(records), records)
+	}
+	wantMsgs := []string{"dbg-line", "info-line", "warn-line", "err-line"}
+	for i, rec := range records {
+		got, _ := rec["binary_session_id"].(string)
+		if got != testBinarySessionID {
+			t.Errorf("record[%d] binary_session_id = %q, want %q (record=%v)",
+				i, got, testBinarySessionID, rec)
+		}
+		msg, _ := rec["msg"].(string)
+		if msg != wantMsgs[i] {
+			t.Errorf("record[%d] msg = %q, want %q", i, msg, wantMsgs[i])
+		}
+	}
+}
+
+// TestWithComposesChild asserts that (*Logger).With returns a child
+// that emits both the parent's sticky attrs (binary_session_id) AND
+// the new attrs supplied to With (here trace_id). This is the
+// load-bearing seam for the dispatcher's per-request trace_id
+// stamping.
+func TestWithComposesChild(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+
+	const traceID = "01JABCDEFGHJKMNPQRSTVWXYZD"
+	child := lg.With("trace_id", traceID)
+	child.Warn("from-child")
+
+	records := readLogRecords(t, dir)
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1: %v", len(records), records)
+	}
+	rec := records[0]
+	if got, _ := rec["binary_session_id"].(string); got != testBinarySessionID {
+		t.Errorf("child record binary_session_id = %q, want %q", got, testBinarySessionID)
+	}
+	if got, _ := rec["trace_id"].(string); got != traceID {
+		t.Errorf("child record trace_id = %q, want %q", got, traceID)
+	}
+
+	// And the parent must NOT inherit the child's sticky attrs (the
+	// parent's slogger is unchanged).
+	lg.Warn("from-parent")
+	records = readLogRecords(t, dir)
+	if len(records) != 2 {
+		t.Fatalf("got %d records, want 2 after parent emit: %v", len(records), records)
+	}
+	if _, has := records[1]["trace_id"]; has {
+		t.Errorf("parent record carries trace_id %v (should be child-only)", records[1]["trace_id"])
+	}
+	if got, _ := records[1]["binary_session_id"].(string); got != testBinarySessionID {
+		t.Errorf("parent record binary_session_id = %q, want %q", got, testBinarySessionID)
+	}
+}
+
+// TestCloseChildSharesParent — the closeOnce is shared, so a Close on
+// the parent followed by a Close on the child is a safe no-op (and
+// vice versa). After the writer is torn down, follow-on log calls on
+// either parent or child must not panic; the rotatingWriter swallows
+// post-close writes and the syncFlush guard short-circuits.
+func TestCloseChildSharesParent(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := logger.New(dir, logger.LevelDebug, testBinarySessionID)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	child := lg.With("trace_id", "01JABCDEFGHJKMNPQRSTVWXYZE")
+
+	if err := lg.Close(); err != nil {
+		t.Fatalf("parent Close: %v", err)
+	}
+	// Child Close must not double-close: it should observe the same
+	// closeOnce-gated state and return the cached err (nil here).
+	if err := child.Close(); err != nil {
+		t.Fatalf("child Close after parent: %v", err)
+	}
+	// Reverse direction — closing child first, parent second — must
+	// also be safe. (Different temp dir to avoid stale state.)
+	dir2 := t.TempDir()
+	lg2, err := logger.New(dir2, logger.LevelDebug, testBinarySessionID)
+	if err != nil {
+		t.Fatalf("logger.New: %v", err)
+	}
+	child2 := lg2.With("trace_id", "01JABCDEFGHJKMNPQRSTVWXYZF")
+	if err := child2.Close(); err != nil {
+		t.Fatalf("child Close: %v", err)
+	}
+	if err := lg2.Close(); err != nil {
+		t.Fatalf("parent Close after child: %v", err)
+	}
+
+	// Subsequent log calls on either side after the writer is torn
+	// down must not panic. The rotatingWriter's Write returns an
+	// error post-close, and slog's JSON handler swallows write errors
+	// silently — we just want to assert no panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("post-close log call panicked: %v", r)
+		}
+	}()
+	lg.Info("post-close-parent")
+	child.Info("post-close-child")
+	lg2.Warn("post-close-parent2")
+	child2.Warn("post-close-child2")
 }

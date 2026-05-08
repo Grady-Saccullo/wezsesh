@@ -125,25 +125,28 @@ local FIXTURE_KEY_HEX =
     "a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1"
 
 local FIXTURE_CANONICAL_SANS_HMAC =
-    '{"args":{},"id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop",'
+    '{"args":{},'
+    .. '"binary_session_id":"01JABCDEFGHJKMNPQRSTVWXYZB",'
+    .. '"id":"01JABCDEFGHJKMNPQRSTVWXYZA","op":"noop",'
     .. '"reply_sock":"/tmp/x.sock","target_window_id":1,'
-    .. '"ts":1700000000,"v":1}'
+    .. '"ts":1700000000,"v":2}'
 
 local FIXTURE_EXPECTED_HMAC =
-    "52d0003484acc868ce5762d065e2360f98b37b777009306b3cec8e7177dd14b5"
+    "21607557a30c79f540fffc8ba3496711108dbdf1f47282ccc7b3593ffb52abe4"
 
 -- The fixture payload as a Lua table, identical in shape to the Go
 -- fixture's `payload` map. `args` is the parser-style empty table; the
 -- canonical_json verb tagger upgrades it to an object below.
 local function fixture_payload()
     return {
-        v                = 1,
-        id               = "01JABCDEFGHJKMNPQRSTVWXYZA",
-        ts               = 1700000000,
-        target_window_id = 1,
-        reply_sock       = "/tmp/x.sock",
-        op               = "noop",
-        args             = {},
+        v                 = 2,
+        id                = "01JABCDEFGHJKMNPQRSTVWXYZA",
+        ts                = 1700000000,
+        target_window_id  = 1,
+        reply_sock        = "/tmp/x.sock",
+        op                = "noop",
+        args              = {},
+        binary_session_id = "01JABCDEFGHJKMNPQRSTVWXYZB",
     }
 end
 

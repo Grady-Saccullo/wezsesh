@@ -274,6 +274,93 @@ func AtomicWriteFile(ctx context.Context, parentDir, filename string, data []byt
 	return nil
 }
 
+// RotateSingleDeep performs a one-deep rotation of <dir>/<leaf>: if the
+// file exists and is strictly larger than thresholdBytes, drop any
+// pre-existing <dir>/<leaf>.1 then rename the active file to
+// <dir>/<leaf>.1. The next writer's open-with-O_APPEND-or-O_CREAT will
+// create a fresh active file.
+//
+// Symlink discipline: the parent directory is symlink-refused via
+// VerifyDir; the active leaf and the .1 destination are inline
+// Lstat-checked and refused if either is a symlink. The dirfd is held
+// only for the parent-validation step — the rename and unlink calls are
+// path-based today, mirroring the existing logger rotation pattern, and
+// will move to dirfd-anchored *at(2) syscalls when safefs grows
+// SafeRenameAt / SafeUnlinkAt primitives.
+//
+// Threshold semantics are strict greater-than: a file at exactly
+// thresholdBytes does NOT rotate. This matches the existing
+// rotatingWriter discipline (size+incoming > threshold).
+//
+// Best-effort contract: a missing file returns nil (nothing to rotate);
+// a missing dir returns the underlying VerifyDir error so the caller
+// can decide whether to surface it. Callers that treat rotation as
+// advisory should log-and-continue.
+//
+// Race window: a concurrent appender (e.g. the wezsesh Lua plugin) can
+// write a single line between the rename and the next writer's
+// open(O_APPEND|O_CREAT) — that line lands in the rotated .1 file.
+// Single-line writes are POSIX-atomic up to PIPE_BUF (Darwin: 512 B,
+// Linux: 4 KiB), so as long as each writer caps its records at 512 B
+// the rotation cannot interleave a partial line. Documented in the
+// plan.
+func RotateSingleDeep(dir, leaf string, thresholdBytes int64) error {
+	if leaf == "" {
+		return errors.New("safefs: RotateSingleDeep: empty leaf")
+	}
+	if filepath.Base(leaf) != leaf {
+		return fmt.Errorf("safefs: RotateSingleDeep: leaf %q must not contain separators", leaf)
+	}
+	dirfd, _, err := VerifyDir(dir)
+	if err != nil {
+		return err
+	}
+	// We don't use the dirfd for the rename/unlink yet (see comment
+	// above); close it now so the caller's process table stays clean
+	// regardless of the rotate path taken.
+	_ = unix.Close(dirfd)
+
+	active := filepath.Join(dir, leaf)
+	rotated := active + ".1"
+
+	// Leaf-level symlink refuse for the active path. Missing → ok=true,
+	// nothing to rotate.
+	ok, err := Enforce(active, SymlinkRefuse, nil)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// Refuse hit — Enforce returned an error above, unreachable.
+		return ErrIsSymlink
+	}
+	info, err := os.Lstat(active)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("safefs: RotateSingleDeep lstat %s: %w", active, err)
+	}
+	if info.Size() <= thresholdBytes {
+		return nil
+	}
+
+	// Rotated destination must not be a symlink either.
+	ok, err = Enforce(rotated, SymlinkRefuse, nil)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrIsSymlink
+	}
+	if err := os.Remove(rotated); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("safefs: RotateSingleDeep drop %s: %w", rotated, err)
+	}
+	if err := os.Rename(active, rotated); err != nil {
+		return fmt.Errorf("safefs: RotateSingleDeep rename %s -> %s: %w", active, rotated, err)
+	}
+	return nil
+}
+
 func writeAll(fd int, data []byte) error {
 	for len(data) > 0 {
 		n, err := unix.Write(fd, data)
