@@ -194,11 +194,19 @@ end
 -- The shim's mutable surface. The spec tweaks `bg_should_raise` to
 -- exercise the pcall-wrap acceptance gate; reads `bg_calls` to
 -- assert the spawn argv shape; tweaks `GLOBAL.wezsesh_bin_path` to
--- exercise the missing-binary degraded path.
+-- exercise the missing-binary degraded path; tweaks
+-- `GLOBAL.wezsesh_session_key` to drive the HMAC-signing path on
+-- replies.
 local bg_calls = {}
 local bg_should_raise = false
+-- A deterministic 64-hex test key matching internal/ipcdispatcher's
+-- dispatcher_test.go so cross-language round-trip fixtures are
+-- reproducible.
+local FIXTURE_KEY_HEX =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 local global_store = {
     wezsesh_bin_path = "/usr/local/bin/wezsesh",
+    wezsesh_session_key = FIXTURE_KEY_HEX,
 }
 
 local global_proxy = setmetatable({}, {
@@ -240,6 +248,7 @@ local function reset_state()
     bg_calls = {}
     bg_should_raise = false
     global_store.wezsesh_bin_path = "/usr/local/bin/wezsesh"
+    global_store.wezsesh_session_key = FIXTURE_KEY_HEX
 end
 
 local function it(name, fn)
@@ -290,6 +299,37 @@ local function last_envelope()
     local json = b64.decode(argv[4])
     assert_true(json ~= nil, "argv[4] was not valid b64")
     return json_parse_shim(json), argv
+end
+
+-- Return the raw wire JSON bytes of the most-recent spawn call. Used
+-- by tests that assert on the literal bytes (e.g. round-trip HMAC
+-- verification, or substring checks on canonical-form deserialisation).
+local function last_wire_json()
+    assert_true(#bg_calls > 0,
+        "expected at least one wezterm.background_child_process call")
+    local argv = bg_calls[#bg_calls]
+    local json = b64.decode(argv[4])
+    assert_true(type(json) == "string" and #json > 0,
+        "argv[4] did not decode to non-empty string")
+    return json
+end
+
+-- Assert the wire bytes carry an `"hmac":"<64-lower-hex>"` field.
+-- The substring match is intentional — round-tripping through
+-- json_parse_shim would lose any byte-level distinction we care about
+-- (e.g. uppercase hex, wrong length).
+local function assert_hmac_present(json)
+    local hex = json:match('"hmac":"(%x+)"')
+    assert_true(hex ~= nil,
+        "expected an \"hmac\" field on the wire, got: " .. tostring(json))
+    assert_eq(#hex, 64,
+        "hmac field must be 64 hex chars, got " .. tostring(#hex)
+        .. " (" .. tostring(hex) .. ")")
+    -- Lowercase only; uppercase would slip through %x.
+    if hex:find("[A-F]") then
+        error("hmac must be lowercase hex, got: " .. hex, 2)
+    end
+    return hex
 end
 
 -- A canonical "valid request payload" stub. Each reply_* takes a
@@ -369,13 +409,13 @@ describe("started reply: invariants", function()
         assert_nil(env.error, "started must NOT carry error")
     end)
 
-    it("started carries id + v exactly, nothing else", function()
+    it("started carries id + v + hmac exactly, nothing else", function()
         result.reply_started(fixture_payload())
         local env = last_envelope()
         local keys = {}
         for k in pairs(env) do keys[#keys + 1] = k end
         table.sort(keys)
-        assert_eq(table.concat(keys, ","), "id,ok,status,v",
+        assert_eq(table.concat(keys, ","), "hmac,id,ok,status,v",
             "started envelope has unexpected fields: "
             .. table.concat(keys, ","))
     end)
@@ -857,6 +897,218 @@ describe("M.toast", function()
         assert_eq(seen.app, "wezsesh", "toast app id wrong")
         assert_eq(seen.msg, "hello", "toast message lost")
         assert_eq(seen.ms, 2500, "toast ms lost")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- deep_tag covers verb-supplied untagged subtables — list_dirs hands
+-- result a `{ dirs = { { name, path }, ... } }` shape with bare
+-- subtables; the canonical encoder raises ENCODER_UNTAGGED_TABLE on
+-- anything not pre-tagged, so the rebuilder MUST walk through nested
+-- containers before encoding.
+-- ────────────────────────────────────────────────────────────────────
+
+describe("deep_tag covers nested untagged tables", function()
+    it("list_dirs-style nested rows encode without raising", function()
+        local p = fixture_payload("list_dirs")
+        local rows = {
+            { name = "alpha", path = "/tmp/alpha" },
+            { name = "beta",  path = "/tmp/beta"  },
+        }
+        local ok = pcall(result.reply_completed, p, { dirs = rows })
+        assert_true(ok,
+            "nested untagged rows must not trip the canonical encoder")
+        local env = last_envelope()
+        assert_eq(env.status, "completed", "list_dirs: status wrong")
+        assert_eq(env.data.dirs[1].name, "alpha",
+            "list_dirs: row 1 name lost")
+        assert_eq(env.data.dirs[2].path, "/tmp/beta",
+            "list_dirs: row 2 path lost")
+    end)
+
+    it("deeply nested empty subtables default to object on the wire",
+    function()
+        local p = fixture_payload("noop")
+        local ok = pcall(result.reply_completed, p,
+            { outer = { inner = {} } })
+        assert_true(ok, "deep empty subtables must encode")
+        local _, argv = last_envelope()
+        local json = b64.decode(argv[4])
+        assert_true(json:find('"inner":{}', 1, true) ~= nil,
+            "expected '\"inner\":{}' in envelope, got: " .. json)
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- Encoder-failure recovery — a programmer-error value (e.g., a float
+-- in `data`) makes the canonical encoder raise. The recovery path
+-- builds a synthetic REPLY_ENCODE_FAILED envelope so the TUI sees a
+-- structured error instead of waiting out the IPC timeout.
+-- ────────────────────────────────────────────────────────────────────
+
+describe("encoder failure triggers REPLY_ENCODE_FAILED fallback",
+function()
+    it("a float in data falls back to REPLY_ENCODE_FAILED", function()
+        local p = fixture_payload("noop")
+        -- Lua 5.4 splits ints from floats; an explicit float (3.14)
+        -- is rejected by the canonical encoder via
+        -- ENCODER_FLOAT_REJECTED, which deep_tag won't catch (it
+        -- doesn't recurse into number leaves).
+        local ok = pcall(result.reply_completed, p,
+            { ratio = 3.14 })
+        assert_true(ok,
+            "encoder failure must NOT propagate out of reply_completed")
+        local env = last_envelope()
+        assert_eq(env.status, "completed",
+            "fallback envelope: status wrong")
+        assert_eq(env.ok, false,
+            "fallback envelope: ok must be false")
+        assert_true(env.error ~= nil,
+            "fallback envelope: error must be present")
+        assert_eq(env.error.code, "REPLY_ENCODE_FAILED",
+            "fallback envelope: code wrong")
+        -- v + id are echoed from the request so the binary's reply
+        -- correlator can match it back to the in-flight call.
+        assert_eq(env.v, 1, "fallback envelope: v not echoed")
+        assert_eq(env.id, p.id, "fallback envelope: id not echoed")
+    end)
+
+    it("recovery envelope itself is a single spawn (no double-reply)",
+    function()
+        local p = fixture_payload("noop")
+        result.reply_completed(p, { ratio = 3.14 })
+        assert_eq(#bg_calls, 1,
+            "recovery path must not produce more than one spawn")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- HMAC signing — the reply path is now authenticated symmetrically
+-- with the forward path. Every reply_* must emit a top-level `"hmac"`
+-- field carrying the lowercase-hex HMAC-SHA-256 of the canonical-JSON
+-- sans-hmac form, computed against the session key.
+--
+-- The Go-side parseReply (internal/ipcdispatcher/dispatcher.go) calls
+-- Signer.Verify on the reply map; a mismatch produces a synthesised
+-- REPLY_HMAC_MISMATCH terminal reply on the consumer channel. The
+-- locked-step round-trip below (extract → strip → re-encode → compute)
+-- is exactly what Verify does on the Go side; byte-equality of the
+-- digest is the load-bearing contract.
+-- ────────────────────────────────────────────────────────────────────
+
+describe("HMAC signing on the reply path", function()
+    local hmac_module = require("wezsesh.crypto.hmac")
+    local cj = require("wezsesh.canonical_json")
+
+    it("reply_started emits an hmac field", function()
+        result.reply_started(fixture_payload())
+        local json = last_wire_json()
+        assert_hmac_present(json)
+    end)
+
+    it("reply_completed emits an hmac field", function()
+        result.reply_completed(fixture_payload(), { foo = "bar" })
+        local json = last_wire_json()
+        assert_hmac_present(json)
+    end)
+
+    it("reply_partial emits an hmac field", function()
+        result.reply_partial(fixture_payload(), { name = "x" }, {{
+            code = "RESURRECT_PARTIAL", message = "y", details = {},
+        }})
+        local json = last_wire_json()
+        assert_hmac_present(json)
+    end)
+
+    it("reply_error emits an hmac field", function()
+        result.reply_error(fixture_payload(), "X", "msg", {})
+        local json = last_wire_json()
+        assert_hmac_present(json)
+    end)
+
+    it("REPLY_ENCODE_FAILED recovery envelope is also signed", function()
+        -- A float in data triggers the recovery path. The recovery
+        -- envelope MUST be signed too, otherwise the TUI's HMAC verify
+        -- would reject the recovery and turn one bad-encoder bug into
+        -- a silent IPC timeout instead of a clear error.
+        result.reply_completed(fixture_payload("noop"), { ratio = 3.14 })
+        local json = last_wire_json()
+        assert_hmac_present(json)
+    end)
+
+    it("emitted hmac verifies against the signing key", function()
+        -- Round-trip: extract the wire hmac, drop it, re-encode the
+        -- envelope canonically sans-hmac, recompute via hmac.compute,
+        -- and assert byte-equality. This pins the contract that the
+        -- Go-side Signer.Verify will accept the same bytes.
+        result.reply_completed(fixture_payload("noop"),
+            { active_workspace = "main" })
+        local json = last_wire_json()
+        local supplied = assert_hmac_present(json)
+
+        -- Reconstruct a tagged Lua envelope from the wire bytes. The
+        -- json_parse_shim returns plain tables; re-tag via the same
+        -- deep_tag idiom result.lua uses so canonical_json.encode
+        -- accepts them.
+        local parsed = json_parse_shim(json)
+        local function deep_tag(t)
+            if type(t) ~= "table" then return t end
+            local mt = getmetatable(t)
+            local tag = mt and mt.__wezsesh_canonical
+            if tag == "null" then return t end
+            if tag == nil then
+                local n = 0
+                local all_int = true
+                for k in pairs(t) do
+                    if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
+                        all_int = false
+                        break
+                    end
+                    n = n + 1
+                end
+                if all_int and n > 0 then
+                    setmetatable(t, cj.array_mt)
+                    tag = "array"
+                else
+                    setmetatable(t, cj.object_mt)
+                    tag = "object"
+                end
+            end
+            if tag == "array" then
+                for i = 1, #t do deep_tag(t[i]) end
+            else
+                for _, v in pairs(t) do
+                    if type(v) == "table" then deep_tag(v) end
+                end
+            end
+            return t
+        end
+        deep_tag(parsed)
+
+        -- Drop the hmac key (preserves metatable) and re-encode.
+        local sans = cj.copy_without(parsed, "hmac")
+        local sans_bytes = cj.encode(sans)
+        local recomputed = hmac_module.compute(sans_bytes, FIXTURE_KEY_HEX)
+        assert_eq(supplied, recomputed,
+            "wire hmac does not match recompute over canonical sans-hmac form")
+
+        -- Verify symmetrically too — hmac.verify is the inverse, and
+        -- both Lua and Go agree on constant-time compare.
+        assert_true(
+            hmac_module.verify(sans_bytes, FIXTURE_KEY_HEX, supplied),
+            "hmac.verify rejected the round-tripped digest")
+    end)
+
+    it("missing session key triggers the recovery envelope path",
+    function()
+        global_store.wezsesh_session_key = nil
+        -- With no key, sign_envelope returns nil and routes to the
+        -- recovery envelope; the recovery envelope itself also wants
+        -- a session key, so the spawn is the silent-noop floor.
+        local ok = pcall(result.reply_started, fixture_payload())
+        assert_true(ok, "missing session key must not propagate")
+        assert_eq(#bg_calls, 0,
+            "missing session key must not produce a signed spawn")
     end)
 end)
 

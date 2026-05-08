@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,14 +16,19 @@ import (
 
 // Env vars consulted by Load (§11.3 / §11.4).
 const (
-	envSnapshotDir = "WEZSESH_SNAPSHOT_DIR"
-	envStateDir    = "WEZSESH_STATE_DIR"
-	envRuntimeDir  = "WEZSESH_RUNTIME_DIR"
-	envDataDir     = "WEZSESH_DATA_DIR"
-	envLog         = "WEZSESH_LOG"
-	envNoHooks     = "WEZSESH_NO_HOOKS"
-	envConfigFile  = "WEZSESH_CONFIG_FILE"
+	envSnapshotDir      = "WEZSESH_SNAPSHOT_DIR"
+	envStateDir         = "WEZSESH_STATE_DIR"
+	envRuntimeDir       = "WEZSESH_RUNTIME_DIR"
+	envDataDir          = "WEZSESH_DATA_DIR"
+	envLog              = "WEZSESH_LOG"
+	envNoHooks          = "WEZSESH_NO_HOOKS"
+	envConfigJSONBase64 = "WEZSESH_CONFIG_JSON_BASE64"
 )
+
+// ErrNoConfigEnv is returned by LoadFromEnvJSONBase64 when the env var
+// is unset / empty. Callers (cmd/wezsesh:tuiSetup) decide whether to
+// error out or fall through to AutoDetect on this sentinel.
+var ErrNoConfigEnv = errors.New("config: WEZSESH_CONFIG_JSON_BASE64 not set")
 
 // Load reads the config file at path (JSON), compiles each Exclude
 // element, then applies the §11.4 env overrides. Regex compile failures
@@ -62,32 +68,68 @@ func Load(ctx context.Context, path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// LoadFromEnv reads the config file pointed to by $WEZSESH_CONFIG_FILE.
-// If the env var is unset/empty, fall back to AutoDetect (the binary was
-// invoked outside its plugin context — `wezsesh doctor` from a shell,
-// etc.; §12.5 covers that path). If the env var is set but the file does
-// not exist, return an error.
+// LoadFromEnv consults $WEZSESH_CONFIG_JSON_BASE64 first; when that env
+// var carries a base64-encoded JSON config (the wezterm plugin's spawn
+// path), decode + parse it. Otherwise fall back to AutoDetect (the
+// binary was invoked outside its plugin context — `wezsesh doctor` from
+// a shell, etc.; §12.5 covers that path). The previous
+// $WEZSESH_CONFIG_FILE tmp-file route is gone — that handoff was a
+// CVE-class TOCTOU surface (predictable filename, mode-0644 leak).
 //
-// §11.4 says env beats both file and auto-detect, so the env-override
-// pass runs on the AutoDetect result too — without it, e.g.
-// WEZSESH_NO_HOOKS=1 silently no-ops on `wezsesh doctor`.
+// §11.4 says env beats both the loaded config and auto-detect, so the
+// env-override pass runs on the AutoDetect result too — without it,
+// e.g. WEZSESH_NO_HOOKS=1 silently no-ops on `wezsesh doctor`.
 func LoadFromEnv(ctx context.Context) (*Config, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path := os.Getenv(envConfigFile)
-	if path == "" {
-		cfg, err := AutoDetect()
-		if err != nil {
-			return nil, err
-		}
-		applyEnvOverrides(cfg, os.Getenv)
+	cfg, err := LoadFromEnvJSONBase64(ctx)
+	if err == nil {
 		return cfg, nil
 	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("config: %s=%s: %w", envConfigFile, path, err)
+	if !errors.Is(err, ErrNoConfigEnv) {
+		return nil, err
 	}
-	return Load(ctx, path)
+	cfg, err = AutoDetect()
+	if err != nil {
+		return nil, err
+	}
+	applyEnvOverrides(cfg, os.Getenv)
+	return cfg, nil
+}
+
+// LoadFromEnvJSONBase64 reads $WEZSESH_CONFIG_JSON_BASE64, base64-decodes
+// the bytes, JSON-unmarshals into a Config, and applies the §11.4 env
+// override pass. Returns ErrNoConfigEnv when the env var is unset/empty
+// so callers can decide whether to fall back to AutoDetect (the doctor /
+// list / find / trust / reset / shell-invoked path) or error out (the
+// TUI startup path which requires the plugin to have spawned us).
+func LoadFromEnvJSONBase64(ctx context.Context) (*Config, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	raw := os.Getenv(envConfigJSONBase64)
+	if raw == "" {
+		return nil, ErrNoConfigEnv
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: %s: base64 decode: %w", envConfigJSONBase64, err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("config: %s: parse: %w", envConfigJSONBase64, err)
+	}
+	compileExclude(&cfg)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("config: home dir: %w", err)
+	}
+	if err := fillAutoDetectDirs(&cfg, runtime.GOOS, os.Getenv, home, os.Getuid()); err != nil {
+		return nil, err
+	}
+	applyEnvOverrides(&cfg, os.Getenv)
+	return &cfg, nil
 }
 
 // compileExclude walks cfg.Exclude and populates ExcludeCompiled +

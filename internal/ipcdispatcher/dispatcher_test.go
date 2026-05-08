@@ -104,6 +104,27 @@ func mustSigner(t *testing.T) *whmac.Signer {
 	return s
 }
 
+// signReply signs `m` against `signer` (using the same field-removal
+// sequence as the Lua side) and returns the canonical-JSON bytes
+// suitable for pushing through fakeListener.pushReply. Mirrors the Lua
+// signer's `sign_envelope` end-to-end: encode-sans-hmac → compute →
+// set m["hmac"] → re-encode. The Lua side and Go side must produce
+// byte-identical bytes for the same shape — TestGoldenCorpus locks
+// down the encoder, this helper locks down the signer.
+func signReply(t *testing.T, signer *whmac.Signer, m map[string]any) []byte {
+	t.Helper()
+	digest, err := signer.Sign(m)
+	if err != nil {
+		t.Fatalf("signReply: Sign: %v", err)
+	}
+	m["hmac"] = digest
+	out, err := canonicaljson.Marshal(m)
+	if err != nil {
+		t.Fatalf("signReply: Marshal: %v", err)
+	}
+	return out
+}
+
 // fakeListener is a stub listenerStarter that returns a channel the
 // test can push raw reply bytes into. It mirrors ipcsock.StartListener's
 // shape so production wiring is unchanged.
@@ -162,10 +183,12 @@ func newTestDispatcher(t *testing.T, w OSCWriter, l listenerStarter, runtimeDir 
 		startListener:  l,
 		now:            func() time.Time { return time.Unix(1700000000, 0) },
 		newID:          newULID,
-		parseReply:     parseReply,
 		dialReply:      dialReplyUnix,
 		nameMutexes:    make(map[string]*sync.Mutex),
 		outstanding:    make(map[string]outstandingDispatch),
+	}
+	d.parseReply = func(raw []byte) (ipc.Reply, error) {
+		return parseReply(raw, d.signer)
 	}
 	if err := os.MkdirAll(d.reqDir, 0o700); err != nil {
 		t.Fatalf("mkdir req: %v", err)
@@ -447,8 +470,13 @@ func TestDispatch_ReplyChannelDeliversParsedReply(t *testing.T) {
 	}
 	id := readRequestID(t, dir)
 
-	reply := []byte(fmt.Sprintf(
-		`{"v":1,"id":%q,"status":"completed","ok":true,"data":{"hash":"sha256:abc"}}`, id))
+	reply := signReply(t, d.signer, map[string]any{
+		"v":      int64(1),
+		"id":     id,
+		"status": "completed",
+		"ok":     true,
+		"data":   map[string]any{"hash": "sha256:abc"},
+	})
 	fl.pushReply(0, reply)
 
 	select {
@@ -472,6 +500,82 @@ func TestDispatch_ReplyChannelDeliversParsedReply(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("channel did not close after terminal reply")
+	}
+}
+
+// TestDispatch_BadHMACSurfacesMismatch is the reply-signing gate: a
+// reply whose hmac field does not verify against the dispatcher's
+// signer is surfaced to the consumer as a synth terminal reply with
+// error.code=REPLY_HMAC_MISMATCH (per user decision: surface, don't
+// silent-drop). The drain forwards the synth and closes the channel
+// after — the consumer sees a clear error instead of waiting out the
+// IPC budget.
+func TestDispatch_BadHMACSurfacesMismatch(t *testing.T) {
+	dir := runtimeShortDir(t)
+	w := &recordingWriter{}
+	fl := &fakeListener{}
+	d := newTestDispatcher(t, w, fl.start, dir)
+
+	ch, err := d.Dispatch(context.Background(), "noop", map[string]any{})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	id := readRequestID(t, dir)
+
+	// Build a reply, sign it, then flip a byte of the hmac so the
+	// verifier rejects it. Sign+marshal first so the field-removal
+	// sequence stays canonical; we mutate the marshalled bytes after.
+	envelope := map[string]any{
+		"v":      int64(1),
+		"id":     id,
+		"status": "completed",
+		"ok":     true,
+		"data":   map[string]any{},
+	}
+	digest, sErr := d.signer.Sign(envelope)
+	if sErr != nil {
+		t.Fatalf("Sign: %v", sErr)
+	}
+	// Flip the last hex digit. Whatever we land on, it cannot collide
+	// with the real digest by construction (ConstantTimeCompare is
+	// length-strict; the bad digest is still 64 hex chars).
+	bad := digest[:len(digest)-1] + "0"
+	if bad == digest {
+		bad = digest[:len(digest)-1] + "1"
+	}
+	envelope["hmac"] = bad
+	raw, mErr := canonicaljson.Marshal(envelope)
+	if mErr != nil {
+		t.Fatalf("Marshal: %v", mErr)
+	}
+	fl.pushReply(0, raw)
+
+	select {
+	case got, ok := <-ch:
+		if !ok {
+			t.Fatal("channel closed before mismatch reply")
+		}
+		if got.Status != "completed" || got.OK {
+			t.Errorf("synth shape wrong: %+v", got)
+		}
+		if got.Error == nil || got.Error.Code != "REPLY_HMAC_MISMATCH" {
+			t.Errorf("error.code = %+v, want REPLY_HMAC_MISMATCH", got.Error)
+		}
+		if got.ID != id {
+			t.Errorf("synth id = %q, want %q", got.ID, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no synth REPLY_HMAC_MISMATCH on channel")
+	}
+
+	// Channel must close after the terminal synth reply.
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("channel produced extra message after terminal synth")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("channel did not close after terminal synth")
 	}
 }
 
@@ -603,7 +707,7 @@ func TestParseReply_RejectsMissingV(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseReply([]byte(tc.raw))
+			_, err := parseReply([]byte(tc.raw), nil)
 			if tc.want && err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -618,7 +722,7 @@ func TestParseReply_RejectsMissingV(t *testing.T) {
 // a nested error object.
 func TestParseReply_ParsesError(t *testing.T) {
 	raw := `{"v":1,"id":"abc","status":"completed","ok":false,"error":{"code":"SAVE_FAILED","message":"disk full","details":{"raw_error":"ENOSPC"}}}`
-	r, err := parseReply([]byte(raw))
+	r, err := parseReply([]byte(raw), nil)
 	if err != nil {
 		t.Fatalf("parseReply: %v", err)
 	}
@@ -636,7 +740,7 @@ func TestParseReply_ParsesError(t *testing.T) {
 // TestParseReply_ParsesPartial covers status="partial" with warnings.
 func TestParseReply_ParsesPartial(t *testing.T) {
 	raw := `{"v":1,"id":"abc","status":"partial","ok":true,"data":{"name":"foo"},"warnings":[{"code":"RESURRECT_PARTIAL","message":"some panes"}]}`
-	r, err := parseReply([]byte(raw))
+	r, err := parseReply([]byte(raw), nil)
 	if err != nil {
 		t.Fatalf("parseReply: %v", err)
 	}
@@ -721,9 +825,13 @@ func TestDispatch_PhaseCRehashShape(t *testing.T) {
 	id := readRequestID(t, dir)
 
 	wantHash := "sha256:" + strings.Repeat("ab", 32)
-	reply := []byte(fmt.Sprintf(
-		`{"v":1,"id":%q,"status":"completed","ok":true,"data":{"name":"gamma","hash":%q}}`,
-		id, wantHash))
+	reply := signReply(t, d.signer, map[string]any{
+		"v":      int64(1),
+		"id":     id,
+		"status": "completed",
+		"ok":     true,
+		"data":   map[string]any{"name": "gamma", "hash": wantHash},
+	})
 	fl.pushReply(0, reply)
 
 	select {
@@ -829,8 +937,14 @@ func TestDispatch_RealListenerEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial reply sock: %v", err)
 	}
-	reply := fmt.Sprintf(`{"v":1,"id":%q,"status":"completed","ok":true,"data":{}}`, id)
-	if _, err := conn.Write([]byte(reply)); err != nil {
+	reply := signReply(t, d.signer, map[string]any{
+		"v":      int64(1),
+		"id":     id,
+		"status": "completed",
+		"ok":     true,
+		"data":   map[string]any{},
+	})
+	if _, err := conn.Write(reply); err != nil {
 		t.Fatalf("write reply: %v", err)
 	}
 	conn.Close()
@@ -1383,21 +1497,44 @@ func TestEmergencyReply_RealSocketDelivery(t *testing.T) {
 
 // TestBuildUnexpectedExitReply_CanonicalShape pins the byte shape of
 // the §13.1 sentinel. Field order on the wire must be (canonical-JSON
-// sorted-key) error / id / ok / status / v; error nested keys
-// code / message. The shape is verified by re-decoding.
+// sorted-key) error / hmac / id / ok / status / v; error nested keys
+// code / message. The shape is verified by re-decoding. The signed
+// form interleaves the `hmac` field per byte-sorted order.
 func TestBuildUnexpectedExitReply_CanonicalShape(t *testing.T) {
 	id := strings.Repeat("0", 26)
-	body, err := buildUnexpectedExitReply(id)
+	signer := mustSigner(t)
+	body, err := buildUnexpectedExitReply(id, signer)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	want := `{"error":{"code":"UNEXPECTED_EXIT","message":""},"id":"00000000000000000000000000","ok":false,"status":"completed","v":1}`
-	if string(body) != want {
-		t.Fatalf("sentinel body = %q\n         want %q", body, want)
+	// Recompute the expected signed bytes via the same Sign/Marshal
+	// dance the function uses; the digest is deterministic given the
+	// fixture key + envelope shape.
+	envelope := map[string]any{
+		"v":      int64(protoVersion),
+		"id":     id,
+		"status": "completed",
+		"ok":     false,
+		"error": map[string]any{
+			"code":    "UNEXPECTED_EXIT",
+			"message": "",
+		},
+	}
+	digest, err := signer.Sign(envelope)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	envelope["hmac"] = digest
+	wantBytes, err := canonicaljson.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(body) != string(wantBytes) {
+		t.Fatalf("sentinel body = %q\n         want %q", body, wantBytes)
 	}
 	// Round-trip through parseReply confirms the dispatcher reply
-	// parser surfaces the sentinel cleanly.
-	r, err := parseReply(body)
+	// parser surfaces the sentinel cleanly under HMAC verification.
+	r, err := parseReply(body, signer)
 	if err != nil {
 		t.Fatalf("parseReply: %v", err)
 	}

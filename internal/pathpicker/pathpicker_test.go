@@ -184,7 +184,7 @@ func TestResolve_CommandFailed(t *testing.T) {
 func TestResolve_EnvFilter_DropsSensitive_KeepsOthers(t *testing.T) {
 	t.Setenv("WEZSESH_HMAC_KEY", "should-be-dropped")
 	t.Setenv("WEZSESH_PROTO_VERSION", "should-be-dropped")
-	t.Setenv("WEZSESH_CONFIG_FILE", "should-be-dropped")
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "should-be-dropped")
 	t.Setenv("WEZSESH_LOG", "should-survive")
 
 	tmp := t.TempDir()
@@ -210,7 +210,7 @@ func TestResolve_EnvFilter_DropsSensitive_KeepsOthers(t *testing.T) {
 	}
 	envStr := string(envBytes)
 
-	for _, k := range []string{"WEZSESH_HMAC_KEY", "WEZSESH_PROTO_VERSION", "WEZSESH_CONFIG_FILE"} {
+	for _, k := range []string{"WEZSESH_HMAC_KEY", "WEZSESH_PROTO_VERSION", "WEZSESH_CONFIG_JSON_BASE64"} {
 		if strings.Contains(envStr, k+"=") {
 			t.Fatalf("sensitive key %s leaked into child env:\n%s", k, envStr)
 		}

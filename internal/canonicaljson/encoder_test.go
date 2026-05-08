@@ -66,6 +66,52 @@ var goldenInputs = map[string]any{
 			map[string]any{"path": "/srv", "name": "srv"},
 		},
 	},
+
+	// Reply-shape fixtures. The `hmac` field is a stable 64-zero string —
+	// the corpus tests encoder byte-equality for the reply shapes that
+	// the Lua-side signer now emits, not HMAC correctness.
+	"reply_started": map[string]any{
+		"v":      int64(1),
+		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status": "started",
+		"ok":     true,
+		"hmac":   "0000000000000000000000000000000000000000000000000000000000000000",
+	},
+	"reply_completed_ok": map[string]any{
+		"v":      int64(1),
+		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status": "completed",
+		"ok":     true,
+		"data":   map[string]any{"active_workspace": "main"},
+		"hmac":   "0000000000000000000000000000000000000000000000000000000000000000",
+	},
+	"reply_completed_error": map[string]any{
+		"v":      int64(1),
+		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status": "completed",
+		"ok":     false,
+		"error": map[string]any{
+			"code":    "SAVE_FAILED",
+			"message": "disk full",
+			"details": map[string]any{"raw_error": "ENOSPC"},
+		},
+		"hmac": "0000000000000000000000000000000000000000000000000000000000000000",
+	},
+	"reply_partial": map[string]any{
+		"v":      int64(1),
+		"id":     "01JABCDEFGHJKMNPQRSTVWXYZA",
+		"status": "partial",
+		"ok":     true,
+		"data":   map[string]any{"name": "snap-1"},
+		"warnings": []any{
+			map[string]any{
+				"code":    "RESURRECT_PARTIAL",
+				"message": "some panes failed",
+				"details": map[string]any{"raw_error": "spawn failed"},
+			},
+		},
+		"hmac": "0000000000000000000000000000000000000000000000000000000000000000",
+	},
 }
 
 // TestGoldenCorpus loads each fixture in testdata/golden/, encodes the

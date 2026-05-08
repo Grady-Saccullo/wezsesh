@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,8 +11,9 @@ import (
 )
 
 // doctorTestEnv builds a self-contained config tree under t.TempDir()
-// and pins WEZSESH_CONFIG_FILE so subcmdDoctor's config.LoadFromEnv
-// path resolves to it. Mirrors resetTestEnv in style.
+// and pins WEZSESH_CONFIG_JSON_BASE64 so subcmdDoctor's
+// config.LoadFromEnv path resolves to it. Mirrors resetTestEnv in
+// style.
 type doctorTestEnv struct {
 	dir         string
 	stateDir    string
@@ -37,7 +39,6 @@ func newDoctorTestEnv(t *testing.T) *doctorTestEnv {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
-	cfgPath := filepath.Join(dir, "wezsesh.json")
 	body := []byte(`{
 "version":1,
 "snapshot_dir":"` + env.snapshotDir + `",
@@ -45,10 +46,7 @@ func newDoctorTestEnv(t *testing.T) *doctorTestEnv {
 "runtime_dir":"` + env.runtimeDir + `",
 "data_dir":"` + env.dataDir + `"
 }`)
-	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv("WEZSESH_CONFIG_FILE", cfgPath)
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", base64.StdEncoding.EncodeToString(body))
 	return env
 }
 
@@ -113,13 +111,13 @@ func TestSubcmdDoctor_UnknownFormat(t *testing.T) {
 	}
 }
 
-// TestSubcmdDoctor_ConfigLoadFails asserts that a missing
-// WEZSESH_CONFIG_FILE returns a non-zero exit code with a clear
+// TestSubcmdDoctor_ConfigLoadFails asserts that a malformed
+// WEZSESH_CONFIG_JSON_BASE64 returns a non-zero exit code with a clear
 // stderr message — doctor is a diagnostic, so config resolution
 // failure is reported rather than silently coerced into a synthetic
 // empty Env.
 func TestSubcmdDoctor_ConfigLoadFails(t *testing.T) {
-	t.Setenv("WEZSESH_CONFIG_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("WEZSESH_CONFIG_JSON_BASE64", "!!!not-valid-base64!!!")
 	var stdout, stderr bytes.Buffer
 	rc := subcmdDoctor(nil, &stdout, &stderr)
 	if rc != exitDoctorOrSubcmd {

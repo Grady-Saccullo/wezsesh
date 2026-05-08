@@ -212,6 +212,25 @@ describe("bytes_clean", function()
         assert_false(on_pane_restore.bytes_clean("a\rb"),
             "CR should be dirty")
     end)
+
+    it("rejects U+2028 / U+2029 (terminal line-separator codepoints)",
+    function()
+        -- U+2028 LINE SEPARATOR = \xE2\x80\xA8. Modern terminals
+        -- interpret it as a line break, splitting `cd '...<U+2028>...'`
+        -- into two commands and executing the injected payload.
+        assert_false(
+            on_pane_restore.bytes_clean("/tmp/foo\xE2\x80\xA8rm -rf ~"),
+            "U+2028 (LINE SEPARATOR) should be dirty")
+        -- U+2029 PARAGRAPH SEPARATOR = \xE2\x80\xA9, same exec class.
+        assert_false(
+            on_pane_restore.bytes_clean("/tmp/foo\xE2\x80\xA9rm -rf ~"),
+            "U+2029 (PARAGRAPH SEPARATOR) should be dirty")
+        -- The other E2 80 xx codepoints are NOT exec-injection vectors
+        -- — they're typographic. Confirm we don't over-reject.
+        assert_true(
+            on_pane_restore.bytes_clean("/tmp/foo\xE2\x80\xA0bar"),
+            "non-line-separator E2 80 xx should be clean")
+    end)
 end)
 
 -- ────────────────────────────────────────────────────────────────────
@@ -426,6 +445,55 @@ describe("Control-char cwd/argv defense", function()
         end
     end)
 
+    it("cwd containing U+2028 → no injection; \\r\\n only", function()
+        -- bytes_clean rejects \xE2\x80\xA8 (LINE SEPARATOR). Step 7
+        -- routes to fallback; cwd is dirty so send_cwd_or_newline emits
+        -- a bare '\r\n' — the cwd MUST NOT appear in any send_text.
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "vim" } },
+            cwd = "/tmp/foo\xE2\x80\xA8rm -rf ~",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite U+2028 in cwd")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "\r\n",
+            "U+2028-tainted cwd must downgrade to bare '\\r\\n'")
+        for _, s in ipairs(sent) do
+            assert_true(s:find("rm", 1, true) == nil,
+                "U+2028-injected 'rm' leaked into sent text: " .. s)
+        end
+    end)
+
+    it("argv element containing U+2029 + clean cwd → cd <cwd>", function()
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "vim", "innocent\xE2\x80\xA9rm -rf ~" } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite U+2029 in argv element")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "clean cwd path expected")
+        for _, s in ipairs(sent) do
+            assert_true(s:find("rm", 1, true) == nil,
+                "argv-injected 'rm' leaked into sent text")
+        end
+    end)
+
     it("argv[1] (the program path itself) with control char is rejected",
     function()
         -- A malicious snapshot that crafts argv[1]="bash\nrm -rf ~"
@@ -449,6 +517,191 @@ describe("Control-char cwd/argv defense", function()
             assert_true(s:find("rm", 1, true) == nil,
                 "leak detected in sent text")
         end
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- Argv size / count caps (Fix #4 — DoS defense-in-depth)
+-- ────────────────────────────────────────────────────────────────────
+
+describe("Argv size / count caps", function()
+    it("argv element > 64 KB → fallback fires", function()
+        -- A 100 KB argv element exceeds MAX_ARGV_ELEMENT_BYTES.
+        -- argv[1]="vim" is allowlisted, so step 5 passes, but step 6's
+        -- per-element cap rejects → fallback to cd <cwd>.
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "vim", string.rep("A", 100 * 1024) } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite oversized argv element")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv count > 256 → fallback fires", function()
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        local argv = { "vim" }
+        for i = 2, 257 do argv[i] = "x" end
+        assert_eq(#argv, 257, "test fixture argv count wrong")
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = argv },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite argv count > 256")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv total > 256 KB → fallback fires", function()
+        -- Each element ≤ 64 KB (per-element cap not tripped) but the
+        -- running total exceeds MAX_ARGV_TOTAL_BYTES.
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        local argv = { "vim" }
+        for i = 2, 6 do argv[i] = string.rep("B", 60 * 1024) end
+        -- Total = 3 + 5 * 60 KB = 300 KB + change > 256 KB.
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = argv },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite argv total > 256 KB")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv just under all caps → default fires", function()
+        -- Sanity: confirm we don't over-reject. argv with 256 elements,
+        -- each tiny, total well under 256 KB → success path.
+        local resurrect, calls = make_resurrect()
+        local pane = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        local argv = { "vim" }
+        for i = 2, 256 do argv[i] = "x" end
+        assert_eq(#argv, 256, "test fixture argv count wrong")
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = argv },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 1,
+            "default should fire when caps are not tripped")
+    end)
+end)
+
+-- ────────────────────────────────────────────────────────────────────
+-- Relative / empty argv[1] (Fix #5 — defense-in-depth)
+-- ────────────────────────────────────────────────────────────────────
+
+describe("argv[1] relative-path / empty rejection", function()
+    it("argv[1]='./evil' → fallback fires", function()
+        -- basename("./evil") == "evil"; if we relied on the allowlist
+        -- alone, an attacker-planted ./evil binary in cwd would be
+        -- spawned. Step 3 rejects before the basename strips the path.
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            -- Inject a permissive policy to ensure the rejection happens
+            -- in step 3 (relative path) and not via the allowlist.
+            policy = { allows = function() return true end },
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "./evil", "-rf" } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite relative argv[1] './evil'")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv[1]='../evil' → fallback fires", function()
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = { allows = function() return true end },
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "../evil" } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite relative argv[1] '../evil'")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv = {''} → fallback fires (NOT step 2 default)", function()
+        -- argv = {} would route to step 2 (resurrect default). The new
+        -- case is argv = {""} — non-empty argv with an empty argv[1].
+        -- Step 3's empty-string guard rejects.
+        local resurrect, calls = make_resurrect()
+        local pane, sent = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = { allows = function() return true end },
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "" } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 0,
+            "default fired despite empty argv[1]")
+        assert_eq(#sent, 1, "expected exactly one send_text")
+        assert_eq(sent[1], "cd '/home/user'\r\n",
+            "fallback should send cd <cwd>")
+    end)
+
+    it("argv[1]='/usr/bin/zsh' → still allowed (don't over-reject)",
+    function()
+        -- Absolute paths must continue to work. zsh is in the default
+        -- allowlist; basename("/usr/bin/zsh") == "zsh" → success path.
+        local resurrect, calls = make_resurrect()
+        local pane = make_pane()
+        on_pane_restore.configure({
+            resurrect = resurrect,
+            policy = build_default_policy(),
+        })
+        on_pane_restore.callback({
+            pane = pane,
+            process = { argv = { "/usr/bin/zsh", "-l" } },
+            cwd = "/home/user",
+        })
+        assert_eq(#calls, 1,
+            "absolute-path argv[1] should still hit the success path")
     end)
 end)
 

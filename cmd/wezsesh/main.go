@@ -10,9 +10,10 @@
 //     (snapshot, state, runtime). A symlinked top-level dir is a hard
 //     refuse-class condition.
 //   - Hook env scrub (§13.5.1) drops the three sensitive vars
-//     (WEZSESH_HMAC_KEY / WEZSESH_PROTO_VERSION / WEZSESH_CONFIG_FILE)
-//     and preserves WEZSESH_LOG so user log preferences survive into
-//     the hook child. Implemented in scrubHookEnv.
+//     (WEZSESH_HMAC_KEY / WEZSESH_PROTO_VERSION /
+//     WEZSESH_CONFIG_JSON_BASE64) and preserves WEZSESH_LOG so user log
+//     preferences survive into the hook child. Implemented in
+//     scrubHookEnv.
 //   - Top-level `defer recover()` writes UNEXPECTED_EXIT on the panic
 //     path then os.Exit(2). Out-of-recover crashes (SIGSEGV / SIGKILL /
 //     OOM-killer) fall through to IPC_TIMEOUT — acceptable per §13.1.
@@ -58,11 +59,11 @@ import (
 
 // Exit codes — §13.14 / §17.3.
 const (
-	exitOK              = 0
-	exitDoctorOrSubcmd  = 2 // doctor / list / find / trust / reset / reply
-	exitKeygen          = 3 // keygen — Lua falls through §5.2 step 2
-	exitUnexpected      = 2 // TUI panic path (§13.1)
-	exitInitFailed      = 2 // IPC_INIT_FAILED bucket (§13.9, §6.x)
+	exitOK             = 0
+	exitDoctorOrSubcmd = 2 // doctor / list / find / trust / reset / reply
+	exitKeygen         = 3 // keygen — Lua falls through §5.2 step 2
+	exitUnexpected     = 2 // TUI panic path (§13.1)
+	exitInitFailed     = 2 // IPC_INIT_FAILED bucket (§13.9, §6.x)
 )
 
 // hexKey64 is the §5.2 / §11.3 64-lowercase-hex shape WEZSESH_HMAC_KEY
@@ -84,7 +85,7 @@ var errBadHMACKey = errors.New("WEZSESH_HMAC_KEY is not 64 lowercase hex chars")
 var hookEnvScrub = []string{
 	"WEZSESH_HMAC_KEY",
 	"WEZSESH_PROTO_VERSION",
-	"WEZSESH_CONFIG_FILE",
+	"WEZSESH_CONFIG_JSON_BASE64",
 }
 
 // runtimeEnv bundles every dependency main.go's helpers consume.
@@ -319,15 +320,17 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error
 		return nil, errBadHMACKey
 	}
 
-	// Sub-step (2): config from env. LoadFromEnv falls back to
-	// AutoDetect when WEZSESH_CONFIG_FILE is unset; that path is
-	// supported by the doctor subcommand but the TUI requires the
-	// config file (§8.20.1 step 4.2).
-	if getEnv("WEZSESH_CONFIG_FILE") == "" {
-		return nil, errors.New("WEZSESH_CONFIG_FILE not set; the TUI requires the plugin's config file")
+	// Sub-step (2): config from env. The TUI startup path requires the
+	// plugin to have set $WEZSESH_CONFIG_JSON_BASE64 (the post-fix-#3
+	// handoff — base64-encoded JSON in an env var, no tmp file). The
+	// doctor / list / find / trust / reset subcommands run a different
+	// loader (LoadFromEnv) that falls back to AutoDetect when the env
+	// var is absent.
+	if getEnv("WEZSESH_CONFIG_JSON_BASE64") == "" {
+		return nil, errors.New("WEZSESH_CONFIG_JSON_BASE64 not set; the TUI requires the plugin's config env var")
 	}
 	ctx, cancelCtx := context.WithCancel(context.Background())
-	cfg, err := config.LoadFromEnv(ctx)
+	cfg, err := config.LoadFromEnvJSONBase64(ctx)
 	if err != nil {
 		cancelCtx()
 		return nil, fmt.Errorf("config: %w", err)
@@ -354,8 +357,17 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error
 		log.Warn("reqsweep failed", "err", err.Error())
 	}
 
-	// Sub-step (5): symlink-refuse top-level managed dirs.
-	for _, d := range []string{cfg.SnapshotDir, cfg.StateDir, cfg.RuntimeDir} {
+	// Sub-step (5): symlink-refuse top-level managed dirs and their
+	// security-sensitive children. The data dir + its allow/ child + the
+	// runtime req/ child are pre-created via safefs.MkdirEnforce so the
+	// startup-to-first-use symlink-plant window is closed (per-use
+	// enforcement in trust.go and dispatcher.go remains as
+	// defense-in-depth).
+	//
+	// Order: Enforce(SymlinkRefuse) on every top-level dir first (missing
+	// dirs pass through ok=true), then os.MkdirAll on the parents that
+	// MkdirEnforce needs, then MkdirEnforce on the leaf children.
+	for _, d := range []string{cfg.SnapshotDir, cfg.StateDir, cfg.RuntimeDir, cfg.DataDir} {
 		if d == "" {
 			continue
 		}
@@ -367,6 +379,29 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string) (*runtimeEnv, error
 			_ = log.Close()
 			cancelCtx()
 			return nil, fmt.Errorf("safefs enforce %s: refusing symlink", d)
+		}
+	}
+	mkdirEnforcePairs := []struct{ parent, name string }{
+		{cfg.DataDir, "allow"},
+		{cfg.RuntimeDir, "req"},
+	}
+	for _, p := range mkdirEnforcePairs {
+		if p.parent == "" {
+			continue
+		}
+		// MkdirAll the parent so MkdirEnforce's VerifyDir does not
+		// ENOENT on a fresh install. MkdirAll is happy if the path
+		// already exists; the subsequent Enforce above plus
+		// MkdirEnforce's own fstatat catch every symlink shape.
+		if err := os.MkdirAll(p.parent, 0o700); err != nil {
+			_ = log.Close()
+			cancelCtx()
+			return nil, fmt.Errorf("mkdir %s: %w", p.parent, err)
+		}
+		if err := safefs.MkdirEnforce(p.parent, p.name, 0o700); err != nil {
+			_ = log.Close()
+			cancelCtx()
+			return nil, fmt.Errorf("safefs enforce %s/%s: %w", p.parent, p.name, err)
 		}
 	}
 

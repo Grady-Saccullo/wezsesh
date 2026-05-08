@@ -5,7 +5,7 @@
 --   * compatible           — same-major semver gate.
 --   * ensure_session_key   — generate or load the HMAC session key.
 --   * validate_runtime_dir — SUN_PATH ceiling check.
---   * write_config_file    — JSON config to a temp file.
+--   * build_config_envvar  — JSON-encode + base64-encode the config body.
 --   * spawn                — env-vector + mux/tab spawn.
 --   * register_keybinding  — default keybinding registration.
 --
@@ -22,6 +22,7 @@
 
 local wezterm = require("wezterm")
 local globals = require("wezsesh.runtime.globals")
+local b64     = require("wezsesh.crypto.b64")
 
 local M = {}
 
@@ -58,18 +59,6 @@ local function path_join(dir, file)
     if type(dir) ~= "string" or dir == "" then return file end
     if dir:sub(-1) == "/" then return dir .. file end
     return dir .. "/" .. file
-end
-
--- Tempdir picker. Lua's `os.tmpdir()` doesn't exist; emulate by
--- consulting `$TMPDIR` (POSIX), falling back to `/tmp`.
-local function tmpdir()
-    local t = os.getenv("TMPDIR")
-    if type(t) == "string" and t ~= "" then
-        -- strip trailing slash for consistency
-        if t:sub(-1) == "/" then t = t:sub(1, -2) end
-        return t
-    end
-    return "/tmp"
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -232,38 +221,26 @@ function M.validate_runtime_dir(opts)
 end
 
 -- ────────────────────────────────────────────────────────────────────
--- write_config_file
+-- build_config_envvar
 -- ────────────────────────────────────────────────────────────────────
 --
--- Builds the JSON config shape and writes it under
--- `<tmp>/wezsesh-<pid>-config.json`. Returns the absolute path.
+-- Builds the JSON config shape, base64-encodes it, and returns the
+-- single string value that the binary picks up via the
+-- WEZSESH_CONFIG_JSON_BASE64 env var. Pure on `opts`; no filesystem
+-- writes. The previous `write_config_file` form is deleted entirely:
+-- a tmp file with a predictable name and umask-defaulted mode (0644)
+-- is a CVE-class TOCTOU surface on a multi-user host. Threading the
+-- bytes through an env var inherits the process's standard env scoping
+-- (visible to the spawn child, scrubbed from hooks at §13.5.1) without
+-- crossing the filesystem.
 --
--- pid sourcing: the wezterm mlua sandbox does not expose `os.getpid`,
--- and the mode-0600 contract is aspirational from Lua (we cannot
--- guarantee 0600 in pure Lua; the file is written via `io.open` which
--- honours the process umask). We use `wezterm.procinfo.pid` when
--- available, else a process-wide monotonic counter combined with
--- `os.time()` for collision avoidance.
+-- Defensive size cap: if the base64 length exceeds 64 KiB, raise
+-- `WEZSESH_CONFIG_TOO_LARGE`. ARG_MAX is 2 MB on Linux / 1 MB on
+-- darwin so the envvar route has plenty of headroom for the < 4 KB
+-- config we ship today; the cap is cheap insurance against an
+-- accidental future field that balloons the body.
 
-local _config_seq = 0
-
-local function next_config_filename()
-    _config_seq = _config_seq + 1
-    local pid_like
-    local ok, pi = pcall(function() return wezterm.procinfo end)
-    if ok and type(pi) == "table" and type(pi.pid) == "function" then
-        local pok, p = pcall(pi.pid)
-        if pok and type(p) == "number" then
-            pid_like = tostring(p)
-        end
-    end
-    if pid_like == nil then
-        pid_like = tostring(os.time()) .. "-" .. tostring(_config_seq)
-    end
-    return string.format("wezsesh-%s-config.json", pid_like)
-end
-
--- Default keys table — copied here so write_config_file is a pure
+-- Default keys table — copied here so build_config_envvar is a pure
 -- function of `opts`. apply_to_config merges user overrides into this
 -- table before calling us.
 local DEFAULT_KEYS = {
@@ -325,7 +302,7 @@ local function resolve_argv_allowlist(v)
     return v
 end
 
-function M.write_config_file(opts)
+function M.build_config_envvar(opts)
     opts = opts or {}
 
     -- Build the config body. Every top-level key the binary expects is
@@ -372,17 +349,12 @@ function M.write_config_file(opts)
         proto_version    = 1,
     }
 
-    local path = path_join(tmpdir(), next_config_filename())
     local encoded = wezterm.json_encode(body)
-    local f, err = io.open(path, "wb")
-    if f == nil then
-        error(string.format(
-            "WEZSESH_CONFIG_WRITE_FAILED: %s (%s)",
-            tostring(err), path), 0)
+    local b64s = b64.encode(encoded)
+    if #b64s > 64 * 1024 then
+        error("WEZSESH_CONFIG_TOO_LARGE: encoded config exceeds 64 KiB", 0)
     end
-    f:write(encoded)
-    f:close()
-    return path
+    return b64s
 end
 
 -- ────────────────────────────────────────────────────────────────────
@@ -390,9 +362,12 @@ end
 -- ────────────────────────────────────────────────────────────────────
 --
 -- Builds the env vector EXACTLY:
---   WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_FILE,
+--   WEZSESH_HMAC_KEY, WEZSESH_PROTO_VERSION, WEZSESH_CONFIG_JSON_BASE64,
 --   WEZSESH_PLUGIN_VERSION
--- — no more, no less. Dirs travel inside `WEZSESH_CONFIG_FILE`.
+-- — no more, no less. Dirs travel inside `WEZSESH_CONFIG_JSON_BASE64`
+-- as a base64-encoded JSON document; no tmp file is involved on the
+-- handoff path (the previous `WEZSESH_CONFIG_FILE` route was a
+-- predictable-name TOCTOU surface and is gone).
 --
 -- spawn_mode dispatch:
 --   "window" → wezterm.mux.spawn_window{ args=…, set_environment_variables=… }
@@ -418,14 +393,14 @@ function M.spawn(window, opts)
         return nil, "WEZSESH_SESSION_KEY_MISSING"
     end
 
-    local config_path = M.write_config_file(opts)
+    local config_b64 = M.build_config_envvar(opts)
     local bin = M.resolve_binary(opts)
 
     local env = {
-        WEZSESH_HMAC_KEY       = key,
-        WEZSESH_PROTO_VERSION  = "1",
-        WEZSESH_CONFIG_FILE    = config_path,
-        WEZSESH_PLUGIN_VERSION = M.VERSION,
+        WEZSESH_HMAC_KEY            = key,
+        WEZSESH_PROTO_VERSION       = "1",
+        WEZSESH_CONFIG_JSON_BASE64  = config_b64,
+        WEZSESH_PLUGIN_VERSION      = M.VERSION,
     }
 
     -- macOS GUI launch contexts hand spawned children a minimal launchd

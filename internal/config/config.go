@@ -1,13 +1,14 @@
 // Package config implements the binary-side configuration loaded from
-// $WEZSESH_CONFIG_FILE (§8.19). The on-disk JSON shape is described in
-// §10.7; the per-key schema in §11; the env-vs-file resolution table in
-// §11.4; auto-detection in §12.5 / §12.2.
+// $WEZSESH_CONFIG_JSON_BASE64 (§8.19). The on-disk JSON shape is
+// described in §10.7; the per-key schema in §11; the env-vs-file
+// resolution table in §11.4; auto-detection in §12.5 / §12.2.
 package config
 
 import "regexp"
 
-// Config is the binary-side configuration loaded from $WEZSESH_CONFIG_FILE.
-// Field shapes follow §8.19; on-disk JSON keys match §10.7.
+// Config is the binary-side configuration loaded from
+// $WEZSESH_CONFIG_JSON_BASE64. Field shapes follow §8.19; the JSON keys
+// match §10.7.
 type Config struct {
 	// Version is the §10.7 schema version (currently 1). Captured so a
 	// future migration can key off the file value; no runtime behaviour

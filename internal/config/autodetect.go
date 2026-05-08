@@ -10,8 +10,8 @@ import (
 
 // AutoDetect returns a *Config populated with §11 defaults plus the
 // platform-specific dir paths defined in §12.5 / §12.2. Used when the
-// binary is invoked outside its plugin context (no $WEZSESH_CONFIG_FILE)
-// — e.g., `wezsesh doctor` from a shell.
+// binary is invoked outside its plugin context (no
+// $WEZSESH_CONFIG_JSON_BASE64) — e.g., `wezsesh doctor` from a shell.
 func AutoDetect() (*Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -109,6 +109,90 @@ func SafeOpenForRead(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// OpenAppendOnly opens <parentDir>/<filename> for append-only writes
+// under a verified parent dirfd. The flag bag is
+// O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW|O_CLOEXEC; if the leaf is a
+// symlink, the open fails with ErrIsSymlink. Caller owns the returned
+// *os.File and must Close it.
+//
+// Why dirfd+openat: O_NOFOLLOW only protects the final path component,
+// so a path-based os.OpenFile would silently traverse a symlinked
+// ancestor. Opening parentDir first with O_DIRECTORY|O_NOFOLLOW closes
+// the gap.
+func OpenAppendOnly(parentDir, filename string, mode fs.FileMode) (*os.File, error) {
+	if filename == "" {
+		return nil, errors.New("safefs: OpenAppendOnly: empty filename")
+	}
+	if filepath.Base(filename) != filename {
+		return nil, fmt.Errorf("safefs: OpenAppendOnly: filename %q must not contain separators", filename)
+	}
+	dirfd, _, err := VerifyDir(parentDir)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(dirfd)
+
+	fd, err := unix.Openat(
+		dirfd,
+		filename,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		uint32(mode.Perm()),
+	)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("safefs: OpenAppendOnly %s/%s: %w", parentDir, filename, ErrIsSymlink)
+		}
+		return nil, fmt.Errorf("safefs: OpenAppendOnly %s/%s: %w", parentDir, filename, err)
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(parentDir, filename)), nil
+}
+
+// MkdirEnforce ensures <parentDir>/<name> exists as a regular directory
+// owned by the current effective uid, refusing every symlink shape. The
+// helper is idempotent: pre-existing dir owned by self → success; missing
+// → created at mode 0700; symlinked → ErrIsSymlink; pre-existing dir
+// owned by another uid → error. Either succeeds with the dir in the
+// expected shape or returns an error — never half-state.
+//
+// Why dirfd+mkdirat+fstatat: the mkdir is anchored to a parent dirfd
+// opened with O_NOFOLLOW so an ancestor symlink cannot redirect the
+// create. After the mkdir, fstatat with AT_SYMLINK_NOFOLLOW on the same
+// dirfd verifies the leaf is a regular dir, not a symlink-to-dir.
+func MkdirEnforce(parentDir, name string, mode fs.FileMode) error {
+	if name == "" {
+		return errors.New("safefs: MkdirEnforce: empty name")
+	}
+	if filepath.Base(name) != name {
+		return fmt.Errorf("safefs: MkdirEnforce: name %q must not contain separators", name)
+	}
+	dirfd, _, err := VerifyDir(parentDir)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dirfd)
+
+	if err := unix.Mkdirat(dirfd, name, uint32(mode.Perm())); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("safefs: MkdirEnforce mkdirat %s/%s: %w", parentDir, name, err)
+		}
+	}
+
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("safefs: MkdirEnforce fstatat %s/%s: %w", parentDir, name, err)
+	}
+	if (st.Mode & unix.S_IFMT) == unix.S_IFLNK {
+		return fmt.Errorf("safefs: MkdirEnforce %s/%s: %w", parentDir, name, ErrIsSymlink)
+	}
+	if (st.Mode & unix.S_IFMT) != unix.S_IFDIR {
+		return fmt.Errorf("safefs: MkdirEnforce %s/%s: not a directory", parentDir, name)
+	}
+	if euid := os.Geteuid(); euid >= 0 && int(st.Uid) != euid {
+		return fmt.Errorf("safefs: MkdirEnforce %s/%s: owned by uid %d (expected %d)", parentDir, name, st.Uid, euid)
+	}
+	return nil
+}
+
 // AtomicWriteFile writes data to <parentDir>/<filename> via the
 // dirfd-anchored temp+rename dance:
 //
@@ -214,4 +298,3 @@ func randHex8() (string, error) {
 	}
 	return hex.EncodeToString(b[:]), nil
 }
-

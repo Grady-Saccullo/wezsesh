@@ -154,6 +154,7 @@ func validateReplyShape(decoded []byte) error {
 		"id":       {},
 		"status":   {},
 		"ok":       {},
+		"hmac":     {},
 		"data":     {},
 		"warnings": {},
 		"error":    {},
@@ -187,6 +188,27 @@ func validateReplyShape(decoded []byte) error {
 	}
 	if len(idStr) != 26 {
 		return fmt.Errorf("id: must be 26 chars (got %d)", len(idStr))
+	}
+
+	hmacRaw, ok := raw["hmac"]
+	if !ok {
+		return errors.New("missing required field: hmac")
+	}
+	var hmacStr string
+	if err := json.Unmarshal(hmacRaw, &hmacStr); err != nil {
+		return fmt.Errorf("hmac: must be string: %w", err)
+	}
+	if len(hmacStr) != 64 {
+		return fmt.Errorf("hmac: must be 64 hex chars (got %d)", len(hmacStr))
+	}
+	for i := 0; i < len(hmacStr); i++ {
+		c := hmacStr[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return fmt.Errorf("hmac: must be lowercase hex (got %q at offset %d)", c, i)
+		}
 	}
 
 	statusRaw, ok := raw["status"]
