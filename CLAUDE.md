@@ -204,9 +204,15 @@ business module should call into `crypto`, not the other way around.
 
 ## Conventions
 
-- **VCS is jj-colocated.** `.jj/` + `.git/` side by side. Use `jj` for commits,
-  diffs, history (`jj log`, `jj diff`, `jj describe`, `jj commit`). Git tools
-  (CI, IDE, `gh pr`) see the colocated `.git/` and work normally.
+- **VCS is jj-colocated; use `jj` for ALL VCS operations.** `.jj/` + `.git/`
+  sit side by side, but every commit, diff, log, status, branch, rebase, or
+  history operation goes through `jj` — never `git`. Canonical commands:
+  `jj st`, `jj log`, `jj diff`, `jj describe`, `jj commit`, `jj new`,
+  `jj rebase`, `jj bookmark`, `jj git push`. The only acceptable `git` usage
+  is read-only inspection by external tools you don't control (CI, IDE,
+  `gh pr` for GitHub interactions) — when *you* take an action, reach for
+  `jj`. If a workflow seems to require a `git` command, find the `jj`
+  equivalent first.
 - **Don't push from agents.** Pushes are user-initiated (`jj git push -b main`).
 - **Comments are rare.** Default to none; add only when the WHY is non-obvious
   (a hidden invariant, a workaround for a specific bug). The codebase already
