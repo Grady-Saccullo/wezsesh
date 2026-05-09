@@ -14,8 +14,9 @@ import (
 
 // withTailEnv points WEZSESH_*_DIR overrides at a scratch tree so
 // subcmdTail's config.LoadFromEnv (now AutoDetect + applyEnvOverrides
-// for non-TUI subcommands) resolves to it. The two log files are
-// pre-created (empty) so the readers don't bail out on ENOENT.
+// for non-TUI subcommands) resolves to it. Both log files now live in
+// stateDir; the runtimeDir return is preserved for callers that still
+// want it but tail itself no longer reads from runtimeDir.
 func withTailEnv(t *testing.T) (stateDir, runtimeDir string) {
 	t.Helper()
 	root := t.TempDir()
@@ -67,7 +68,7 @@ func mustJSON(t *testing.T, v map[string]any) string {
 
 func TestParseTailLine_Binary(t *testing.T) {
 	line := []byte(`{"time":"2026-05-08T10:00:00.123Z","level":"WARN","msg":"hmac mismatch","binary_session_id":"01J7PABC","trace_id":"01J7ZXYZ","reason":"replay"}`)
-	rec, ok := parseTailLine("binary", line)
+	rec, ok := parseTailLine(tailSource{Name: "binary"}, line, time.Time{})
 	if !ok {
 		t.Fatalf("parse failed")
 	}
@@ -93,7 +94,7 @@ func TestParseTailLine_Binary(t *testing.T) {
 
 func TestParseTailLine_Plugin(t *testing.T) {
 	line := []byte(`{"ts":1746700800,"level":"warn","msg":"REQ_POINTER_REJECTED","plugin_session_id":"01J8QABC","trace_id":"01J7ZXYZ","binary_session_id":"01J7PABC","pane_id":42}`)
-	rec, ok := parseTailLine("plugin", line)
+	rec, ok := parseTailLine(tailSource{Name: "plugin"}, line, time.Time{})
 	if !ok {
 		t.Fatalf("parse failed")
 	}
@@ -113,16 +114,60 @@ func TestParseTailLine_Plugin(t *testing.T) {
 }
 
 func TestParseTailLine_Malformed(t *testing.T) {
-	if _, ok := parseTailLine("binary", []byte("not json")); ok {
+	if _, ok := parseTailLine(tailSource{Name: "binary"}, []byte("not json"), time.Time{}); ok {
 		t.Fatalf("expected ok=false on malformed JSON")
 	}
 	// Binary missing time.
-	if _, ok := parseTailLine("binary", []byte(`{"level":"info","msg":"x"}`)); ok {
+	if _, ok := parseTailLine(tailSource{Name: "binary"}, []byte(`{"level":"info","msg":"x"}`), time.Time{}); ok {
 		t.Fatalf("expected ok=false on missing time")
 	}
 	// Plugin missing ts.
-	if _, ok := parseTailLine("plugin", []byte(`{"level":"info","msg":"x"}`)); ok {
+	if _, ok := parseTailLine(tailSource{Name: "plugin"}, []byte(`{"level":"info","msg":"x"}`), time.Time{}); ok {
 		t.Fatalf("expected ok=false on missing ts")
+	}
+}
+
+// TestParseTailLine_WezTerm exercises the wezterm GUI log parser:
+// extracts time-of-day, level, module, and message body, and applies
+// the substring filter (case-insensitive).
+func TestParseTailLine_WezTerm(t *testing.T) {
+	anchor := time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
+	src := tailSource{Name: "wezterm", Filter: "wezsesh"}
+	// Match: line carries "wezsesh".
+	line := []byte(`17:08:42.608  WARN   logging > lua: switch: branch3 saved-not-live name="wezsesh-A"`)
+	rec, ok := parseTailLine(src, line, anchor)
+	if !ok {
+		t.Fatalf("expected match")
+	}
+	if rec.Source != "wezterm" {
+		t.Fatalf("source = %q", rec.Source)
+	}
+	if rec.Level != "warn" {
+		t.Fatalf("level = %q, want warn", rec.Level)
+	}
+	if !strings.Contains(rec.Msg, "branch3") {
+		t.Fatalf("msg = %q", rec.Msg)
+	}
+	want := time.Date(2026, 5, 9, 17, 8, 42, 608000000, time.UTC)
+	if !rec.Time.Equal(want) {
+		t.Fatalf("time = %v, want %v", rec.Time, want)
+	}
+	if rec.Raw["module"] != "logging" {
+		t.Fatalf("raw.module = %v", rec.Raw["module"])
+	}
+	// No match: filter substring absent.
+	noMatch := []byte(`17:08:42.608  INFO   logging > lua: [smart-splits.nvim]: nothing wezsesh-y`)
+	if _, ok := parseTailLine(tailSource{Name: "wezterm", Filter: "TRACE-ME"}, noMatch, anchor); ok {
+		t.Fatalf("expected filter to reject")
+	}
+	// Filter is case-insensitive against the line.
+	mixed := []byte(`17:08:42.608  WARN   logging > lua: WEZSESH error here`)
+	if _, ok := parseTailLine(tailSource{Name: "wezterm", Filter: "wezsesh"}, mixed, anchor); !ok {
+		t.Fatalf("expected case-insensitive match")
+	}
+	// Continuation / non-conforming line dropped.
+	if _, ok := parseTailLine(src, []byte(`    at some::stack::frame wezsesh`), anchor); ok {
+		t.Fatalf("expected non-conforming line to drop")
 	}
 }
 
@@ -297,13 +342,13 @@ func readWithTimeout(t *testing.T, ch <-chan tailRecord, d time.Duration) tailRe
 // overlapping times; the no-follow drain sorts by time and produces a
 // single ordered stream. Force colour off so the output is grep-able.
 func TestRunTail_NoFollow_Interleaved(t *testing.T) {
-	stateDir, runtimeDir := withTailEnv(t)
+	stateDir, _ := withTailEnv(t)
 	prev := tailColorize
 	t.Cleanup(func() { tailColorize = prev })
 	tailColorize = func() bool { return false }
 
 	binPath := filepath.Join(stateDir, "wezsesh.log")
-	luaPath := filepath.Join(runtimeDir, "plugin.log")
+	luaPath := filepath.Join(stateDir, "plugin.log")
 
 	// Binary at t=10:00:00.500, plugin at t=10:00:00.250 (earlier),
 	// binary at t=10:00:01.000, plugin at t=10:00:01.750.
@@ -342,7 +387,7 @@ func TestRunTail_NoFollow_Interleaved(t *testing.T) {
 
 // TestRunTail_NoFollow_TraceFilter: filter by trace_id substring.
 func TestRunTail_NoFollow_TraceFilter(t *testing.T) {
-	stateDir, runtimeDir := withTailEnv(t)
+	stateDir, _ := withTailEnv(t)
 	prev := tailColorize
 	t.Cleanup(func() { tailColorize = prev })
 	tailColorize = func() bool { return false }
@@ -351,7 +396,7 @@ func TestRunTail_NoFollow_TraceFilter(t *testing.T) {
 		mustJSON(t, map[string]any{"time": "2026-05-08T10:00:00Z", "level": "INFO", "msg": "matches", "binary_session_id": "BS1", "trace_id": "01J7ZTRACEME"}),
 		mustJSON(t, map[string]any{"time": "2026-05-08T10:00:01Z", "level": "INFO", "msg": "skipped", "binary_session_id": "BS1", "trace_id": "01J7ZOTHER"}),
 	)
-	writeLog(t, filepath.Join(runtimeDir, "plugin.log"),
+	writeLog(t, filepath.Join(stateDir, "plugin.log"),
 		mustJSON(t, map[string]any{"ts": 1746700802, "level": "info", "msg": "lua-match", "plugin_session_id": "PS1", "trace_id": "01J7ZTRACEME"}),
 	)
 
@@ -371,7 +416,7 @@ func TestRunTail_NoFollow_TraceFilter(t *testing.T) {
 // TestRunTail_NoFollow_JSON: --json emits the original raw map plus a
 // `_source` discriminator.
 func TestRunTail_NoFollow_JSON(t *testing.T) {
-	stateDir, runtimeDir := withTailEnv(t)
+	stateDir, _ := withTailEnv(t)
 	prev := tailColorize
 	t.Cleanup(func() { tailColorize = prev })
 	tailColorize = func() bool { return false }
@@ -379,7 +424,7 @@ func TestRunTail_NoFollow_JSON(t *testing.T) {
 	writeLog(t, filepath.Join(stateDir, "wezsesh.log"),
 		mustJSON(t, map[string]any{"time": "2026-05-08T10:00:00Z", "level": "INFO", "msg": "x", "binary_session_id": "BS1"}),
 	)
-	writeLog(t, filepath.Join(runtimeDir, "plugin.log"),
+	writeLog(t, filepath.Join(stateDir, "plugin.log"),
 		mustJSON(t, map[string]any{"ts": 1746700801, "level": "info", "msg": "y", "plugin_session_id": "PS1"}),
 	)
 
@@ -407,7 +452,7 @@ func TestRunTail_NoFollow_JSON(t *testing.T) {
 // TestRunTail_NoFollow_NoBinary: --no-binary skips the wezsesh.log
 // source; the only output should be the plugin record.
 func TestRunTail_NoFollow_NoBinary(t *testing.T) {
-	stateDir, runtimeDir := withTailEnv(t)
+	stateDir, _ := withTailEnv(t)
 	prev := tailColorize
 	t.Cleanup(func() { tailColorize = prev })
 	tailColorize = func() bool { return false }
@@ -415,7 +460,7 @@ func TestRunTail_NoFollow_NoBinary(t *testing.T) {
 	writeLog(t, filepath.Join(stateDir, "wezsesh.log"),
 		mustJSON(t, map[string]any{"time": "2026-05-08T10:00:00Z", "level": "INFO", "msg": "bin-skipped", "binary_session_id": "BS1"}),
 	)
-	writeLog(t, filepath.Join(runtimeDir, "plugin.log"),
+	writeLog(t, filepath.Join(stateDir, "plugin.log"),
 		mustJSON(t, map[string]any{"ts": 1746700801, "level": "info", "msg": "lua-kept", "plugin_session_id": "PS1"}),
 	)
 
@@ -429,6 +474,95 @@ func TestRunTail_NoFollow_NoBinary(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "lua-kept") {
 		t.Fatalf("expected plugin record: %q", out.String())
+	}
+}
+
+// TestRunTail_WezTerm_AutoDetectAndFilter: --wezterm picks the most-
+// recent wezterm-gui-log-*.txt under the candidate dirs, parses lines
+// matching the substring filter, and surfaces them with source=wezterm.
+// Drives auto-detection through the package-level `wezTermLogCandidates`
+// seam so tests don't touch the user's real $HOME.
+func TestRunTail_WezTerm_AutoDetectAndFilter(t *testing.T) {
+	stateDir, _ := withTailEnv(t)
+	prev := tailColorize
+	t.Cleanup(func() { tailColorize = prev })
+	tailColorize = func() bool { return false }
+
+	// Two wezterm GUI log files: an older one with no wezsesh content,
+	// and a newer one that does. Auto-detect picks the newer.
+	wezDir := t.TempDir()
+	old := filepath.Join(wezDir, "wezterm-gui-log-1111.txt")
+	cur := filepath.Join(wezDir, "wezterm-gui-log-2222.txt")
+	writeLog(t, old, "10:00:00.000  INFO   logging > unrelated stuff")
+	writeLog(t, cur,
+		"10:00:01.250  WARN   logging > lua: wezsesh: switch failed",
+		"10:00:01.260  INFO   logging > lua: [smart-splits.nvim]: noise nobody cares about",
+		"10:00:01.300  ERROR  logging > lua: [wezsesh] something broke",
+	)
+	// Bump current's mtime so it wins the most-recent comparison even
+	// when both files are created in the same wall-clock second.
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(cur, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	prevC := wezTermLogCandidates
+	t.Cleanup(func() { wezTermLogCandidates = prevC })
+	wezTermLogCandidates = func() []string { return []string{wezDir} }
+
+	// Seed something in the binary log too so the multi-source render
+	// path is exercised.
+	writeLog(t, filepath.Join(stateDir, "wezsesh.log"),
+		mustJSON(t, map[string]any{
+			"time": "2026-05-09T10:00:00Z", "level": "INFO",
+			"msg": "binary line", "binary_session_id": "BS1",
+		}),
+	)
+
+	var out, errBuf bytes.Buffer
+	rc := subcmdTail([]string{"--no-follow", "--wezterm"}, &out, &errBuf)
+	if rc != exitOK {
+		t.Fatalf("rc = %d (stderr=%s)", rc, errBuf.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"binary line",
+		"wezsesh: switch failed",
+		"[wezsesh] something broke",
+		"[wzt ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+	// Filter excluded the smart-splits.nvim noise.
+	if strings.Contains(got, "smart-splits") {
+		t.Fatalf("filter should have dropped non-wezsesh wezterm line:\n%s", got)
+	}
+	// Older wezterm log was not chosen.
+	if strings.Contains(got, "unrelated stuff") {
+		t.Fatalf("auto-detect picked the older log file:\n%s", got)
+	}
+}
+
+// TestRunTail_WezTerm_NoCandidates: --wezterm with no log file found
+// returns the documented usage error.
+func TestRunTail_WezTerm_NoCandidates(t *testing.T) {
+	withTailEnv(t)
+	prev := tailColorize
+	t.Cleanup(func() { tailColorize = prev })
+	tailColorize = func() bool { return false }
+	prevC := wezTermLogCandidates
+	t.Cleanup(func() { wezTermLogCandidates = prevC })
+	wezTermLogCandidates = func() []string { return []string{t.TempDir()} }
+
+	var out, errBuf bytes.Buffer
+	rc := subcmdTail([]string{"--no-follow", "--wezterm"}, &out, &errBuf)
+	if rc != exitDoctorOrSubcmd {
+		t.Fatalf("rc = %d, want %d", rc, exitDoctorOrSubcmd)
+	}
+	if !strings.Contains(errBuf.String(), "could not find a wezterm GUI log") {
+		t.Fatalf("stderr missing autodetect-failure hint: %q", errBuf.String())
 	}
 }
 
@@ -454,7 +588,7 @@ func TestRunTail_NoBothSources_Errors(t *testing.T) {
 // magenta source chips (when colour is on) or the plain `[bin …]` /
 // `[lua …]` tags (when colour is off), plus trace/session chips.
 func TestRunTail_TextFormat_Chips(t *testing.T) {
-	stateDir, runtimeDir := withTailEnv(t)
+	stateDir, _ := withTailEnv(t)
 	prev := tailColorize
 	t.Cleanup(func() { tailColorize = prev })
 	tailColorize = func() bool { return false }
@@ -469,7 +603,7 @@ func TestRunTail_TextFormat_Chips(t *testing.T) {
 			"reason":            "replay",
 		}),
 	)
-	writeLog(t, filepath.Join(runtimeDir, "plugin.log"),
+	writeLog(t, filepath.Join(stateDir, "plugin.log"),
 		mustJSON(t, map[string]any{
 			"ts":                int64(1746700801),
 			"level":             "warn",

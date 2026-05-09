@@ -304,7 +304,7 @@ func ensureDir(dir string) error {
 }
 
 // refuseSymlinkAt is the leaf-only inline check used by the rotation
-// path for the numbered targets (.1, .2, .3). Missing paths are treated
+// path for the numbered targets (.1.log, .2.log, .3.log). Missing paths are treated
 // as ok. The active log path itself is guarded by safefs.OpenAppendOnly
 // (dirfd-anchored, no TOCTOU); rotation uses path-based renames so the
 // inline check remains as a stand-in until rotation is dirfd-anchored
@@ -437,9 +437,11 @@ func (w *rotatingWriter) tickLoop() {
 	}
 }
 
-// rotateLocked performs the .1→.2→.3 shift then renames the active log
-// to .1, finally re-opening a fresh active log via safefs.OpenAppendOnly
-// (dirfd-anchored, O_NOFOLLOW). Caller must hold w.mu.
+// rotateLocked performs the .1.log→.2.log→.3.log shift then renames the
+// active log to the .1.log slot, finally re-opening a fresh active log
+// via safefs.OpenAppendOnly (dirfd-anchored, O_NOFOLLOW). Numbered slot
+// names route through safefs.RotatedName so the extension lives at the
+// tail (`wezsesh.1.log`, not `wezsesh.log.1`). Caller must hold w.mu.
 //
 // TODO(security): the numbered-target path-based os.Rename / os.Remove
 // calls are not dirfd-anchored, so a leaf-level symlink swap between
@@ -449,10 +451,13 @@ func (w *rotatingWriter) tickLoop() {
 // pair. The state dir itself is symlink-refused at startup (§8.20.1
 // substep 5), so the post-startup window is the residual exposure.
 func (w *rotatingWriter) rotateLocked() error {
-	// Numbered targets, oldest-first, so we can drop .3 then shift .2→.3,
-	// .1→.2, active→.1 without overwriting a target prematurely.
+	rotatedPath := func(n int) string {
+		return filepath.Join(w.dir, safefs.RotatedName(w.filename, n))
+	}
+	// Numbered targets, oldest-first, so we can drop slot 3 then shift
+	// 2→3, 1→2, active→1 without overwriting a target prematurely.
 	for i := 3; i >= 1; i-- {
-		dst := fmt.Sprintf("%s.%d", w.path, i)
+		dst := rotatedPath(i)
 		if err := refuseSymlinkAt(dst); err != nil {
 			return err
 		}
@@ -463,8 +468,8 @@ func (w *rotatingWriter) rotateLocked() error {
 			}
 			continue
 		}
-		src := fmt.Sprintf("%s.%d", w.path, i)
-		nextDst := fmt.Sprintf("%s.%d", w.path, i+1)
+		src := rotatedPath(i)
+		nextDst := rotatedPath(i + 1)
 		if _, err := os.Lstat(src); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -475,7 +480,7 @@ func (w *rotatingWriter) rotateLocked() error {
 			return fmt.Errorf("logger: rotate %s -> %s: %w", src, nextDst, err)
 		}
 	}
-	// Move active to .1.
+	// Move active to slot 1.
 	if err := refuseSymlinkAt(w.path); err != nil {
 		return err
 	}
@@ -490,7 +495,7 @@ func (w *rotatingWriter) rotateLocked() error {
 	}
 	w.file = nil
 	w.buf = nil
-	if err := os.Rename(w.path, w.path+".1"); err != nil {
+	if err := os.Rename(w.path, rotatedPath(1)); err != nil {
 		return fmt.Errorf("logger: rotate active: %w", err)
 	}
 	f, err := openLog(w.dir, w.filename)

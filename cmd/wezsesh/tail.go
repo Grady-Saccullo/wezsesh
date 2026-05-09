@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,10 +32,15 @@ import (
 //                                 level, msg, binary_session_id, optional
 //                                 trace_id / plugin_session_id, plus
 //                                 caller-supplied kv attrs.
-//   - <runtimeDir>/plugin.log  — Lua-side JSON. Schema: level, ts (unix
+//   - <stateDir>/plugin.log    — Lua-side JSON. Schema: level, ts (unix
 //                                 seconds int), msg, plugin_session_id,
 //                                 optional trace_id / binary_session_id /
 //                                 pane_id, plus caller-supplied fields.
+//                                 Lives next to wezsesh.log so a `wezsesh
+//                                 tail` from a fresh shell finds both
+//                                 streams under the same auto-detected
+//                                 path; the plugin's spawn-env runtime_dir
+//                                 isn't visible to that shell.
 //
 // Behaviour: spin a reader goroutine per source, parse each line as JSON,
 // normalise the timestamp into a single ordering key, and emit through a
@@ -71,14 +78,22 @@ type tailFlags struct {
 	JSON     bool
 	NoBinary bool
 	NoPlugin bool
+	// WezTerm enables the wezterm GUI log as a third source, filtered to
+	// lines containing WezTermFilter (default "wezsesh"). Off by default
+	// because the GUI log is shared with every other wezterm plugin and
+	// would drown out the binary + plugin streams without a filter.
+	WezTerm       bool
+	WezTermPath   string // explicit path; empty → auto-detect
+	WezTermFilter string // case-insensitive substring; empty → "wezsesh"
 }
 
-// tailRecord is the normalised in-memory shape both readers emit. Time
+// tailRecord is the normalised in-memory shape every reader emits. Time
 // is the unified ordering key; Raw carries every field from the source
 // JSON so --json output preserves the original schema (with a `_source`
-// tag injected).
+// tag injected). Wezterm-source records synthesise Raw from the parsed
+// time/level/module/msg quartet since wezterm's GUI log is plain text.
 type tailRecord struct {
-	Source          string         // "binary" or "plugin"
+	Source          string         // "binary" / "plugin" / "wezterm"
 	Time            time.Time      // unified ordering key
 	Level           string         // canonical name
 	Msg             string
@@ -181,7 +196,13 @@ func parseTailFlags(rest []string) (tailFlags, error) {
 	fs.BoolVar(&p.NoFollow, "no-follow", false, "print existing matches and exit (default: follow)")
 	fs.BoolVar(&p.JSON, "json", false, "emit raw JSON, one record per line, with _source injected")
 	fs.BoolVar(&p.NoBinary, "no-binary", false, "skip <stateDir>/wezsesh.log")
-	fs.BoolVar(&p.NoPlugin, "no-plugin", false, "skip <runtimeDir>/plugin.log")
+	fs.BoolVar(&p.NoPlugin, "no-plugin", false, "skip <stateDir>/plugin.log")
+	fs.BoolVar(&p.WezTerm, "wezterm", false,
+		"include the wezterm GUI log filtered by --wezterm-filter (off by default)")
+	fs.StringVar(&p.WezTermPath, "wezterm-log", "",
+		"explicit path to a wezterm GUI log file (default: auto-detect newest under XDG locations)")
+	fs.StringVar(&p.WezTermFilter, "wezterm-filter", "",
+		"case-insensitive substring filter for --wezterm lines (default: 'wezsesh')")
 	if err := fs.Parse(rest); err != nil {
 		return tailFlags{}, err
 	}
@@ -210,10 +231,14 @@ func parseTailFlags(rest []string) (tailFlags, error) {
 
 // tailSource describes one open log file the runtime is following. The
 // path is captured up front so rotation detection (open dev+inode vs.
-// path dev+inode) has a stable referent.
+// path dev+inode) has a stable referent. Wezterm-source records carry a
+// substring `Filter` and the wezterm log's plain-text format means the
+// reader synthesises a date anchor from the file's mtime (the GUI log
+// only stamps `HH:MM:SS.mmm`, not the date).
 type tailSource struct {
-	Name string // "binary" or "plugin"
-	Path string
+	Name   string // "binary" / "plugin" / "wezterm"
+	Path   string
+	Filter string // case-insensitive substring (wezterm only)
 }
 
 // buildTailSources resolves the two log file paths from the loaded
@@ -230,12 +255,76 @@ func buildTailSources(cfg *config.Config, flags tailFlags) ([]tailSource, error)
 		out = append(out, tailSource{Name: "binary", Path: filepath.Join(cfg.StateDir, "wezsesh.log")})
 	}
 	if !flags.NoPlugin {
-		if cfg.RuntimeDir == "" {
-			return nil, errors.New("config: runtime_dir is empty")
+		if cfg.StateDir == "" {
+			return nil, errors.New("config: state_dir is empty")
 		}
-		out = append(out, tailSource{Name: "plugin", Path: filepath.Join(cfg.RuntimeDir, "plugin.log")})
+		out = append(out, tailSource{Name: "plugin", Path: filepath.Join(cfg.StateDir, "plugin.log")})
+	}
+	if flags.WezTerm {
+		path := flags.WezTermPath
+		if path == "" {
+			path = autoDetectWezTermLog()
+		}
+		if path == "" {
+			return nil, errors.New("--wezterm: could not find a wezterm GUI log; pass --wezterm-log <path>")
+		}
+		filter := flags.WezTermFilter
+		if filter == "" {
+			filter = "wezsesh"
+		}
+		out = append(out, tailSource{
+			Name: "wezterm", Path: path, Filter: strings.ToLower(filter),
+		})
 	}
 	return out, nil
+}
+
+// wezTermLogCandidates is the list of directories `autoDetectWezTermLog`
+// scans. Wezterm writes one `wezterm-gui-log-<pid>.txt` per GUI process
+// invocation; we pick the most-recently-modified one, matching the
+// running wezterm. Order is irrelevant — the mtime comparison decides.
+//
+// Tests substitute this slice via the package var so a scratch tmpdir
+// drives auto-detection without touching the user's real `$HOME`.
+var wezTermLogCandidates = func() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	return []string{
+		// Linux + macOS — wezterm uses XDG_DATA_HOME on both.
+		filepath.Join(home, ".local", "share", "wezterm"),
+		// macOS Application Support — observed on some installs.
+		filepath.Join(home, "Library", "Application Support", "wezterm"),
+		// Cache directory fallback.
+		filepath.Join(home, ".cache", "wezterm"),
+	}
+}
+
+// autoDetectWezTermLog returns the absolute path of the newest
+// `wezterm-gui-log-*.txt` file under any of the platform candidate
+// directories, or "" if nothing is found. Caller maps "" to a clear
+// error so the user knows to pass --wezterm-log explicitly.
+func autoDetectWezTermLog() string {
+	var best string
+	var bestMtime time.Time
+	for _, dir := range wezTermLogCandidates() {
+		matches, err := filepath.Glob(filepath.Join(dir, "wezterm-gui-log-*.txt"))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			fi, err := os.Stat(m)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().After(bestMtime) {
+				best = m
+				bestMtime = fi.ModTime()
+			}
+		}
+	}
+	return best
 }
 
 // runTail wires the reader goroutines + the buffered emit loop. In
@@ -411,6 +500,12 @@ func tailReader(ctx context.Context, src tailSource, noFollow bool, out chan<- t
 		curDev  uint64
 		curIno  uint64
 		hasFile bool
+		// dateAnchor is the calendar date at which time-of-day-only
+		// timestamps (wezterm's `HH:MM:SS.mmm` prefix) are anchored.
+		// Captured from the file's mtime each time openFile succeeds so
+		// the wezterm source orders sensibly against the JSON-timestamped
+		// binary + plugin streams. Zero for sources that don't need it.
+		dateAnchor time.Time
 		// Carry-over for partial trailing line across reads. bufio.Reader
 		// returns io.EOF mid-line if the writer hasn't flushed the
 		// newline yet; we stash the partial fragment and prepend on the
@@ -440,6 +535,15 @@ func tailReader(ctx context.Context, src tailSource, noFollow bool, out chan<- t
 		if !ok {
 			_ = fh.Close()
 			return false
+		}
+		// File mtime → date anchor. Best-effort; on Stat failure fall
+		// back to "now" so the wezterm source still produces orderable
+		// records (just less correct relative to the binary/plugin
+		// streams when the user is tailing an old wezterm log).
+		if fi, err := fh.Stat(); err == nil {
+			dateAnchor = fi.ModTime()
+		} else {
+			dateAnchor = tailNow()
 		}
 		f = fh
 		reader = bufio.NewReader(fh)
@@ -517,11 +621,13 @@ func tailReader(ctx context.Context, src tailSource, noFollow bool, out chan<- t
 				if len(trim) == 0 {
 					continue
 				}
-				rec, ok := parseTailLine(src.Name, trim)
+				rec, ok := parseTailLine(src, trim, dateAnchor)
 				if !ok {
 					// Malformed line — skip silently. The Lua side could
 					// in principle emit a partial write under crash; we
-					// defensively drop rather than panic.
+					// defensively drop rather than panic. For the wezterm
+					// source this is also where the substring filter
+					// rejects unrelated lines.
 					continue
 				}
 				select {
@@ -609,18 +715,25 @@ func pathDevIno(path string) (dev, ino uint64, ok bool) {
 // schemas differ on timestamp and on which fields are guaranteed
 // present, so the source name selects the timestamp extraction strategy.
 //
-// Returns ok=false on malformed JSON or an unparseable timestamp. The
-// caller (tailReader) silently drops on ok=false.
-func parseTailLine(source string, line []byte) (tailRecord, bool) {
+// Returns ok=false on malformed JSON / an unparseable timestamp / a
+// wezterm line that fails the substring filter. The caller (tailReader)
+// silently drops on ok=false.
+//
+// dateAnchor is consulted only by the "wezterm" source (its log lines
+// stamp `HH:MM:SS.mmm` without a calendar date); other sources ignore it.
+func parseTailLine(src tailSource, line []byte, dateAnchor time.Time) (tailRecord, bool) {
+	if src.Name == "wezterm" {
+		return parseWezTermLine(line, src.Filter, dateAnchor)
+	}
 	var raw map[string]any
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return tailRecord{}, false
 	}
 	rec := tailRecord{
-		Source: source,
+		Source: src.Name,
 		Raw:    raw,
 	}
-	switch source {
+	switch src.Name {
 	case "binary":
 		// Go-side slog JSON. `time` is RFC3339 with sub-second precision.
 		if ts, ok := raw["time"].(string); ok {
@@ -678,6 +791,72 @@ func parseTailLine(source string, line []byte) (tailRecord, bool) {
 	return rec, true
 }
 
+// wezTermLineRE matches one line of wezterm's GUI log:
+//
+//	HH:MM:SS.mmm  LEVEL  module > body
+//
+// The body capture is greedy and may itself contain `>` characters. The
+// timestamp lacks a calendar date (wezterm anchors to "today" in the
+// process's local TZ); the caller combines it with the file's mtime
+// date so the record orders sensibly against the JSON-timestamped
+// binary + plugin streams.
+var wezTermLineRE = regexp.MustCompile(
+	`^(\d{2}):(\d{2}):(\d{2})\.(\d+)\s+(\S+)\s+(\S+)\s*>\s*(.*)$`)
+
+// parseWezTermLine extracts the time-of-day prefix, level, module, and
+// message body from a wezterm GUI log line and applies a case-
+// insensitive substring filter. Lines that don't match the regex OR
+// don't contain `filter` are dropped (ok=false). `dateAnchor` provides
+// the calendar date the time-of-day attaches to.
+//
+// `filter` MUST already be lower-cased by the caller; we lower-case
+// the line once for the contains check and skip lower-casing the
+// filter on every record.
+func parseWezTermLine(line []byte, filter string, dateAnchor time.Time) (tailRecord, bool) {
+	if filter != "" && !bytes.Contains(bytes.ToLower(line), []byte(filter)) {
+		return tailRecord{}, false
+	}
+	m := wezTermLineRE.FindSubmatch(line)
+	if m == nil {
+		// Continuation lines / non-standard prefix. Drop — the surrounding
+		// lines that DO match carry the diagnostic content.
+		return tailRecord{}, false
+	}
+	hh, _ := strconv.Atoi(string(m[1]))
+	mm, _ := strconv.Atoi(string(m[2]))
+	ss, _ := strconv.Atoi(string(m[3]))
+	frac := string(m[4])
+	// Pad/truncate the fractional part to 9 digits for time.Date's nanos.
+	for len(frac) < 9 {
+		frac += "0"
+	}
+	if len(frac) > 9 {
+		frac = frac[:9]
+	}
+	ns, _ := strconv.Atoi(frac)
+	anchor := dateAnchor
+	if anchor.IsZero() {
+		anchor = tailNow()
+	}
+	t := time.Date(anchor.Year(), anchor.Month(), anchor.Day(),
+		hh, mm, ss, ns, anchor.Location())
+	level := strings.ToLower(string(m[5]))
+	module := string(m[6])
+	body := string(m[7])
+	return tailRecord{
+		Source: "wezterm",
+		Time:   t,
+		Level:  level,
+		Msg:    body,
+		Raw: map[string]any{
+			"ts":     t.Unix(),
+			"level":  level,
+			"module": module,
+			"msg":    body,
+		},
+	}, true
+}
+
 // stringField fetches a top-level string field from the parsed JSON
 // map. Non-string / missing values yield "".
 func stringField(raw map[string]any, key string) string {
@@ -699,6 +878,7 @@ const (
 	ansiReset   = "\x1b[0m"
 	ansiCyan    = "\x1b[36m"
 	ansiMagenta = "\x1b[35m"
+	ansiYellow  = "\x1b[33m"
 )
 
 // emitTailRecord writes one record to stdout in the requested format.
@@ -796,6 +976,8 @@ func tailSourceTag(source string) string {
 		return "bin"
 	case "plugin":
 		return "lua"
+	case "wezterm":
+		return "wzt"
 	}
 	return source
 }
@@ -808,6 +990,8 @@ func tailSourceColor(source string) string {
 		return ansiCyan
 	case "plugin":
 		return ansiMagenta
+	case "wezterm":
+		return ansiYellow
 	}
 	return ""
 }

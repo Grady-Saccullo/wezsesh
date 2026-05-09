@@ -410,7 +410,16 @@ function M.spawn(window, opts)
 
     local key = globals.session_key()
     if type(key) ~= "string" or #key ~= 64 then
-        if type(wezterm.log_error) == "function" then
+        -- Route through runtime/log.lua so the failure also lands in
+        -- plugin.log; the require is pcall-wrapped so a load failure
+        -- here can never block the spawn-error return.
+        local ok_log, log = pcall(require, "wezsesh.runtime.log")
+        if ok_log and type(log) == "table"
+           and type(log.error) == "function"
+        then
+            pcall(log.error,
+                "spawn aborted: wezsesh_session_key missing or malformed")
+        elseif type(wezterm.log_error) == "function" then
             wezterm.log_error(
                 "wezsesh: spawn aborted — wezsesh_session_key missing or malformed")
         end
@@ -541,9 +550,21 @@ function M.register_keybinding(config, opts)
         mods   = kb.mods,
         action = wezterm.action_callback(function(window, _pane)
             local ok, err = pcall(M.spawn, window, opts)
-            if not ok and type(wezterm.log_error) == "function" then
-                wezterm.log_error(
-                    "wezsesh: spawn keybinding failed: " .. tostring(err))
+            if not ok then
+                -- Route through runtime/log.lua so the failure lands in
+                -- plugin.log too. The require is pcall-wrapped because
+                -- this callback runs inside the wezterm event loop and
+                -- a raise here would wedge it (CLAUDE.md invariant 1).
+                local ok_log, log = pcall(require, "wezsesh.runtime.log")
+                if ok_log and type(log) == "table"
+                   and type(log.error) == "function"
+                then
+                    pcall(log.error,
+                        "spawn keybinding failed: " .. tostring(err))
+                elseif type(wezterm.log_error) == "function" then
+                    wezterm.log_error(
+                        "wezsesh: spawn keybinding failed: " .. tostring(err))
+                end
             end
         end),
     })

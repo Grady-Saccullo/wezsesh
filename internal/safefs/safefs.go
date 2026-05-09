@@ -30,9 +30,27 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
+
+// RotatedName turns an active log leaf like "wezsesh.log" into the
+// rotated form "wezsesh.<n>.log" — the numeric slot lands BEFORE the
+// extension so a file picker / `ls *.log` glob still surfaces every
+// generation as a `.log` file. Pure on its inputs; both the safefs
+// `RotateSingleDeep` path and `internal/logger`'s `rotateLocked` route
+// every numbered-slot name through this helper.
+//
+// If the leaf has no `.` (or the only `.` is the leading char), falls
+// back to the legacy `<leaf>.<n>` shape so a future caller passing a
+// dotless leaf still gets a deterministic, unique name.
+func RotatedName(leaf string, n int) string {
+	if i := strings.LastIndexByte(leaf, '.'); i > 0 {
+		return fmt.Sprintf("%s.%d%s", leaf[:i], n, leaf[i:])
+	}
+	return fmt.Sprintf("%s.%d", leaf, n)
+}
 
 // Public errors. ErrIsSymlink is returned wherever the SymlinkRejectOp
 // policy applies; ErrLockTimeout when context.Done fires before the lock
@@ -276,12 +294,14 @@ func AtomicWriteFile(ctx context.Context, parentDir, filename string, data []byt
 
 // RotateSingleDeep performs a one-deep rotation of <dir>/<leaf>: if the
 // file exists and is strictly larger than thresholdBytes, drop any
-// pre-existing <dir>/<leaf>.1 then rename the active file to
-// <dir>/<leaf>.1. The next writer's open-with-O_APPEND-or-O_CREAT will
-// create a fresh active file.
+// pre-existing rotated slot (RotatedName(leaf, 1)) then rename the
+// active file to that slot. The next writer's open-with-O_APPEND-or-
+// O_CREAT will create a fresh active file. For leaf="plugin.log" the
+// rotated slot is "plugin.1.log" (extension preserved at the tail);
+// see RotatedName for the rule.
 //
 // Symlink discipline: the parent directory is symlink-refused via
-// VerifyDir; the active leaf and the .1 destination are inline
+// VerifyDir; the active leaf and the rotated destination are inline
 // Lstat-checked and refused if either is a symlink. The dirfd is held
 // only for the parent-validation step — the rename and unlink calls are
 // path-based today, mirroring the existing logger rotation pattern, and
@@ -299,7 +319,7 @@ func AtomicWriteFile(ctx context.Context, parentDir, filename string, data []byt
 //
 // Race window: a concurrent appender (e.g. the wezsesh Lua plugin) can
 // write a single line between the rename and the next writer's
-// open(O_APPEND|O_CREAT) — that line lands in the rotated .1 file.
+// open(O_APPEND|O_CREAT) — that line lands in the rotated slot.
 // Single-line writes are POSIX-atomic up to PIPE_BUF (Darwin: 512 B,
 // Linux: 4 KiB), so as long as each writer caps its records at 512 B
 // the rotation cannot interleave a partial line. Documented in the
@@ -321,7 +341,7 @@ func RotateSingleDeep(dir, leaf string, thresholdBytes int64) error {
 	_ = unix.Close(dirfd)
 
 	active := filepath.Join(dir, leaf)
-	rotated := active + ".1"
+	rotated := filepath.Join(dir, RotatedName(leaf, 1))
 
 	// Leaf-level symlink refuse for the active path. Missing → ok=true,
 	// nothing to rotate.

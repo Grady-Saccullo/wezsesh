@@ -76,12 +76,22 @@ local function on_resurrect_error(msg)
         -- tick. There is no in-flight wezsesh request envelope (no
         -- payload, no trace_id, no binary_session_id), and any
         -- previous dispatch's active-trace bucket has long since been
-        -- cleared. We use `wezterm.log_warn` directly here (rather
-        -- than runtime/log.lua) to avoid coupling the resurrect-error
-        -- handler to the structured-log path; a `wezsesh tail`
-        -- consumer correlates these by timestamp + the diagnostic
-        -- ring instead.
-        wezterm.log_warn("resurrect.error (uncaptured): " .. s)
+        -- cleared.
+        --
+        -- Routed through runtime/log.lua so the record lands in
+        -- plugin.log alongside the wezterm GUI log emission — a
+        -- `wezsesh tail` consumer sees these without grepping
+        -- wezterm's own log file. The require is pcall-wrapped so a
+        -- load failure here cannot wedge the event-loop callback;
+        -- bare wezterm.log_warn is the fallback.
+        local ok_log, log = pcall(require, "wezsesh.runtime.log")
+        if ok_log and type(log) == "table"
+           and type(log.warn) == "function"
+        then
+            pcall(log.warn, "resurrect.error (uncaptured): " .. s)
+        else
+            wezterm.log_warn("resurrect.error (uncaptured): " .. s)
+        end
         uncaptured_ring[#uncaptured_ring + 1] =
             { ts = os.time(), msg = s }
         while #uncaptured_ring > UNCAPTURED_RING_MAX do

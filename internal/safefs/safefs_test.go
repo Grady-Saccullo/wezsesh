@@ -452,7 +452,7 @@ func TestRotateSingleDeepUnderThreshold(t *testing.T) {
 	if _, err := os.Stat(active); err != nil {
 		t.Errorf("active file should still exist: %v", err)
 	}
-	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.1.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf(".1 should not exist: %v", err)
 	}
 }
@@ -477,7 +477,7 @@ func TestRotateSingleDeepAtThreshold(t *testing.T) {
 	if st.Size() != 8 {
 		t.Errorf("active size: want 8, got %d", st.Size())
 	}
-	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.1.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf(".1 should not exist: %v", err)
 	}
 }
@@ -496,15 +496,15 @@ func TestRotateSingleDeepOverThreshold(t *testing.T) {
 	if _, err := os.Stat(active); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("active should be gone after rename: %v", err)
 	}
-	body, err := os.ReadFile(active + ".1")
+	body, err := os.ReadFile(filepath.Join(tmp, "plugin.1.log"))
 	if err != nil {
 		t.Fatalf("read .1: %v", err)
 	}
 	if string(body) != "abcdefghi" {
 		t.Errorf(".1 contents: %q", body)
 	}
-	if _, err := os.Stat(active + ".2"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("no .2 should be created: %v", err)
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.2.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("no slot 2 should be created: %v", err)
 	}
 }
 
@@ -517,13 +517,13 @@ func TestRotateSingleDeepDropsExistingDotOne(t *testing.T) {
 	if err := os.WriteFile(active, []byte("NEW data over threshold"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(active+".1", []byte("OLD"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "plugin.1.log"), []byte("OLD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := RotateSingleDeep(tmp, "plugin.log", 8); err != nil {
 		t.Fatalf("RotateSingleDeep: %v", err)
 	}
-	body, err := os.ReadFile(active + ".1")
+	body, err := os.ReadFile(filepath.Join(tmp, "plugin.1.log"))
 	if err != nil {
 		t.Fatalf("read .1: %v", err)
 	}
@@ -541,8 +541,8 @@ func TestRotateSingleDeepMissingFile(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmp, "plugin.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("active file should still be missing: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "plugin.log.1")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf(".1 should not exist: %v", err)
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.1.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("rotated slot should not exist: %v", err)
 	}
 }
 
@@ -566,7 +566,7 @@ func TestRotateSingleDeepRefusesSymlinkActive(t *testing.T) {
 	if _, err := os.Lstat(active); err != nil {
 		t.Errorf("symlink should still exist: %v", err)
 	}
-	if _, err := os.Stat(active + ".1"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(tmp, "plugin.1.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf(".1 should not exist: %v", err)
 	}
 }
@@ -583,7 +583,7 @@ func TestRotateSingleDeepRefusesSymlinkDotOne(t *testing.T) {
 	if err := os.WriteFile(target, []byte("OLD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(target, active+".1"); err != nil {
+	if err := os.Symlink(target, filepath.Join(tmp, "plugin.1.log")); err != nil {
 		t.Fatal(err)
 	}
 	err := RotateSingleDeep(tmp, "plugin.log", 8)

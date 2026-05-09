@@ -11,12 +11,16 @@
 --   1. `wezterm.log_warn` / `log_error` / `log_info` with the literal
 --      `[wezsesh] ` prefix so `wezsesh tail` can grep / parse the
 --      record off wezterm's GUI log file.
---   2. `<runtime_dir>/plugin.log`, append-only, reopened per write.
+--   2. `<state_dir>/plugin.log`, append-only, reopened per write.
 --      The reopen-per-write pattern is load-bearing — init.lua's
 --      `package.loaded["wezsesh.*"]` cache-bust loop on Ctrl+Shift+R
 --      drops every cached module, including this one; a long-lived
 --      file handle would leak descriptors across reload cycles. See
 --      CLAUDE.md "Plugin layers" for the cache-bust rule.
+--      plugin.log lives next to the binary's wezsesh.log in state_dir
+--      so `wezsesh tail` finds both streams in one well-known location
+--      without depending on the runtime_dir env var the plugin set at
+--      spawn time (a tail invoked from a fresh shell has no such env).
 --
 -- ── Durability asymmetry (load-bearing) ────────────────────────────
 -- Lua's `io` API has NO fsync binding (`fh:flush()` only flushes the
@@ -53,7 +57,7 @@
 -- lazily on every emit and drops records whose rank is below the
 -- threshold. Symmetry with the Go side: a config of "warn" suppresses
 -- Debug/Info on BOTH `<state_dir>/wezsesh.log` (slog filtering) and
--- `<runtime_dir>/plugin.log` + the wezterm-log leg (this filter).
+-- `<state_dir>/plugin.log` + the wezterm-log leg (this filter).
 -- Both sides see the same parent env at wezterm-launch time, so the
 -- resolved level matches without any disk-sidecar coordination.
 -- Unknown / nil threshold → "info" (matches the Go default).
@@ -65,7 +69,7 @@
 -- `rec.plugin_session_id` directly without round-tripping through a
 -- parser. `_reset()` restores the wezterm-backed defaults. The file-
 -- append leg is unaffected by `_set`; specs that need to assert on
--- `plugin.log` contents stash a tmp `runtime_dir` via the globals
+-- `plugin.log` contents stash a tmp `state_dir` via the globals
 -- accessor and read the file after the call.
 --
 -- mlua sandbox: acquired via `local wezterm = require("wezterm")` per
@@ -276,11 +280,11 @@ local sink_error = default_error_sink
 local sink_info  = default_info_sink
 
 -- ────────────────────────────────────────────────────────────────────
--- file-append leg (NOT test-seamed — specs use a tmp runtime_dir)
+-- file-append leg (NOT test-seamed — specs use a tmp state_dir)
 -- ────────────────────────────────────────────────────────────────────
 
 local function append_to_plugin_log(rec)
-    local dir = globals.runtime_dir()
+    local dir = globals.state_dir()
     if type(dir) ~= "string" or #dir == 0 then return end
     local path = dir
     if path:sub(-1) ~= "/" then path = path .. "/" end
