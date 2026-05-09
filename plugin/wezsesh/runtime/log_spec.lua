@@ -14,7 +14,7 @@
 -- runtime/log.lua actually touches:
 --   * wezterm.GLOBAL — snapshot-on-read userdata-shaped table.
 --     runtime/log requires runtime/globals (for plugin_session_id /
---     runtime_dir) and runtime/state (for the active-trace lookup),
+--     state_dir) and runtime/state (for the active-trace lookup),
 --     both of which read GLOBAL on every emit.
 --   * wezterm.json_encode — used to encode the structured record.
 --   * wezterm.json_parse — used by runtime/state to decode the
@@ -24,7 +24,7 @@
 --
 -- The structural-record assertions DON'T install a `_set` capture —
 -- we use the public API and inspect the recorded wezterm-log output
--- AND the tmp-runtime_dir's plugin.log file. That way the test exercises
+-- AND the tmp-state_dir's plugin.log file. That way the test exercises
 -- the real two-leg path (wezterm log + file append).
 
 local function script_dir()
@@ -94,9 +94,9 @@ end
 -- reaped after the run via the OS's tmpdir cleanup (we don't
 -- aggressively `os.remove` because the spec wants to inspect the file
 -- after each test).
-local tmp_runtime_dir
+local tmp_state_dir
 local function ensure_tmp_dir()
-    if tmp_runtime_dir ~= nil then return tmp_runtime_dir end
+    if tmp_state_dir ~= nil then return tmp_state_dir end
     -- Use mktemp -d so the path is unique. Fallback to /tmp/wezsesh-spec-<pid>
     -- if mktemp isn't available.
     local p
@@ -109,11 +109,11 @@ local function ensure_tmp_dir()
         p = "/tmp/wezsesh-log-spec-" .. tostring(os.time())
         os.execute("mkdir -p " .. p)
     end
-    tmp_runtime_dir = p
+    tmp_state_dir = p
     return p
 end
 
--- Read the plugin.log file from the tmp runtime_dir. Returns the file
+-- Read the plugin.log file from the tmp state_dir. Returns the file
 -- contents as a string, or nil if the file doesn't exist yet.
 local function read_plugin_log()
     local dir = ensure_tmp_dir()
@@ -139,7 +139,7 @@ local function it(name, fn)
     wezterm_log.error = {}
     wezterm_log.info = {}
     log._reset()
-    -- Wipe the plugin_session_id / runtime_dir / active-trace keys so
+    -- Wipe the plugin_session_id / state_dir / active-trace keys so
     -- a previous test's seed doesn't bleed.
     for k in pairs(global_proxy) do
         if type(k) == "string" and k:sub(1, 8) == "wezsesh_" then
@@ -276,7 +276,7 @@ describe("level threshold", function()
 
     it("debug() routes only to plugin.log, never wezterm sink", function()
         global_proxy.wezsesh_log_level = "debug"
-        global_proxy.wezsesh_runtime_dir = ensure_tmp_dir()
+        global_proxy.wezsesh_state_dir = ensure_tmp_dir()
         log.debug("only-file")
         assert_eq(#wezterm_log.warn, 0, "debug must not hit log_warn")
         assert_eq(#wezterm_log.error, 0, "debug must not hit log_error")
@@ -287,7 +287,7 @@ describe("level threshold", function()
 
     it("debug() at default threshold writes nothing to plugin.log", function()
         global_proxy.wezsesh_log_level = "info"
-        global_proxy.wezsesh_runtime_dir = ensure_tmp_dir()
+        global_proxy.wezsesh_state_dir = ensure_tmp_dir()
         log.debug("dropped")
         -- The file is unlinked between tests; a gated debug call should
         -- leave it untouched, so the helper returns nil (file absent).
@@ -419,7 +419,7 @@ describe("truncation cap (512 bytes)", function()
 
     it("plugin.log lines respect the 512-byte cap (POSIX atomic-append)",
     function()
-        globals.set_runtime_dir(ensure_tmp_dir())
+        globals.set_state_dir(ensure_tmp_dir())
         local big = string.rep("Z", 2000)
         log.warn(big)
         local body = read_plugin_log()
@@ -495,13 +495,13 @@ describe("wezterm-log sink routing", function()
 end)
 
 -- ────────────────────────────────────────────────────────────────────
--- file-append leg — <runtime_dir>/plugin.log
+-- file-append leg — <state_dir>/plugin.log
 -- ────────────────────────────────────────────────────────────────────
 
 describe("plugin.log file-append leg", function()
-    it("appends a JSON line to <runtime_dir>/plugin.log on every emit",
+    it("appends a JSON line to <state_dir>/plugin.log on every emit",
     function()
-        globals.set_runtime_dir(ensure_tmp_dir())
+        globals.set_state_dir(ensure_tmp_dir())
         globals.set_plugin_session_id("01JFILELEG_______________")
         log.warn("file-1")
         log.error("file-2")
@@ -526,7 +526,7 @@ describe("plugin.log file-append leg", function()
 
     it("plugin.log lines do NOT carry the [wezsesh] prefix",
     function()
-        globals.set_runtime_dir(ensure_tmp_dir())
+        globals.set_state_dir(ensure_tmp_dir())
         log.warn("file-prefix-test")
         local body = read_plugin_log()
         assert_true(body ~= nil, "plugin.log not created")
@@ -535,18 +535,18 @@ describe("plugin.log file-append leg", function()
             .. "tail tool would double-strip")
     end)
 
-    it("absent runtime_dir is a noop on the file leg "
+    it("absent state_dir is a noop on the file leg "
         .. "(wezterm log still gets the line)", function()
-        -- Don't set runtime_dir. The wezterm-log leg still fires.
-        log.warn("no-runtime-dir")
+        -- Don't set state_dir. The wezterm-log leg still fires.
+        log.warn("no-state-dir")
         assert_eq(#wezterm_log.warn, 1,
-            "wezterm log leg dropped on absent runtime_dir")
+            "wezterm log leg dropped on absent state_dir")
     end)
 
     it("a write error on the file leg does NOT propagate", function()
-        -- Point runtime_dir at a path we can't write to. The pcall in
+        -- Point state_dir at a path we can't write to. The pcall in
         -- the file leg must swallow the error.
-        globals.set_runtime_dir("/this/path/should/not/exist/wezsesh")
+        globals.set_state_dir("/this/path/should/not/exist/wezsesh")
         local ok = pcall(log.warn, "fs-error")
         assert_true(ok, "log.warn raised on filesystem error")
         assert_eq(#wezterm_log.warn, 1,

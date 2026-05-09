@@ -28,9 +28,10 @@
 --      (impossible-by-construction over the
 --      `snapshot.dir.matches.resurrect` doctor check).
 --   5. Validate `opts.runtime_dir` against the SUN_PATH ceiling.
---   5b. Stash `runtime_dir` in
---      `wezterm.GLOBAL.wezsesh_runtime_dir` so `runtime/log.lua` can
---      append structured records to `<runtime_dir>/plugin.log`
+--   5b. Stash `runtime_dir` in `wezterm.GLOBAL.wezsesh_runtime_dir`
+--      and `state_dir` in `wezterm.GLOBAL.wezsesh_state_dir` so
+--      `runtime/log.lua` can append structured records to
+--      `<state_dir>/plugin.log` (next to the binary's wezsesh.log)
 --      without each caller threading the path through.
 --   5c. Resolve the log level locally (symmetric with Go-side
 --      `logger.ResolveLevel`) via
@@ -122,6 +123,15 @@ end
 -- emitted by the submodules via `error("WEZSESH_*: …", 0)`. We match
 -- on substring (the `error(msg, 0)` form suppresses the file:line
 -- prefix, but we cannot rely on that everywhere).
+--
+-- The error record routes through runtime/log.lua so it lands in
+-- plugin.log alongside the wezterm GUI log emission — `wezsesh tail`
+-- consumers see apply_to_config sentinel failures without grepping the
+-- wezterm log themselves. The require is pcall-wrapped because
+-- maybe_toast runs OUTSIDE apply_to_config's pcall body: a load error
+-- on runtime/log here must not propagate and crash the wezterm config
+-- eval. On require failure we fall back to wezterm.log_error so the
+-- toast machinery still preserves at least one structured emission.
 local function maybe_toast(err)
     if err == nil then return end
     local msg = tostring(err)
@@ -132,7 +142,10 @@ local function maybe_toast(err)
         pcall(wezterm.toast_notification,
             "wezsesh", msg, nil, 10000)
     end
-    if type(wezterm.log_error) == "function" then
+    local ok_log, log = pcall(require, "wezsesh.runtime.log")
+    if ok_log and type(log) == "table" and type(log.error) == "function" then
+        pcall(log.error, "apply_to_config: " .. msg)
+    elseif type(wezterm.log_error) == "function" then
         pcall(wezterm.log_error, "wezsesh: " .. msg)
     end
 end
@@ -299,14 +312,35 @@ function M.apply_to_config(config, opts)
         manager.validate_runtime_dir(opts)
 
         -- Step 5b — Stash the runtime_dir for downstream consumers
-        -- (runtime/log appends to <runtime_dir>/plugin.log). The path
-        -- has just been validated against the SUN_PATH ceiling AND
-        -- the binary side runs `manager.validate_runtime_dir` /
-        -- `safefs.Enforce` on it before the binary spawns, so it is
-        -- safe to write through without re-running symlink checks
-        -- here. Falls through to the `/tmp/wezsesh` default when the
-        -- user didn't pin a path — same default as ipc.register below.
+        -- (IPC sockets + req/ sidecars). The path has just been
+        -- validated against the SUN_PATH ceiling AND the binary
+        -- side runs `manager.validate_runtime_dir` / `safefs.Enforce`
+        -- on it before the binary spawns, so it is safe to write
+        -- through without re-running symlink checks here. Falls
+        -- through to the `/tmp/wezsesh` default when the user didn't
+        -- pin a path — same default as ipc.register below.
         globals.set_runtime_dir(opts.runtime_dir or "/tmp/wezsesh")
+
+        -- Stash the state_dir alongside, mirroring the binary's
+        -- autoStateDir (`internal/config/autodetect.go`): XDG-style
+        -- on both Linux and macOS, since the wezsesh state files
+        -- (state.json, the rotated wezsesh.log set, and now
+        -- plugin.log) live in one well-known location that
+        -- `wezsesh tail` resolves the same way from a fresh shell —
+        -- no env coordination required.
+        local function default_state_dir()
+            local xdg = os.getenv("XDG_STATE_HOME")
+            if type(xdg) == "string" and xdg ~= "" then
+                return xdg .. "/wezsesh"
+            end
+            local home = (wezterm.home_dir or os.getenv("HOME") or "")
+            return home .. "/.local/state/wezsesh"
+        end
+        local state_dir = opts.state_dir
+        if type(state_dir) ~= "string" or state_dir == "" then
+            state_dir = default_state_dir()
+        end
+        globals.set_state_dir(state_dir)
 
         -- Step 5c — Resolve the log level locally (symmetric with the
         -- Go side's `logger.ResolveLevel`). Both sides see the same

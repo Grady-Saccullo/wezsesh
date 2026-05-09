@@ -22,9 +22,16 @@
 --     for the same event fan out in registration order).
 --   * `wezterm.log_warn` — captures messages into `log_warns` so the
 --     spec can assert the "uncaptured" warn is emitted.
+--   * `wezterm.json_encode` / `wezterm.json_parse` — required by
+--     `wezsesh.runtime.log` (which the production handler now routes
+--     uncaptured emissions through so they land in plugin.log too).
+--     Sourced from `spec_helpers.make_json_codec`.
 --   * `wezterm.GLOBAL` — empty stub; resurrect_error.lua does not
---     touch it, but other modules pulled into the package.preload
---     namespace might. Kept for forward-compat with shared shims.
+--     touch it, but `runtime.log`'s transitive require of
+--     `runtime.state` reads/writes `wezsesh_*` keys when an
+--     active-trace bucket is consulted (we never set `pane_id` from
+--     this spec, but the shim must be correctly shaped for the
+--     no-op path).
 --
 -- The spec does NOT depend on any sibling wezsesh module — the file
 -- under test only imports `wezterm`. `package.path` is set up the same
@@ -68,6 +75,15 @@ end
 function wezterm_shim.log_warn(msg)
     log_warns[#log_warns + 1] = tostring(msg)
 end
+
+-- runtime/log.lua now sits between this spec and `wezterm.log_warn` —
+-- it JSON-encodes the structured record before handing the line to the
+-- wezterm sink. Pull the shared codec from spec_helpers so the shim can
+-- service that path.
+local _spec_helpers = require("spec_helpers")
+local _codec = _spec_helpers.make_json_codec()
+wezterm_shim.json_encode = _codec.encode
+wezterm_shim.json_parse  = _codec.decode
 
 -- Synthesise a `wezterm.emit("resurrect.error", msg)` by calling each
 -- handler registered against `event` in registration order. mlua's

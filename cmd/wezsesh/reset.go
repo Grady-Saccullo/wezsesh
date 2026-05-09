@@ -269,8 +269,9 @@ func buildResetPlan(cfg *config.Config, includeSnapshots bool, _ *logger.Logger)
 	plan := resetPlan{topLevelDirs: topLevelResetDirs(cfg)}
 
 	// Log files first so they are unlinked before the state-dir removal
-	// (which would otherwise be non-empty). Two patterns: <state>/wezsesh.log
-	// and <state>/wezsesh.log.<n>.
+	// (which would otherwise be non-empty). Patterns: <state>/wezsesh.log
+	// and <state>/wezsesh.log.<n>; <state>/plugin.log and the rotated
+	// <state>/plugin.log.<n>.
 	if cfg.StateDir != "" {
 		logs, err := listResetLogFiles(cfg.StateDir)
 		if err != nil {
@@ -369,8 +370,12 @@ func buildResetPlan(cfg *config.Config, includeSnapshots bool, _ *logger.Logger)
 	return plan, nil
 }
 
-// listResetLogFiles returns wezsesh.log + every rotated wezsesh.log.<n>.
-// Missing dir or no matches → empty slice.
+// listResetLogFiles returns the wezsesh log files under state_dir:
+// the active wezsesh.log + every rotated wezsesh.<n>.log, plus the
+// active plugin.log + the rotated plugin.<n>.log. The legacy
+// `<base>.log.<n>` shape (pre-extension-tail rotation) is also matched
+// so an upgrade across the rotation-naming change still cleans up the
+// old generation. Missing dir or no matches → empty slice.
 func listResetLogFiles(stateDir string) ([]string, error) {
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
@@ -382,12 +387,53 @@ func listResetLogFiles(stateDir string) ([]string, error) {
 	var out []string
 	for _, e := range entries {
 		nm := e.Name()
-		if nm == "wezsesh.log" || strings.HasPrefix(nm, "wezsesh.log.") {
+		if isResetLogName(nm) {
 			out = append(out, filepath.Join(stateDir, nm))
 		}
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// isResetLogName reports whether `nm` belongs to one of the wezsesh log
+// families (active, rotated, or legacy-rotated) under state_dir.
+//
+// Recognised shapes for base ∈ {"wezsesh", "plugin"}:
+//   - <base>.log              (active)
+//   - <base>.<n>.log          (rotated, current naming)
+//   - <base>.log.<n>          (rotated, legacy naming pre-rename)
+func isResetLogName(nm string) bool {
+	for _, base := range []string{"wezsesh", "plugin"} {
+		if nm == base+".log" {
+			return true
+		}
+		if strings.HasPrefix(nm, base+".log.") {
+			return true
+		}
+		if strings.HasPrefix(nm, base+".") && strings.HasSuffix(nm, ".log") &&
+			len(nm) > len(base)+len(".log")+1 {
+			// Middle slice between "<base>." and ".log" must be all digits.
+			mid := nm[len(base)+1 : len(nm)-len(".log")]
+			if mid != "" && allDigits(mid) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// allDigits reports whether every byte in s is an ASCII decimal digit.
+// Empty string returns false (caller checks explicitly).
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // listResetStateFiles returns state.json + .v<N>.bak migration backups.

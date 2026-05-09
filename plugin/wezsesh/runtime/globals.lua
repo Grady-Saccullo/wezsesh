@@ -32,11 +32,16 @@
 --                               logical session.
 --   wezsesh_runtime_dir       — absolute, validated runtime directory
 --                               (already SUN_PATH-checked). Stashed by
---                               init.lua so `runtime/log.lua` can
---                               append structured records to
---                               `<runtime_dir>/plugin.log` without
---                               threading the path through every
---                               caller.
+--                               init.lua so the IPC sockets and req/
+--                               sidecars have a known parent.
+--   wezsesh_state_dir         — absolute path to the wezsesh state
+--                               directory. Stashed by init.lua so
+--                               `runtime/log.lua` can append structured
+--                               records to `<state_dir>/plugin.log`
+--                               alongside the binary's `wezsesh.log` —
+--                               keeping every wezsesh log file in one
+--                               place that `wezsesh tail` can find from
+--                               a fresh shell without env coordination.
 --   wezsesh_log_level         — one of "debug","info","warn","error".
 --                               Resolved locally by init.lua at
 --                               apply_to_config via
@@ -121,6 +126,18 @@ end
 
 function M.set_runtime_dir(p)
     wezterm.GLOBAL.wezsesh_runtime_dir = p
+end
+
+-- ────────────────────────────────────────────────────────────────────
+-- state_dir — wezsesh_state_dir (absolute path)
+-- ────────────────────────────────────────────────────────────────────
+
+function M.state_dir()
+    return wezterm.GLOBAL.wezsesh_state_dir
+end
+
+function M.set_state_dir(p)
+    wezterm.GLOBAL.wezsesh_state_dir = p
 end
 
 -- ────────────────────────────────────────────────────────────────────

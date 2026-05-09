@@ -329,7 +329,7 @@ func TestTickGoroutineExitsOnClose(t *testing.T) {
 }
 
 // TestRotation forces ~1.1 MiB of writes through a single Logger and
-// asserts that wezsesh.log.1 exists and the active log was reset to a
+// asserts that wezsesh.1.log exists and the active log was reset to a
 // small size. This validates the §8.18 1 MiB rotation policy without
 // depending on real disk pressure.
 func TestRotation(t *testing.T) {
@@ -350,7 +350,7 @@ func TestRotation(t *testing.T) {
 	// inline write paths settle.
 	time.Sleep(20 * time.Millisecond)
 
-	rotated := filepath.Join(dir, "wezsesh.log.1")
+	rotated := filepath.Join(dir, "wezsesh.1.log")
 	st, err := os.Stat(rotated)
 	if err != nil {
 		t.Fatalf("expected rotated file %s: %v", rotated, err)

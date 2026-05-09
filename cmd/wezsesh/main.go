@@ -520,7 +520,7 @@ func tuiSetup(flags parsedFlags, getEnv func(string) string, binarySessionID str
 	if err := reqsweep.SweepStale(filepath.Join(cfg.RuntimeDir, "req"), log); err != nil {
 		log.Warn("reqsweep failed", "err", err.Error())
 	}
-	if err := safefs.RotateSingleDeep(cfg.RuntimeDir, "plugin.log", 1<<20); err != nil {
+	if err := safefs.RotateSingleDeep(cfg.StateDir, "plugin.log", 1<<20); err != nil {
 		log.Warn("plugin.log rotate failed", "err", err.Error())
 	}
 	// Log level no longer flows through a sidecar — the Lua plugin

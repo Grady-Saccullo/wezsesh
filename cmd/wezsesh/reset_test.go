@@ -61,7 +61,9 @@ func (e *resetTestEnv) seed(t *testing.T) {
 	files := map[string][]byte{
 		filepath.Join(e.stateDir, "state.json"):                  []byte(`{"version":1}`),
 		filepath.Join(e.stateDir, "wezsesh.log"):                 []byte(`{"msg":"x"}` + "\n"),
-		filepath.Join(e.stateDir, "wezsesh.log.1"):               []byte(`{"msg":"old"}` + "\n"),
+		filepath.Join(e.stateDir, "wezsesh.1.log"):               []byte(`{"msg":"old"}` + "\n"),
+		filepath.Join(e.stateDir, "plugin.log"):                  []byte(`{"msg":"p"}` + "\n"),
+		filepath.Join(e.stateDir, "plugin.1.log"):                []byte(`{"msg":"po"}` + "\n"),
 		filepath.Join(e.trustDir, "deadbeef0000000000000000000000000000000000000000000000000000aaaa"): []byte(`{"path":"/tmp/x"}`),
 		filepath.Join(e.runtimeDir, "abcd1234.sock"):             []byte{},
 		filepath.Join(e.reqDir, "01234567.json"):                 []byte(`{"v":1}`),
@@ -164,7 +166,9 @@ func TestSubcmdReset_Yes_RemovesEverythingExceptSnapshots(t *testing.T) {
 	gone := []string{
 		filepath.Join(env.stateDir, "state.json"),
 		filepath.Join(env.stateDir, "wezsesh.log"),
-		filepath.Join(env.stateDir, "wezsesh.log.1"),
+		filepath.Join(env.stateDir, "wezsesh.1.log"),
+		filepath.Join(env.stateDir, "plugin.log"),
+		filepath.Join(env.stateDir, "plugin.1.log"),
 		filepath.Join(env.trustDir, "deadbeef0000000000000000000000000000000000000000000000000000aaaa"),
 		filepath.Join(env.runtimeDir, "abcd1234.sock"),
 		filepath.Join(env.reqDir, "01234567.json"),
@@ -586,7 +590,7 @@ func TestApplyResetPlan_FilesProcessedBeforeDirs(t *testing.T) {
 	// state-dir rmdir absolutely depends on the file being removed
 	// first. (The base seed already puts wezsesh.log + state.json there;
 	// we add one more for belt-and-braces.)
-	extra := filepath.Join(env.stateDir, "wezsesh.log.99")
+	extra := filepath.Join(env.stateDir, "wezsesh.99.log")
 	if err := os.WriteFile(extra, []byte("noise"), 0o600); err != nil {
 		t.Fatalf("seed extra log: %v", err)
 	}
@@ -676,7 +680,9 @@ func TestBuildResetPlan_FiltersByExtensionsAndSuffixes(t *testing.T) {
 	want := map[string]resetCategory{
 		filepath.Join(env.stateDir, "state.json"):      resetCatStateFile,
 		filepath.Join(env.stateDir, "wezsesh.log"):     resetCatLogFile,
-		filepath.Join(env.stateDir, "wezsesh.log.1"):   resetCatLogFile,
+		filepath.Join(env.stateDir, "wezsesh.1.log"):   resetCatLogFile,
+		filepath.Join(env.stateDir, "plugin.log"):      resetCatLogFile,
+		filepath.Join(env.stateDir, "plugin.1.log"):    resetCatLogFile,
 		filepath.Join(env.trustDir, "deadbeef0000000000000000000000000000000000000000000000000000aaaa"): resetCatTrustFile,
 		filepath.Join(env.runtimeDir, "abcd1234.sock"): resetCatSockFile,
 		filepath.Join(env.reqDir, "01234567.json"):     resetCatReqFile,
